@@ -23,7 +23,10 @@ Then open:
 """
 
 import os
+import csv
 import json
+import hashlib
+import getpass
 from datetime import datetime, timedelta
 from typing import Dict, Tuple, List, Optional
 
@@ -38,6 +41,15 @@ HOURLY_CSV = os.path.join(LOG_DIR, "hourly_averages.csv")
 THRESHOLDS_JSON = os.path.join(LOG_DIR, "thresholds.json")
 SETTINGS_JSON = "settings.json"  # optional: to discover tags before any data
 ENV_EVENTS_CSV = os.path.join(LOG_DIR, "env_events.csv")
+CONFIG_CHANGES_CSV = os.path.join(LOG_DIR, "config_changes.csv")
+CONFIG_CHANGE_HEADERS = [
+    "timestamp",
+    "user",
+    "field",
+    "old_value",
+    "new_value",
+    "reason",
+]
 
 REFRESH_MS = 5000  # dashboard refresh interval (ms)
 
@@ -51,6 +63,52 @@ def ensure_dir(path: str) -> None:
     d = os.path.abspath(path)
     if d and not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
+
+
+def ensure_csv(path: str, headers: List[str]) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+
+
+def log_config_change(field: str, old_value: object, new_value: object, reason: str) -> None:
+    ensure_csv(CONFIG_CHANGES_CSV, CONFIG_CHANGE_HEADERS)
+    try:
+        user = getpass.getuser() or "Workstation"
+    except Exception:
+        user = "Workstation"
+
+    ts = datetime.now().isoformat(timespec="seconds")
+    row = [
+        ts,
+        user,
+        field,
+        "" if old_value is None else str(old_value),
+        "" if new_value is None else str(new_value),
+        reason,
+    ]
+    try:
+        with open(CONFIG_CHANGES_CSV, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+    except Exception:
+        pass
+
+
+def compute_config_version_text() -> str:
+    if not os.path.exists(SETTINGS_JSON):
+        return "Config: not found"
+    try:
+        with open(SETTINGS_JSON, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        mdate = datetime.fromtimestamp(os.path.getmtime(SETTINGS_JSON)).strftime(
+            "%Y-%m-%d"
+        )
+        return f"Config: v{mdate} ({digest[:8]})"
+    except Exception:
+        return "Config: unavailable"
 
 
 def get_latest_raw_path() -> Optional[str]:
@@ -801,6 +859,14 @@ app.layout = html.Div(
                 html.Div(
                     children=[
                         html.Div(
+                            id="config-version-label",
+                            style={
+                                "fontSize": "11px",
+                                "color": "#b0bec5",
+                                "textAlign": "right",
+                            },
+                        ),
+                        html.Div(
                             id="last-update-label",
                             style={
                                 "fontSize": "11px",
@@ -1017,14 +1083,25 @@ def save_thresholds_callback(n_clicks, tag, low, high):
         low, high = high, low
 
     th = load_thresholds()
+    old_entry = th.get(tag, {})
+    old_low = old_entry.get("low") if isinstance(old_entry, dict) else None
+    old_high = old_entry.get("high") if isinstance(old_entry, dict) else None
     th[tag] = {"low": low, "high": high}
     save_thresholds(th)
+    if old_low != low or old_high != high:
+        log_config_change(
+            field=f"Thresholds: {tag}",
+            old_value=old_entry,
+            new_value=th[tag],
+            reason="Edited in web dashboard",
+        )
     return f"Saved thresholds for {tag}: [{low}, {high}]"
 
 
 @app.callback(
     Output("tag-cards-container", "children"),
     Output("last-update-label", "children"),
+    Output("config-version-label", "children"),
     Input("refresh-interval", "n_intervals"),
 )
 def update_dashboard(n):
@@ -1037,6 +1114,7 @@ def update_dashboard(n):
         hourly_df = load_hourly_stats()
         events_df = load_env_events()
         thresholds = load_thresholds()
+        config_version = compute_config_version_text()
 
         latest_by_tag, current_hour_avg, last_ts = extract_raw_stats(raw_df)
         last_hour_stats = extract_last_full_hour(hourly_df)
@@ -1080,6 +1158,7 @@ def update_dashboard(n):
             )
             last_update = "Last update: no data"
             return [quality_card, empty_card], last_update
+            return [empty_card], last_update, config_version
 
         cards = [quality_card]
         for tag in all_tags:
@@ -1101,7 +1180,7 @@ def update_dashboard(n):
         else:
             last_update = "Last update: unknown"
 
-        return cards, last_update
+        return cards, last_update, config_version
 
     except Exception as e:
         error_card = html.Div(
@@ -1126,7 +1205,7 @@ def update_dashboard(n):
             ],
         )
         last_update = "Last update: error"
-        return [error_card], last_update
+        return [error_card], last_update, compute_config_version_text()
 
 
 # ----------------- main -----------------

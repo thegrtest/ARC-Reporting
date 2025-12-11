@@ -52,6 +52,8 @@ import os
 import csv
 import json
 import time
+import hashlib
+import getpass
 from datetime import datetime, timedelta, date
 from typing import Dict, Tuple, List, Optional
 
@@ -412,6 +414,14 @@ class PollThread(QThread):
 
 class MainWindow(QMainWindow):
     SETTINGS_FILE = "settings.json"
+    CONFIG_CHANGE_HEADERS = [
+        "timestamp",
+        "user",
+        "field",
+        "old_value",
+        "new_value",
+        "reason",
+    ]
 
     def __init__(self):
         super().__init__()
@@ -433,6 +443,8 @@ class MainWindow(QMainWindow):
         self.tag_order: List[str] = []
         # tag -> alias mapping
         self.alias_map: Dict[str, str] = {}
+        # last loaded settings snapshot for change detection
+        self._last_settings_snapshot: Dict[str, object] = {}
 
         # data quality controls
         self.stale_intervals_threshold = 5
@@ -452,6 +464,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_dark_theme()
         self._load_settings()  # populates fields and paths
+        self._update_config_version_label()
 
         # init daily raw path
         self.current_log_date = datetime.now().date()
@@ -559,9 +572,15 @@ class MainWindow(QMainWindow):
         machine_font.setPointSize(11)
         self.machine_label.setFont(machine_font)
 
+        self.config_version_label = QLabel("Config: —")
+        config_font = QFont()
+        config_font.setPointSize(10)
+        self.config_version_label.setFont(config_font)
+
         header_left = QVBoxLayout()
         header_left.addWidget(self.title_label)
         header_left.addWidget(self.machine_label)
+        header_left.addWidget(self.config_version_label)
 
         header_right = QVBoxLayout()
         header_right.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -964,6 +983,12 @@ class MainWindow(QMainWindow):
             print(f"Failed to load settings: {e}", file=sys.stderr)
             return
 
+        # Keep a snapshot for change detection / logging
+        if isinstance(data, dict):
+            self._last_settings_snapshot = dict(data)
+        else:
+            self._last_settings_snapshot = {}
+
         self.machine_name = data.get("machine_name", "")
         self.machine_name_edit.setText(self.machine_name)
 
@@ -1018,8 +1043,11 @@ class MainWindow(QMainWindow):
         else:
             self.machine_label.setText("Machine: —")
 
+        self._update_config_version_label()
+
     def _save_settings(self):
         """Persist all tags, aliases (via text), machine, and general settings to JSON."""
+        old_data = self._last_settings_snapshot or self._read_settings_file()
         data = {
             "machine_name": self.machine_name_edit.text().strip(),
             "ip": self.ip_edit.text().strip(),
@@ -1036,11 +1064,93 @@ class MainWindow(QMainWindow):
             "gap_threshold_minutes": self.gap_spin.value(),
             "moving_tags": [t.strip() for t in self.moving_tags_edit.text().split(",") if t.strip()],
         }
+        self.log_dir = data["log_dir"]
         try:
             with open(self.SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            self._log_settings_changes(old_data, data, "Updated via desktop app")
+            self._last_settings_snapshot = dict(data)
+            self._update_config_version_label()
         except Exception as e:
             print(f"Failed to save settings: {e}", file=sys.stderr)
+
+    def _read_settings_file(self) -> Dict[str, object]:
+        if not os.path.exists(self.SETTINGS_FILE):
+            return {}
+        try:
+            with open(self.SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _config_change_log_path(self) -> str:
+        return os.path.join(self.log_dir, "config_changes.csv")
+
+    def _ensure_config_change_log(self) -> str:
+        path = self._config_change_log_path()
+        ensure_csv(path, self.CONFIG_CHANGE_HEADERS)
+        return path
+
+    @staticmethod
+    def _current_user() -> str:
+        try:
+            user = getpass.getuser()
+            return user or "Workstation"
+        except Exception:
+            return "Workstation"
+
+    def _write_config_change(
+        self, field: str, old_value: object, new_value: object, reason: str
+    ) -> None:
+        path = self._ensure_config_change_log()
+        ts = datetime.now().isoformat(timespec="seconds")
+        row = [
+            ts,
+            self._current_user(),
+            field,
+            "" if old_value is None else str(old_value),
+            "" if new_value is None else str(new_value),
+            reason,
+        ]
+        try:
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+        except Exception as e:
+            print(f"Failed to log config change: {e}", file=sys.stderr)
+
+    def _log_settings_changes(
+        self, old: Dict[str, object], new: Dict[str, object], reason: str
+    ) -> None:
+        watched_fields = [
+            ("tags", "Tags list"),
+            ("machine_state_tag", "Machine state tag"),
+            ("pause_when_down", "Machine state gating"),
+            ("heartbeat_tag", "Heartbeat tag"),
+            ("heartbeat_enabled", "Heartbeat mode"),
+        ]
+        for key, label in watched_fields:
+            old_val = None if old is None else old.get(key)
+            new_val = new.get(key)
+            if old_val != new_val:
+                self._write_config_change(label, old_val, new_val, reason)
+
+    def _compute_config_version_text(self) -> str:
+        if not os.path.exists(self.SETTINGS_FILE):
+            return "Config: not found"
+        try:
+            with open(self.SETTINGS_FILE, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            mdate = datetime.fromtimestamp(os.path.getmtime(self.SETTINGS_FILE)).strftime(
+                "%Y-%m-%d"
+            )
+            return f"Config: v{mdate} ({digest[:8]})"
+        except Exception:
+            return "Config: unavailable"
+
+    def _update_config_version_label(self):
+        self.config_version_label.setText(self._compute_config_version_text())
 
     # ---------------- polling control ----------------
 

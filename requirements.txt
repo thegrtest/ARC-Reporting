@@ -1,0 +1,5 @@
+pandas
+Dash
+dash-daq
+PySide6
+pylogix

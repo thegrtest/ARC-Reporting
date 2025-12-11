@@ -27,12 +27,30 @@ import csv
 import json
 import hashlib
 import getpass
+import sys
 from datetime import datetime, timedelta
 from typing import Dict, Tuple, List, Optional
 
-import pandas as pd
-from dash import Dash, dcc, html, Input, Output, State, dash_table
-import dash_daq as daq
+try:
+    import pandas as pd
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        "pandas is required for CIPMonitor. Install via 'pip install pandas'."
+    ) from exc
+
+try:
+    from dash import Dash, dcc, html, Input, Output, State, dash_table
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        "Dash is required for CIPMonitor. Install via 'pip install dash'."
+    ) from exc
+
+try:
+    import dash_daq as daq
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        "dash-daq is required for CIPMonitor. Install via 'pip install dash-daq'."
+    ) from exc
 
 # ----------------- config -----------------
 

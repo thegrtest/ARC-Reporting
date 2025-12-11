@@ -61,7 +61,16 @@ from datetime import datetime, timedelta, date
 from typing import Dict, Tuple, List, Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, QMutex, QMutexLocker, QTimer
-from PySide6.QtGui import QPalette, QColor, QAction, QFont, QIcon, QPixmap, QPainter
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QGuiApplication,
+    QIcon,
+    QPalette,
+    QPainter,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QLabel, QPushButton, QTextEdit, QTableWidget,
@@ -2434,6 +2443,10 @@ def _build_splash_pixmap(icon: QIcon) -> QPixmap:
 def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    if hasattr(QGuiApplication, "setHighDpiScaleFactorRoundingPolicy"):
+        QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
 
     app = QApplication(sys.argv)
 

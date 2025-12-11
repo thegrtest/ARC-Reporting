@@ -106,6 +106,45 @@ def ensure_csv(path: str, headers: List[str]) -> None:
             writer.writerow(headers)
 
 
+def _to_float(val: object) -> Optional[float]:
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_threshold_entry(raw_entry: object) -> Dict[str, object]:
+    if not isinstance(raw_entry, dict):
+        return {}
+
+    entry: Dict[str, object] = {}
+    for key in ["alias", "units"]:
+        if isinstance(raw_entry.get(key), str) and raw_entry.get(key).strip():
+            entry[key] = raw_entry.get(key).strip()
+
+    low_oper = _to_float(raw_entry.get("low_oper"))
+    if low_oper is None:
+        low_oper = _to_float(raw_entry.get("low"))
+
+    high_oper = _to_float(raw_entry.get("high_oper"))
+    if high_oper is None:
+        high_oper = _to_float(raw_entry.get("high"))
+
+    low_limit = _to_float(raw_entry.get("low_limit"))
+    high_limit = _to_float(raw_entry.get("high_limit"))
+
+    if low_oper is not None:
+        entry["low_oper"] = low_oper
+    if high_oper is not None:
+        entry["high_oper"] = high_oper
+    if low_limit is not None:
+        entry["low_limit"] = low_limit
+    if high_limit is not None:
+        entry["high_limit"] = high_limit
+
+    return entry
+
+
 def chunked(seq: List[str], size: int):
     """Yield chunks from list (used to batch pylogix reads)."""
     for i in range(0, len(seq), size):
@@ -550,7 +589,7 @@ class MainWindow(QMainWindow):
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                return data
+                return {k: _normalize_threshold_entry(v) for k, v in data.items()}
         except Exception:
             return {}
         return {}
@@ -1505,11 +1544,19 @@ class MainWindow(QMainWindow):
             return "SUSPECT"
 
         thresholds = self.thresholds.get(tag)
-        if thresholds:
+        if isinstance(thresholds, dict):
             try:
-                low = float(thresholds.get("low"))
-                high = float(thresholds.get("high"))
-                if num_val < low or num_val > high:
+                low_limit = _to_float(thresholds.get("low_limit"))
+                high_limit = _to_float(thresholds.get("high_limit"))
+                low_oper = _to_float(thresholds.get("low_oper"))
+                high_oper = _to_float(thresholds.get("high_oper"))
+
+                low_bound = low_limit if low_limit is not None else low_oper
+                high_bound = high_limit if high_limit is not None else high_oper
+
+                if low_bound is not None and num_val < low_bound:
+                    return "OUT_OF_RANGE"
+                if high_bound is not None and num_val > high_bound:
                     return "OUT_OF_RANGE"
             except Exception:
                 pass

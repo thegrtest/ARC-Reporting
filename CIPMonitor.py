@@ -221,11 +221,67 @@ def load_env_events() -> pd.DataFrame:
     return df
 
 
-def load_thresholds() -> Dict[str, Dict[str, float]]:
+def _to_float(val: object) -> Optional[float]:
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_threshold_entry(raw_entry: object) -> Dict[str, object]:
+    """Normalize a raw threshold entry into the new schema."""
+    if not isinstance(raw_entry, dict):
+        return {}
+
+    entry: Dict[str, object] = {}
+
+    # carry friendly metadata if present
+    for key in ["alias", "units"]:
+        if isinstance(raw_entry.get(key), str) and raw_entry.get(key).strip():
+            entry[key] = raw_entry.get(key).strip()
+
+    # prefer new keys, fall back to legacy low/high
+    low_oper = _to_float(raw_entry.get("low_oper"))
+    if low_oper is None:
+        low_oper = _to_float(raw_entry.get("low"))
+
+    high_oper = _to_float(raw_entry.get("high_oper"))
+    if high_oper is None:
+        high_oper = _to_float(raw_entry.get("high"))
+
+    low_limit = _to_float(raw_entry.get("low_limit"))
+    high_limit = _to_float(raw_entry.get("high_limit"))
+
+    if low_oper is not None:
+        entry["low_oper"] = low_oper
+    if high_oper is not None:
+        entry["high_oper"] = high_oper
+    if low_limit is not None:
+        entry["low_limit"] = low_limit
+    if high_limit is not None:
+        entry["high_limit"] = high_limit
+
+    return entry
+
+
+def load_thresholds() -> Dict[str, Dict[str, object]]:
     """
-    Load per-tag thresholds from JSON if available.
+    Load per-tag thresholds/limits from JSON if available.
     thresholds.json format:
-        { "TagName": {"low": float, "high": float}, ... }
+        {
+          "TagName": {
+              "alias": "Kiln Temperature",
+              "units": "°C",
+              "low_oper": 800,
+              "high_oper": 950,
+              "low_limit": 750,
+              "high_limit": 1000
+          },
+          ...
+        }
+
+    Legacy `{ "Tag": {"low": x, "high": y} }` entries are normalized to
+    `low_oper`/`high_oper`.
     """
     if not os.path.exists(THRESHOLDS_JSON):
         return {}
@@ -233,7 +289,8 @@ def load_thresholds() -> Dict[str, Dict[str, float]]:
         with open(THRESHOLDS_JSON, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
-            return data
+            normalized = {k: _normalize_threshold_entry(v) for k, v in data.items()}
+            return normalized
     except Exception:
         pass
     return {}
@@ -613,7 +670,7 @@ def build_tag_card(
     latest: Dict[str, Tuple[float, str]],
     last_hour_stats: Dict[str, Tuple[float, datetime, datetime, int]],
     current_hour_avg: Dict[str, float],
-    thresholds: Dict[str, Dict[str, float]],
+    thresholds: Dict[str, Dict[str, object]],
 ) -> html.Div:
     """
     Build a card with three gauges for a single tag:
@@ -636,22 +693,46 @@ def build_tag_card(
         cur_plc_status = "Derived from last full hour"
         derived_current = True
 
-    # Thresholds (if any)
-    low = thresholds.get(tag, {}).get("low")
-    high = thresholds.get(tag, {}).get("high")
+    entry = thresholds.get(tag, {}) if isinstance(thresholds.get(tag, {}), dict) else {}
 
-    # Derive gauge ranges
+    alias = entry.get("alias") if isinstance(entry.get("alias"), str) else None
+    units = entry.get("units") if isinstance(entry.get("units"), str) else None
+
+    low_oper = entry.get("low_oper")
+    high_oper = entry.get("high_oper")
+    low_limit = entry.get("low_limit")
+    high_limit = entry.get("high_limit")
+
+    # Derive gauge ranges using operational thresholds first, then limits, then data
     sample_vals = [cur_val, last_avg, live_hr_val]
-    low_eff, high_eff, gmin, gmax = compute_gauge_range(low, high, sample_vals)
+    low_for_range = low_oper if low_oper is not None else low_limit
+    high_for_range = high_oper if high_oper is not None else high_limit
+    low_eff, high_eff, gmin, gmax = compute_gauge_range(
+        low_for_range, high_for_range, sample_vals
+    )
+
+    # When classifying, prefer operational thresholds if set; otherwise use limits/range
+    low_for_class = low_oper if low_oper is not None else low_eff
+    high_for_class = high_oper if high_oper is not None else high_eff
 
     # Classification
-    cur_status_eval = classify_value(cur_val, low_eff, high_eff)
-    last_status_eval = classify_value(last_avg, low_eff, high_eff)
-    live_hr_status_eval = classify_value(live_hr_val, low_eff, high_eff)
+    cur_status_eval = classify_value(cur_val, low_for_class, high_for_class)
+    last_status_eval = classify_value(last_avg, low_for_class, high_for_class)
+    live_hr_status_eval = classify_value(live_hr_val, low_for_class, high_for_class)
 
     cur_color = status_color(cur_status_eval)
     last_color = status_color(last_status_eval)
     live_hr_color = status_color(live_hr_status_eval)
+
+    # Hard-limit exceedance text (if provided)
+    def limit_note(value: float) -> str:
+        if value != value:
+            return ""
+        if low_limit is not None and value < low_limit:
+            return f" (below limit {low_limit})"
+        if high_limit is not None and value > high_limit:
+            return f" (above limit {high_limit})"
+        return ""
 
     # Labels with 2 decimal places
     if cur_val == cur_val:
@@ -660,6 +741,7 @@ def build_tag_card(
             prefix = "Current (from last full hour)"
         cur_label_text = (
             f"{prefix}: {cur_val:.2f} (PLC: {cur_plc_status}, eval: {cur_status_eval})"
+            f"{limit_note(cur_val)}"
         )
     else:
         cur_label_text = f"Current: no data (PLC: {cur_plc_status})"
@@ -674,6 +756,7 @@ def build_tag_card(
         last_label_text = (
             f"Last full hour {hs_s}-{he_s}: {last_avg:.2f} "
             f"(samples: {sample_count}, eval: {last_status_eval})"
+            f"{limit_note(last_avg)}"
         )
     else:
         last_label_text = "Last full hour: no data"
@@ -682,6 +765,7 @@ def build_tag_card(
         live_hr_label_text = (
             f"Live hourly average: {live_hr_val:.2f} "
             f"(current hour, eval: {live_hr_status_eval})"
+            f"{limit_note(live_hr_val)}"
         )
     else:
         live_hr_label_text = "Live hourly average: no data"
@@ -748,23 +832,49 @@ def build_tag_card(
         ],
     )
 
-    header = html.Div(
-        [
-            html.Div(
-                tag,
-                style={
-                    "fontWeight": "600",
-                    "fontSize": "13px",
-                    "color": "#e0e6ed",
-                },
-            ),
-            html.Div(
-                f"Thresholds: [{low if low is not None else 'auto'}, "
-                f"{high if high is not None else 'auto'}]",
-                style={"fontSize": "11px", "color": "#90a4ae"},
-            ),
-        ]
+    display_name = alias or tag
+    subtitle_bits = []
+    if alias:
+        subtitle_bits.append(f"Tag: {tag}")
+    if units:
+        subtitle_bits.append(f"Units: {units}")
+    subtitle = " • ".join(subtitle_bits)
+
+    def format_bounds(label: str, low_val: Optional[float], high_val: Optional[float], fallback: str) -> str:
+        bounds: List[str] = []
+        if low_val is not None:
+            bounds.append(str(low_val))
+        if high_val is not None:
+            bounds.append(str(high_val))
+        if bounds:
+            return f"{label}: [{' – '.join(bounds)}]"
+        return fallback
+
+    oper_text = format_bounds("Operational", low_oper, high_oper, "Operational: auto")
+    limit_text = format_bounds(
+        "Regulatory limit", low_limit, high_limit, "Regulatory limit: none set"
     )
+
+    header_children = [
+        html.Div(
+            display_name,
+            style={
+                "fontWeight": "600",
+                "fontSize": "13px",
+                "color": "#e0e6ed",
+            },
+        ),
+        html.Div(
+            [
+                html.Div(oper_text),
+                html.Div(limit_text),
+                html.Div(subtitle) if subtitle else None,
+            ],
+            style={"fontSize": "11px", "color": "#90a4ae", "lineHeight": "16px"},
+        ),
+    ]
+
+    header = html.Div([child for child in header_children if child is not None])
 
     gauges_row = html.Div(
         style=GAUGE_ROW_STYLE,
@@ -1012,15 +1122,15 @@ app.layout = html.Div(
                             },
                             children=[
                                 html.Div(
-                                    "Threshold Editor",
+                                    "Threshold / Limit Editor",
                                     style={
                                         "fontSize": "14px",
                                         "fontWeight": "600",
                                     },
                                 ),
                                 html.Div(
-                                    "Select a tag and define its good operating range. "
-                                    "Gauges on the Overview tab will color based on these thresholds.",
+                                    "Separate operator warning bands from regulatory/permit limits. "
+                                    "Operational thresholds drive gauge coloring; limits track strict compliance.",
                                     style={"fontSize": "11px", "color": "#90a4ae"},
                                 ),
                                 html.Label(
@@ -1035,7 +1145,27 @@ app.layout = html.Div(
                                     style={"color": "#000"},
                                 ),
                                 html.Label(
-                                    "Good Range (low / high):",
+                                    "Alias (friendly name):",
+                                    style={"marginTop": "6px", "fontSize": "11px"},
+                                ),
+                                dcc.Input(
+                                    id="threshold-alias-input",
+                                    type="text",
+                                    placeholder="Kiln Temperature",
+                                    style={"width": "100%"},
+                                ),
+                                html.Label(
+                                    "Units:",
+                                    style={"marginTop": "6px", "fontSize": "11px"},
+                                ),
+                                dcc.Input(
+                                    id="threshold-units-input",
+                                    type="text",
+                                    placeholder="°C",
+                                    style={"width": "100%"},
+                                ),
+                                html.Label(
+                                    "Operational thresholds (warning band):",
                                     style={"marginTop": "6px", "fontSize": "11px"},
                                 ),
                                 html.Div(
@@ -1044,13 +1174,34 @@ app.layout = html.Div(
                                         dcc.Input(
                                             id="threshold-low-input",
                                             type="number",
-                                            placeholder="Low",
+                                            placeholder="Low operational",
                                             style={"flex": 1},
                                         ),
                                         dcc.Input(
                                             id="threshold-high-input",
                                             type="number",
-                                            placeholder="High",
+                                            placeholder="High operational",
+                                            style={"flex": 1},
+                                        ),
+                                    ],
+                                ),
+                                html.Label(
+                                    "Regulatory limits (permit/compliance):",
+                                    style={"marginTop": "6px", "fontSize": "11px"},
+                                ),
+                                html.Div(
+                                    style={"display": "flex", "gap": "6px"},
+                                    children=[
+                                        dcc.Input(
+                                            id="threshold-low-limit-input",
+                                            type="number",
+                                            placeholder="Low limit",
+                                            style={"flex": 1},
+                                        ),
+                                        dcc.Input(
+                                            id="threshold-high-limit-input",
+                                            type="number",
+                                            placeholder="High limit",
                                             style={"flex": 1},
                                         ),
                                     ],
@@ -1121,14 +1272,26 @@ def refresh_threshold_dropdown(n, current_value):
 @app.callback(
     Output("threshold-low-input", "value"),
     Output("threshold-high-input", "value"),
+    Output("threshold-alias-input", "value"),
+    Output("threshold-units-input", "value"),
+    Output("threshold-low-limit-input", "value"),
+    Output("threshold-high-limit-input", "value"),
     Input("threshold-tag-dropdown", "value"),
 )
 def populate_threshold_inputs(tag):
     """Fill threshold inputs when tag changes."""
     th = load_thresholds()
     if not tag or tag not in th:
-        return None, None
-    return th[tag].get("low"), th[tag].get("high")
+        return None, None, None, None, None, None
+    entry = th[tag]
+    return (
+        entry.get("low_oper"),
+        entry.get("high_oper"),
+        entry.get("alias"),
+        entry.get("units"),
+        entry.get("low_limit"),
+        entry.get("high_limit"),
+    )
 
 
 @app.callback(
@@ -1137,36 +1300,82 @@ def populate_threshold_inputs(tag):
     State("threshold-tag-dropdown", "value"),
     State("threshold-low-input", "value"),
     State("threshold-high-input", "value"),
+    State("threshold-alias-input", "value"),
+    State("threshold-units-input", "value"),
+    State("threshold-low-limit-input", "value"),
+    State("threshold-high-limit-input", "value"),
     prevent_initial_call=True,
 )
-def save_thresholds_callback(n_clicks, tag, low, high):
+def save_thresholds_callback(
+    n_clicks, tag, low_oper, high_oper, alias, units, low_limit, high_limit
+):
     if not tag:
         return "Select a tag first."
-    if low is None or high is None:
-        return "Enter both low and high values."
     try:
-        low = float(low)
-        high = float(high)
+        low_oper = float(low_oper) if low_oper not in (None, "") else None
     except ValueError:
-        return "Low / High must be numeric."
+        return "Operational low must be numeric."
+    try:
+        high_oper = float(high_oper) if high_oper not in (None, "") else None
+    except ValueError:
+        return "Operational high must be numeric."
+    try:
+        low_limit = float(low_limit) if low_limit not in (None, "") else None
+    except ValueError:
+        return "Regulatory low must be numeric."
+    try:
+        high_limit = float(high_limit) if high_limit not in (None, "") else None
+    except ValueError:
+        return "Regulatory high must be numeric."
 
-    if high < low:
-        low, high = high, low
+    if (
+        low_oper is not None
+        and high_oper is not None
+        and high_oper < low_oper
+    ):
+        low_oper, high_oper = high_oper, low_oper
+
+    if (
+        low_limit is not None
+        and high_limit is not None
+        and high_limit < low_limit
+    ):
+        low_limit, high_limit = high_limit, low_limit
 
     th = load_thresholds()
-    old_entry = th.get(tag, {})
-    old_low = old_entry.get("low") if isinstance(old_entry, dict) else None
-    old_high = old_entry.get("high") if isinstance(old_entry, dict) else None
-    th[tag] = {"low": low, "high": high}
+    old_entry = th.get(tag, {}) if isinstance(th.get(tag, {}), dict) else {}
+
+    entry: Dict[str, object] = {}
+    if alias:
+        entry["alias"] = alias.strip()
+    if units:
+        entry["units"] = units.strip()
+    if low_oper is not None:
+        entry["low_oper"] = low_oper
+    if high_oper is not None:
+        entry["high_oper"] = high_oper
+    if low_limit is not None:
+        entry["low_limit"] = low_limit
+    if high_limit is not None:
+        entry["high_limit"] = high_limit
+
+    th[tag] = entry
     save_thresholds(th)
-    if old_low != low or old_high != high:
+    if entry != old_entry:
         log_config_change(
-            field=f"Thresholds: {tag}",
+            field=f"Thresholds/Limits: {tag}",
             old_value=old_entry,
-            new_value=th[tag],
+            new_value=entry,
             reason="Edited in web dashboard",
         )
-    return f"Saved thresholds for {tag}: [{low}, {high}]"
+
+    has_oper = (low_oper is not None) or (high_oper is not None)
+    op_range = (
+        f"operational [{low_oper}, {high_oper}]" if has_oper else "operational auto"
+    )
+    has_limit = (low_limit is not None) or (high_limit is not None)
+    limit_range = f"limits [{low_limit}, {high_limit}]" if has_limit else "limits not set"
+    return f"Saved {tag}: {op_range}; {limit_range}"
 
 
 @app.callback(

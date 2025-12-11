@@ -67,7 +67,8 @@ from PySide6.QtWidgets import (
     QLineEdit, QLabel, QPushButton, QTextEdit, QTableWidget,
     QTableWidgetItem, QMessageBox, QGroupBox, QFormLayout, QSpinBox,
     QFileDialog, QHeaderView, QPlainTextEdit, QStatusBar, QFrame,
-    QSpacerItem, QSizePolicy, QComboBox, QCheckBox
+    QSpacerItem, QSizePolicy, QComboBox, QCheckBox, QScrollArea, QTabWidget,
+    QProgressBar
 )
 
 try:
@@ -156,6 +157,184 @@ def hour_bucket(dt: datetime) -> datetime:
     return dt.replace(minute=0, second=0, microsecond=0)
 
 
+class GaugeDisplay(QWidget):
+    def __init__(self, title: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        self.title_label = QLabel(title)
+        title_font = QFont()
+        title_font.setBold(True)
+        self.title_label.setFont(title_font)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(True)
+        self.bar.setAlignment(Qt.AlignCenter)
+
+        self.range_label = QLabel("")
+        self.range_label.setStyleSheet("color: #90a4ae; font-size: 11px;")
+        self.detail_label = QLabel("")
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setStyleSheet("color: #b0bec5; font-size: 11px;")
+
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.bar)
+        layout.addWidget(self.range_label)
+        layout.addWidget(self.detail_label)
+
+    def update_display(
+        self,
+        value: Optional[float],
+        gauge_min: float,
+        gauge_max: float,
+        color: str,
+        detail_text: str,
+    ) -> None:
+        if gauge_max <= gauge_min:
+            gauge_max = gauge_min + 1.0
+
+        try:
+            disp_val = float(value) if value is not None else float("nan")
+        except Exception:
+            disp_val = float("nan")
+
+        if disp_val != disp_val:  # NaN
+            percent = 0
+            formatted = "—"
+        else:
+            percent = int(1000 * (disp_val - gauge_min) / max(1e-6, gauge_max - gauge_min))
+            percent = max(0, min(1000, percent))
+            formatted = f"{disp_val:.2f}"
+
+        self.bar.setValue(percent)
+        self.bar.setFormat(formatted)
+        self.bar.setStyleSheet(
+            f"""
+            QProgressBar {{
+                border: 1px solid #2b323c;
+                border-radius: 6px;
+                background: #11151b;
+                color: #e0e6ed;
+                text-align: center;
+                padding: 4px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {color};
+                border-radius: 6px;
+            }}
+            """
+        )
+
+        self.range_label.setText(f"Gauge range: {gauge_min:.2f} – {gauge_max:.2f}")
+        self.detail_label.setText(detail_text)
+
+
+class GaugeCard(QFrame):
+    def __init__(self, tag: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.tag = tag
+        self.setObjectName("gaugeCard")
+        self.setFrameShape(QFrame.StyledPanel)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        header_layout = QVBoxLayout()
+        header_layout.setSpacing(2)
+
+        self.title_label = QLabel(tag)
+        title_font = QFont()
+        title_font.setPointSize(12)
+        title_font.setBold(True)
+        self.title_label.setFont(title_font)
+
+        self.subtitle_label = QLabel("")
+        self.subtitle_label.setStyleSheet("color: #90a4ae; font-size: 11px;")
+
+        self.oper_label = QLabel("")
+        self.oper_label.setStyleSheet("color: #b0bec5; font-size: 11px;")
+        self.limit_label = QLabel("")
+        self.limit_label.setStyleSheet("color: #b0bec5; font-size: 11px;")
+
+        self.qa_label = QLabel("")
+        self.qa_label.setStyleSheet("color: #ffb74d; font-size: 11px;")
+
+        header_layout.addWidget(self.title_label)
+        header_layout.addWidget(self.subtitle_label)
+        header_layout.addWidget(self.oper_label)
+        header_layout.addWidget(self.limit_label)
+        header_layout.addWidget(self.qa_label)
+
+        gauges_row = QHBoxLayout()
+        gauges_row.setSpacing(12)
+
+        self.current_display = GaugeDisplay("Current")
+        self.last_display = GaugeDisplay("Last Full Hour")
+        self.live_display = GaugeDisplay("Current Hour Avg")
+
+        gauges_row.addWidget(self.current_display)
+        gauges_row.addWidget(self.last_display)
+        gauges_row.addWidget(self.live_display)
+
+        layout.addLayout(header_layout)
+        layout.addLayout(gauges_row)
+
+    def update_metadata(
+        self,
+        display_name: str,
+        tag: str,
+        units: str,
+        low_oper: Optional[float],
+        high_oper: Optional[float],
+        low_limit: Optional[float],
+        high_limit: Optional[float],
+    ) -> None:
+        self.title_label.setText(display_name or tag)
+
+        subtitle_bits = []
+        if display_name and display_name != tag:
+            subtitle_bits.append(f"Tag: {tag}")
+        if units:
+            subtitle_bits.append(f"Units: {units}")
+        self.subtitle_label.setText(" • ".join(subtitle_bits))
+
+        def format_bounds(label: str, low_val: Optional[float], high_val: Optional[float], fallback: str) -> str:
+            bounds: List[str] = []
+            if low_val is not None:
+                bounds.append(str(low_val))
+            if high_val is not None:
+                bounds.append(str(high_val))
+            return f"{label}: [{' – '.join(bounds)}]" if bounds else fallback
+
+        self.oper_label.setText(
+            format_bounds("Operational", low_oper, high_oper, "Operational: auto range")
+        )
+        self.limit_label.setText(
+            format_bounds("Regulatory limit", low_limit, high_limit, "Regulatory limit: none set")
+        )
+
+    def update_values(
+        self,
+        current_val: Optional[float],
+        last_avg: Optional[float],
+        live_avg: Optional[float],
+        gauge_min: float,
+        gauge_max: float,
+        current_color: str,
+        last_color: str,
+        live_color: str,
+        current_detail: str,
+        last_detail: str,
+        live_detail: str,
+    ) -> None:
+        self.qa_label.setText(current_detail)
+        self.current_display.update_display(current_val, gauge_min, gauge_max, current_color, current_detail)
+        self.last_display.update_display(last_avg, gauge_min, gauge_max, last_color, last_detail)
+        self.live_display.update_display(live_avg, gauge_min, gauge_max, live_color, live_detail)
 # ------------------- background polling thread -------------------
 
 
@@ -485,6 +664,8 @@ class MainWindow(QMainWindow):
         self._stale_tracker: Dict[str, Dict[str, object]] = {}
         self._log_size_warned = False
         self.lockdown_enabled = False
+        self.gauge_cards: Dict[str, GaugeCard] = {}
+        self._gauge_spacer: Optional[QSpacerItem] = None
 
         # stable tag ordering for the dashboard
         self.tag_order: List[str] = []
@@ -977,6 +1158,15 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(16, 16, 16, 16)
         right_layout.setSpacing(12)
 
+        self.dashboard_tabs = QTabWidget()
+        self.dashboard_tabs.setObjectName("dashboardTabs")
+
+        # ----- Table tab -----
+        table_tab = QWidget()
+        table_layout = QVBoxLayout(table_tab)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setSpacing(12)
+
         dash_header_layout = QHBoxLayout()
         dash_title = QLabel("Tag Dashboard")
         dash_title_font = QFont()
@@ -991,7 +1181,7 @@ class MainWindow(QMainWindow):
         dash_header_layout.addStretch(1)
         dash_header_layout.addWidget(self.rows_summary_label, alignment=Qt.AlignRight)
 
-        right_layout.addLayout(dash_header_layout)
+        table_layout.addLayout(dash_header_layout)
 
         self.table = QTableWidget()
         # Alias + Tag + 3 metrics + QA flag
@@ -1014,7 +1204,39 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
 
-        right_layout.addWidget(self.table, stretch=1)
+        table_layout.addWidget(self.table, stretch=1)
+
+        # ----- Gauges tab -----
+        gauges_tab = QWidget()
+        gauges_layout = QVBoxLayout(gauges_tab)
+        gauges_layout.setContentsMargins(0, 0, 0, 0)
+        gauges_layout.setSpacing(10)
+
+        gauges_header = QLabel("Gauges (Current, Last Hour, Current Hour Avg)")
+        gauges_header_font = QFont()
+        gauges_header_font.setPointSize(13)
+        gauges_header_font.setBold(True)
+        gauges_header.setFont(gauges_header_font)
+
+        gauges_layout.addWidget(gauges_header)
+
+        self.gauge_scroll = QScrollArea()
+        self.gauge_scroll.setWidgetResizable(True)
+        self.gauge_container = QWidget()
+        self.gauge_list_layout = QVBoxLayout(self.gauge_container)
+        self.gauge_list_layout.setSpacing(12)
+        self.gauge_list_layout.setContentsMargins(4, 4, 4, 4)
+        self._gauge_spacer = QSpacerItem(
+            20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding
+        )
+        self.gauge_list_layout.addItem(self._gauge_spacer)
+        self.gauge_scroll.setWidget(self.gauge_container)
+        gauges_layout.addWidget(self.gauge_scroll)
+
+        self.dashboard_tabs.addTab(table_tab, "Table")
+        self.dashboard_tabs.addTab(gauges_tab, "Gauges")
+
+        right_layout.addWidget(self.dashboard_tabs, stretch=1)
 
         main_content.addWidget(right_frame, stretch=7)
 
@@ -1149,6 +1371,31 @@ class MainWindow(QMainWindow):
             QPushButton:pressed {
                 background-color: #282d35;
             }
+            QTabWidget::pane {
+                border: 1px solid #2b323c;
+                border-radius: 8px;
+            }
+            QTabBar::tab {
+                background: #1c2026;
+                color: #e0e6ed;
+                padding: 8px 14px;
+                border: 1px solid #2b323c;
+                border-bottom-color: #2b323c;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                margin-right: 2px;
+            }
+            QTabBar::tab:selected {
+                background: #252b35;
+            }
+            QTabBar::tab:hover {
+                background: #2d3441;
+            }
+            #gaugeCard {
+                background-color: #1c2026;
+                border-radius: 10px;
+                border: 1px solid #2b323c;
+            }
 
             QPushButton#primaryButton {
                 background-color: #43a047;
@@ -1195,6 +1442,87 @@ class MainWindow(QMainWindow):
             }
             """
         )
+
+    # ---------------- gauge helpers ----------------
+
+    @staticmethod
+    def _status_color(status: str) -> str:
+        if status == "good":
+            return "#4caf50"
+        if status == "warning":
+            return "#fdd835"
+        if status == "bad":
+            return "#ef5350"
+        return "#78909c"
+
+    @staticmethod
+    def _classify_value(value: Optional[float], low: Optional[float], high: Optional[float]) -> str:
+        if low is None or high is None:
+            return "unknown"
+        try:
+            num_val = float(value) if value is not None else float("nan")
+        except Exception:
+            return "unknown"
+
+        if num_val != num_val:
+            return "unknown"
+
+        if high < low:
+            low, high = high, low
+
+        if low <= num_val <= high:
+            return "good"
+
+        width = max(1e-6, high - low)
+        if num_val < low and (low - num_val) <= 0.1 * width:
+            return "warning"
+        if num_val > high and (num_val - high) <= 0.1 * width:
+            return "warning"
+
+        return "bad"
+
+    @staticmethod
+    def _compute_gauge_range(
+        low: Optional[float], high: Optional[float], sample_values: List[Optional[float]]
+    ) -> Tuple[float, float, float, float]:
+        values = [
+            float(v)
+            for v in sample_values
+            if isinstance(v, (int, float)) and v == v  # filter NaN
+        ]
+
+        if low is not None and high is not None and high != low:
+            if high < low:
+                low, high = high, low
+            center = (low + high) / 2.0
+            span = max(1.0, abs(high - low) * 1.5)
+            gmin = round(center - span / 2.0, 2)
+            gmax = round(center + span / 2.0, 2)
+            return low, high, gmin, gmax
+
+        if values:
+            vmin = min(values)
+            vmax = max(values)
+            if vmin == vmax:
+                vmin -= 0.5
+                vmax += 0.5
+        else:
+            vmin = 0.0
+            vmax = 1.0
+
+        center = (vmin + vmax) / 2.0
+        span = max(1.0, (vmax - vmin) * 1.5)
+        gmin = round(center - span / 2.0, 2)
+        gmax = round(center + span / 2.0, 2)
+        return vmin, vmax, gmin, gmax
+
+    @staticmethod
+    def _safe_float(value: object) -> Optional[float]:
+        try:
+            val = float(value)
+            return val
+        except Exception:
+            return None
 
     # ---------------- settings ----------------
 
@@ -1946,6 +2274,94 @@ class MainWindow(QMainWindow):
             )
             self.table.setItem(row, 5, item(qa_flag))
 
+        self._update_gauges(tags)
+
+    def _update_gauges(self, tags: List[str]) -> None:
+        if not hasattr(self, "gauge_list_layout"):
+            return
+
+        if self._gauge_spacer is not None:
+            self.gauge_list_layout.removeItem(self._gauge_spacer)
+
+        active_tags: List[str] = []
+        for tag in tags:
+            card = self.gauge_cards.get(tag)
+            if card is None:
+                card = GaugeCard(tag)
+                self.gauge_cards[tag] = card
+            else:
+                self.gauge_list_layout.removeWidget(card)
+
+            thresholds_entry = self.thresholds.get(tag, {}) if isinstance(self.thresholds.get(tag, {}), dict) else {}
+            alias = thresholds_entry.get("alias") if isinstance(thresholds_entry.get("alias"), str) else None
+            units = thresholds_entry.get("units") if isinstance(thresholds_entry.get("units"), str) else ""
+
+            low_oper = _to_float(thresholds_entry.get("low_oper"))
+            high_oper = _to_float(thresholds_entry.get("high_oper"))
+            low_limit = _to_float(thresholds_entry.get("low_limit"))
+            high_limit = _to_float(thresholds_entry.get("high_limit"))
+
+            alias_display = alias or self.alias_map.get(tag, "") or tag
+            card.update_metadata(alias_display, tag, units or "", low_oper, high_oper, low_limit, high_limit)
+
+            entry = self.current_values.get(tag, (None, ""))
+            if isinstance(entry, tuple) and len(entry) >= 2:
+                current_val_raw, qa_flag = entry[0], entry[1]
+            else:
+                current_val_raw, qa_flag = entry, ""
+
+            current_val = self._safe_float(current_val_raw)
+            last_avg = self._safe_float(self.last_hour_avg.get(tag))
+            live_avg = self._safe_float(self.current_hour_preview.get(tag))
+
+            sample_vals: List[Optional[float]] = [current_val, last_avg, live_avg]
+            low_for_range = low_oper if low_oper is not None else low_limit
+            high_for_range = high_oper if high_oper is not None else high_limit
+            low_eff, high_eff, gauge_min, gauge_max = self._compute_gauge_range(
+                low_for_range, high_for_range, sample_vals
+            )
+            low_for_class = low_oper if low_oper is not None else low_eff
+            high_for_class = high_oper if high_oper is not None else high_eff
+
+            cur_status = self._classify_value(current_val, low_for_class, high_for_class)
+            last_status = self._classify_value(last_avg, low_for_class, high_for_class)
+            live_status = self._classify_value(live_avg, low_for_class, high_for_class)
+
+            status_bits = []
+            if cur_status != "unknown":
+                status_bits.append(f"Status: {cur_status}")
+            if qa_flag:
+                status_bits.append(f"QA: {qa_flag}")
+            current_detail = " | ".join(status_bits) if status_bits else "Status: unknown"
+            last_detail = "Status: unknown" if last_status == "unknown" else f"Status: {last_status}"
+            live_detail = "Status: unknown" if live_status == "unknown" else f"Status: {live_status}"
+
+            card.update_values(
+                current_val,
+                last_avg,
+                live_avg,
+                gauge_min,
+                gauge_max,
+                self._status_color(cur_status),
+                self._status_color(last_status),
+                self._status_color(live_status),
+                current_detail,
+                last_detail,
+                live_detail,
+            )
+
+            self.gauge_list_layout.addWidget(card)
+            active_tags.append(tag)
+
+        stale_tags = set(self.gauge_cards.keys()) - set(active_tags)
+        for tag in stale_tags:
+            widget = self.gauge_cards.pop(tag)
+            widget.setParent(None)
+            widget.deleteLater()
+
+        self._gauge_spacer = QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding)
+        self.gauge_list_layout.addItem(self._gauge_spacer)
+
     # ---------------- logging & lifecycle ----------------
 
     def log_message(self, msg: str):
@@ -1976,7 +2392,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     win = MainWindow()
-    win.show()
+    win.showMaximized()
     sys.exit(app.exec())
 
 

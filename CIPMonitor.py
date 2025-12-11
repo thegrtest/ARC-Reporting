@@ -31,7 +31,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Tuple, List, Optional
 
 import pandas as pd
-from dash import Dash, dcc, html, Input, Output, State
+from dash import Dash, dcc, html, Input, Output, State, dash_table
 import dash_daq as daq
 
 # ----------------- config -----------------
@@ -41,6 +41,7 @@ HOURLY_CSV = os.path.join(LOG_DIR, "hourly_averages.csv")
 THRESHOLDS_JSON = os.path.join(LOG_DIR, "thresholds.json")
 SETTINGS_JSON = "settings.json"  # optional: to discover tags before any data
 ENV_EVENTS_CSV = os.path.join(LOG_DIR, "env_events.csv")
+EXCEEDANCES_CSV = os.path.join(LOG_DIR, "exceedances.csv")
 CONFIG_CHANGES_CSV = os.path.join(LOG_DIR, "config_changes.csv")
 SYSTEM_HEALTH_JSON = os.path.join(LOG_DIR, "system_health.json")
 CONFIG_CHANGE_HEADERS = [
@@ -172,6 +173,67 @@ def load_latest_raw_df() -> pd.DataFrame:
     return df
 
 
+def load_raw_history(max_days: int = 30) -> pd.DataFrame:
+    """Load up to `max_days` of raw_data_YYYY-MM-DD.csv files."""
+
+    base_cols = [
+        "timestamp",
+        "date",
+        "time",
+        "tag",
+        "alias",
+        "value",
+        "status",
+        "qa_flag",
+    ]
+
+    if not os.path.isdir(LOG_DIR):
+        return pd.DataFrame(columns=base_cols)
+
+    today = datetime.now().date()
+    cutoff_date = today - timedelta(days=max_days - 1)
+    candidates: List[Tuple[datetime, str]] = []
+
+    for name in os.listdir(LOG_DIR):
+        if not (name.startswith("raw_data_") and name.endswith(".csv")):
+            continue
+        try:
+            date_part = name.replace("raw_data_", "").replace(".csv", "")
+            file_date = datetime.strptime(date_part, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if file_date < cutoff_date:
+            continue
+        candidates.append((datetime.combine(file_date, datetime.min.time()), os.path.join(LOG_DIR, name)))
+
+    if not candidates:
+        return pd.DataFrame(columns=base_cols)
+
+    candidates.sort(key=lambda tup: tup[0])
+
+    frames: List[pd.DataFrame] = []
+    for _, path in candidates:
+        try:
+            df = pd.read_csv(path)
+            for col in base_cols:
+                if col not in df.columns:
+                    df[col] = None
+            frames.append(df[base_cols])
+        except Exception:
+            continue
+
+    if not frames:
+        return pd.DataFrame(columns=base_cols)
+
+    df = pd.concat(frames, ignore_index=True)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df["value_num"] = pd.to_numeric(df.get("value", None), errors="coerce")
+    df["status_str"] = df.get("status", "").astype(str)
+    df["qa_flag"] = df.get("qa_flag", "OK").fillna("OK")
+    df["ok"] = df["qa_flag"].astype(str).str.upper().eq("OK")
+    return df
+
+
 def load_hourly_stats() -> pd.DataFrame:
     """
     Load hourly averages as DataFrame with columns:
@@ -218,6 +280,42 @@ def load_env_events() -> pd.DataFrame:
         except Exception:
             df["duration_sec"] = None
 
+    return df
+
+
+def load_exceedances() -> pd.DataFrame:
+    if not os.path.exists(EXCEEDANCES_CSV):
+        return pd.DataFrame(
+            columns=[
+                "tag",
+                "start_time",
+                "end_time",
+                "duration_sec",
+                "max_value",
+                "avg_value_over_event",
+                "limit_value",
+            ]
+        )
+    try:
+        df = pd.read_csv(EXCEEDANCES_CSV)
+    except Exception:
+        return pd.DataFrame(
+            columns=[
+                "tag",
+                "start_time",
+                "end_time",
+                "duration_sec",
+                "max_value",
+                "avg_value_over_event",
+                "limit_value",
+            ]
+        )
+
+    for col in ["start_time", "end_time"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+        else:
+            df[col] = pd.NaT
     return df
 
 
@@ -318,6 +416,183 @@ def load_system_health() -> Dict[str, object]:
         default["status"] = "Error"
         default["status_reason"] = "Failed to read system_health.json"
     return default
+
+
+def _overlap_seconds(start: datetime, end: datetime, window_start: datetime, window_end: datetime) -> float:
+    latest_start = max(start, window_start)
+    earliest_end = min(end, window_end)
+    delta = (earliest_end - latest_start).total_seconds()
+    return max(0.0, delta)
+
+
+def detect_exceedance_events(
+    raw_df: pd.DataFrame,
+    thresholds: Dict[str, Dict[str, object]],
+    merge_gap: int = 1,
+    stable_samples: int = 2,
+) -> pd.DataFrame:
+    """
+    Scan raw data for limit exceedances and aggregate them into events.
+
+    Args:
+        raw_df: Raw samples across days.
+        thresholds: Per-tag thresholds containing high_limit/low_limit.
+        merge_gap: Number of consecutive invalid/missing samples to tolerate inside an event.
+        stable_samples: Consecutive in-range samples required to close an event.
+    """
+
+    columns = [
+        "tag",
+        "start_time",
+        "end_time",
+        "duration_sec",
+        "max_value",
+        "avg_value_over_event",
+        "limit_value",
+    ]
+
+    if raw_df.empty or "tag" not in raw_df.columns:
+        return pd.DataFrame(columns=columns)
+
+    df = raw_df.copy()
+    df = df.sort_values("timestamp")
+    df["value_num"] = pd.to_numeric(df.get("value_num", df.get("value", None)), errors="coerce")
+    df["ok"] = df.get("ok", True)
+
+    events: List[Dict[str, object]] = []
+
+    for tag, group in df.groupby("tag"):
+        entry = thresholds.get(tag, {}) if isinstance(thresholds.get(tag, {}), dict) else {}
+        low_limit = _to_float(entry.get("low_limit"))
+        high_limit = _to_float(entry.get("high_limit"))
+
+        if low_limit is None and high_limit is None:
+            continue
+
+        active = False
+        start_ts: Optional[datetime] = None
+        last_exceed_ts: Optional[datetime] = None
+        values: List[float] = []
+        limit_value: Optional[float] = None
+        stable_count = 0
+        gap_run = 0
+
+        for _, row in group.iterrows():
+            ts = row.get("timestamp")
+            if pd.isna(ts):
+                continue
+            ts = pd.to_datetime(ts)
+            ok = bool(row.get("ok", False))
+            val = row.get("value_num")
+            try:
+                num_val = float(val)
+            except Exception:
+                num_val = float("nan")
+
+            if not ok or num_val != num_val:
+                if active:
+                    gap_run += 1
+                    stable_count = 0
+                    if gap_run > merge_gap and start_ts and last_exceed_ts:
+                        duration = max(1, int((last_exceed_ts - start_ts).total_seconds()))
+                        events.append(
+                            {
+                                "tag": str(tag),
+                                "start_time": start_ts,
+                                "end_time": last_exceed_ts,
+                                "duration_sec": duration,
+                                "max_value": max(values) if values else float("nan"),
+                                "avg_value_over_event": float(sum(values) / len(values)) if values else float("nan"),
+                                "limit_value": limit_value,
+                            }
+                        )
+                        active = False
+                        values = []
+                        limit_value = None
+                continue
+
+            gap_run = 0
+
+            exceeds_high = high_limit is not None and num_val > high_limit
+            exceeds_low = low_limit is not None and num_val < low_limit
+            exceeds = exceeds_high or exceeds_low
+
+            if exceeds:
+                if not active:
+                    active = True
+                    start_ts = ts
+                    values = []
+                    limit_value = high_limit if exceeds_high else low_limit
+                last_exceed_ts = ts
+                values.append(num_val)
+                stable_count = 0
+                continue
+
+            # In-range sample
+            if active and start_ts and last_exceed_ts:
+                stable_count += 1
+                if stable_count >= stable_samples:
+                    duration = max(1, int((last_exceed_ts - start_ts).total_seconds()))
+                    events.append(
+                        {
+                            "tag": str(tag),
+                            "start_time": start_ts,
+                            "end_time": last_exceed_ts,
+                            "duration_sec": duration,
+                            "max_value": max(values) if values else float("nan"),
+                            "avg_value_over_event": float(sum(values) / len(values)) if values else float("nan"),
+                            "limit_value": limit_value,
+                        }
+                    )
+                    active = False
+                    values = []
+                    limit_value = None
+                    stable_count = 0
+
+        if active and start_ts and last_exceed_ts:
+            duration = max(1, int((last_exceed_ts - start_ts).total_seconds()))
+            events.append(
+                {
+                    "tag": str(tag),
+                    "start_time": start_ts,
+                    "end_time": last_exceed_ts,
+                    "duration_sec": duration,
+                    "max_value": max(values) if values else float("nan"),
+                    "avg_value_over_event": float(sum(values) / len(values)) if values else float("nan"),
+                    "limit_value": limit_value,
+                }
+            )
+
+    if not events:
+        return pd.DataFrame(columns=columns)
+
+    events_df = pd.DataFrame(events)
+    events_df = events_df.sort_values("start_time", ascending=False)
+    return events_df
+
+
+def save_exceedances(events_df: pd.DataFrame) -> None:
+    ensure_dir(os.path.dirname(EXCEEDANCES_CSV) or ".")
+    headers = [
+        "tag",
+        "start_time",
+        "end_time",
+        "duration_sec",
+        "max_value",
+        "avg_value_over_event",
+        "limit_value",
+    ]
+    if events_df.empty:
+        ensure_csv(EXCEEDANCES_CSV, headers)
+        return
+
+    try:
+        df = events_df.copy()
+        df["start_time"] = df["start_time"].astype(str)
+        df["end_time"] = df["end_time"].astype(str)
+        df.to_csv(EXCEEDANCES_CSV, index=False, columns=headers)
+    except Exception:
+        pass
 
 
 def save_thresholds(th: Dict[str, Dict[str, float]]) -> None:
@@ -586,6 +861,105 @@ def compute_quality_metrics(
                     stat["longest_gap"] = 0.0
 
     return stats
+
+
+def _month_bounds(now: datetime) -> Tuple[datetime, datetime]:
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if start.month == 12:
+        end = start.replace(year=start.year + 1, month=1)
+    else:
+        end = start.replace(month=start.month + 1)
+    return start, end
+
+
+def compute_exceedance_minutes(
+    events_df: pd.DataFrame, window_start: datetime, window_end: datetime
+) -> float:
+    if events_df.empty:
+        return 0.0
+    total_sec = 0.0
+    for _, row in events_df.iterrows():
+        start = row.get("start_time")
+        end = row.get("end_time")
+        if pd.isna(start) or pd.isna(end):
+            continue
+        start_dt = pd.to_datetime(start)
+        end_dt = pd.to_datetime(end)
+        total_sec += _overlap_seconds(start_dt, end_dt, window_start, window_end)
+    return total_sec / 60.0
+
+
+def _sample_within_limits(val: float, low: Optional[float], high: Optional[float]) -> bool:
+    if low is not None and val < low:
+        return False
+    if high is not None and val > high:
+        return False
+    return True
+
+
+def compute_within_limit_percent(
+    raw_df: pd.DataFrame, thresholds: Dict[str, Dict[str, object]], window: timedelta
+) -> float:
+    if raw_df.empty or "timestamp" not in raw_df.columns:
+        return 0.0
+
+    cutoff = datetime.now() - window
+    try:
+        window_df = raw_df[raw_df["timestamp"] >= cutoff]
+    except Exception:
+        window_df = raw_df
+
+    if window_df.empty:
+        return 0.0
+
+    window_df = window_df[window_df.get("ok", False)]
+    total = 0
+    within = 0
+
+    for _, row in window_df.iterrows():
+        tag = str(row.get("tag"))
+        entry = thresholds.get(tag, {}) if isinstance(thresholds.get(tag, {}), dict) else {}
+        low_limit = _to_float(entry.get("low_limit"))
+        high_limit = _to_float(entry.get("high_limit"))
+        try:
+            val = float(row.get("value_num"))
+        except Exception:
+            continue
+        if val != val:
+            continue
+
+        total += 1
+        if _sample_within_limits(val, low_limit, high_limit):
+            within += 1
+
+    if total == 0:
+        return 0.0
+
+    return round((within / float(total)) * 100.0, 1)
+
+
+def compute_compliance_summary(
+    raw_df: pd.DataFrame,
+    thresholds: Dict[str, Dict[str, object]],
+    events_df: pd.DataFrame,
+) -> Dict[str, float]:
+    now = datetime.now()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+    month_start, month_end = _month_bounds(now)
+
+    today_minutes = compute_exceedance_minutes(events_df, day_start, day_end)
+    month_minutes = compute_exceedance_minutes(events_df, month_start, month_end)
+
+    pct_24h = compute_within_limit_percent(raw_df, thresholds, timedelta(hours=24))
+    pct_30d = compute_within_limit_percent(raw_df, thresholds, timedelta(days=30))
+
+    return {
+        "today_minutes": today_minutes,
+        "month_minutes": month_minutes,
+        "pct_24h": pct_24h,
+        "pct_30d": pct_30d,
+    }
 
 
 def looks_numeric_tag(tag: str) -> bool:
@@ -992,6 +1366,124 @@ def build_quality_card(stats: Dict[str, Dict[str, float]]) -> html.Div:
     )
 
 
+def build_stat_tile(title: str, value: str, subtitle: str = "") -> html.Div:
+    return html.Div(
+        style={
+            "backgroundColor": "#1e252c",
+            "padding": "10px",
+            "borderRadius": "8px",
+            "minWidth": "200px",
+            "color": "#e0e6ed",
+        },
+        children=[
+            html.Div(title, style={"fontSize": "12px", "color": "#90a4ae"}),
+            html.Div(value, style={"fontSize": "18px", "fontWeight": "700", "marginTop": "4px"}),
+            html.Div(subtitle, style={"fontSize": "11px", "color": "#b0bec5", "marginTop": "2px"}),
+        ],
+    )
+
+
+def build_exceedance_table(events_df: pd.DataFrame, limit: int = 20):
+    if events_df.empty:
+        return html.Div(
+            "No exceedance events found in the current window.",
+            style={"color": "#90a4ae", "fontSize": "11px"},
+        )
+
+    table_df = events_df.copy()
+    table_df = table_df.sort_values("start_time", ascending=False).head(limit)
+    table_df["start_time"] = table_df["start_time"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    table_df["end_time"] = table_df["end_time"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    table_df["duration_min"] = (table_df["duration_sec"].astype(float) / 60.0).round(1)
+
+    return dash_table.DataTable(
+        data=table_df[
+            [
+                "tag",
+                "start_time",
+                "end_time",
+                "duration_min",
+                "max_value",
+                "avg_value_over_event",
+                "limit_value",
+            ]
+        ].to_dict("records"),
+        columns=[
+            {"name": "Tag", "id": "tag"},
+            {"name": "Start", "id": "start_time"},
+            {"name": "End", "id": "end_time"},
+            {"name": "Duration (min)", "id": "duration_min"},
+            {"name": "Max", "id": "max_value"},
+            {"name": "Avg", "id": "avg_value_over_event"},
+            {"name": "Limit", "id": "limit_value"},
+        ],
+        style_header={"backgroundColor": "#1c2026", "color": "#b0bec5"},
+        style_cell={
+            "backgroundColor": "#202632",
+            "color": "#e0e6ed",
+            "fontSize": "11px",
+            "padding": "6px",
+            "textAlign": "left",
+        },
+        page_size=limit,
+    )
+
+
+def build_compliance_view(summary: Dict[str, float], events_df: pd.DataFrame) -> html.Div:
+    tiles = html.Div(
+        style={"display": "flex", "gap": "10px", "flexWrap": "wrap"},
+        children=[
+            build_stat_tile(
+                "Today's exceedance minutes",
+                f"{summary.get('today_minutes', 0.0):.1f} min",
+            ),
+            build_stat_tile(
+                "Month-to-date exceedance minutes",
+                f"{summary.get('month_minutes', 0.0):.1f} min",
+            ),
+        ],
+    )
+
+    gauges = html.Div(
+        style={"display": "flex", "gap": "20px", "flexWrap": "wrap"},
+        children=[
+            daq.Gauge(
+                min=0,
+                max=100,
+                value=summary.get("pct_24h", 0.0),
+                showCurrentValue=True,
+                label="Within limits (last 24h)",
+                color="#4caf50",
+                size=170,
+            ),
+            daq.Gauge(
+                min=0,
+                max=100,
+                value=summary.get("pct_30d", 0.0),
+                showCurrentValue=True,
+                label="Within limits (last 30d)",
+                color="#81c784",
+                size=170,
+            ),
+        ],
+    )
+
+    table = html.Div(
+        children=[
+            html.Div(
+                "Recent exceedance events",
+                style={"fontSize": "12px", "fontWeight": "600", "marginBottom": "6px"},
+            ),
+            build_exceedance_table(events_df, limit=20),
+        ]
+    )
+
+    return html.Div(
+        style={"padding": "12px", "display": "flex", "flexDirection": "column", "gap": "12px"},
+        children=[tiles, gauges, table],
+    )
+
+
 # ----------------- dash app -----------------
 
 app = Dash(__name__)
@@ -1099,6 +1591,22 @@ app.layout = html.Div(
                                 "flexDirection": "column",
                                 "gap": "14px",
                             },
+                        ),
+                    ],
+                ),
+                dcc.Tab(
+                    label="Compliance",
+                    value="compliance",
+                    style={"backgroundColor": "#1c2026", "color": "#b0bec5"},
+                    selected_style={
+                        "backgroundColor": "#20242b",
+                        "color": "white",
+                        "fontWeight": "600",
+                    },
+                    children=[
+                        html.Div(
+                            id="compliance-content",
+                            style={"padding": "12px"},
                         ),
                     ],
                 ),
@@ -1376,6 +1884,25 @@ def save_thresholds_callback(
     has_limit = (low_limit is not None) or (high_limit is not None)
     limit_range = f"limits [{low_limit}, {high_limit}]" if has_limit else "limits not set"
     return f"Saved {tag}: {op_range}; {limit_range}"
+
+
+@app.callback(
+    Output("compliance-content", "children"),
+    Input("refresh-interval", "n_intervals"),
+)
+def refresh_compliance_tab(n):
+    try:
+        thresholds = load_thresholds()
+        raw_df = load_raw_history(max_days=30)
+        events_df = detect_exceedance_events(raw_df, thresholds)
+        save_exceedances(events_df)
+        summary = compute_compliance_summary(raw_df, thresholds, events_df)
+        return build_compliance_view(summary, events_df)
+    except Exception as exc:
+        return html.Div(
+            f"Unable to compute compliance view: {exc}",
+            style={"color": "#ef9a9a", "fontSize": "11px"},
+        )
 
 
 @app.callback(

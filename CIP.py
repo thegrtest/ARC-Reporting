@@ -61,14 +61,14 @@ from datetime import datetime, timedelta, date
 from typing import Dict, Tuple, List, Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, QMutex, QMutexLocker, QTimer
-from PySide6.QtGui import QPalette, QColor, QAction, QFont
+from PySide6.QtGui import QPalette, QColor, QAction, QFont, QIcon, QPixmap, QPainter
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QLabel, QPushButton, QTextEdit, QTableWidget,
     QTableWidgetItem, QMessageBox, QGroupBox, QFormLayout, QSpinBox,
     QFileDialog, QHeaderView, QPlainTextEdit, QStatusBar, QFrame,
     QSpacerItem, QSizePolicy, QComboBox, QCheckBox, QScrollArea, QTabWidget,
-    QProgressBar
+    QProgressBar, QSplashScreen
 )
 
 try:
@@ -155,6 +155,12 @@ def chunked(seq: List[str], size: int):
 def hour_bucket(dt: datetime) -> datetime:
     """Return datetime truncated to hour (start of hour)."""
     return dt.replace(minute=0, second=0, microsecond=0)
+
+
+def resource_path(name: str) -> str:
+    """Return an absolute path for bundled assets (icons, etc.)."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, name)
 
 
 class GaugeDisplay(QWidget):
@@ -648,6 +654,8 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("CIP Tag Poller & Dashboard")
+        if QApplication.instance() and not QApplication.instance().windowIcon().isNull():
+            self.setWindowIcon(QApplication.instance().windowIcon())
         self._apply_initial_size()
 
         # --- state ---
@@ -937,11 +945,15 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         central = QWidget()
-        self.setCentralWidget(central)
 
         root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(12, 12, 12, 12)
         root_layout.setSpacing(10)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(central)
+        self.setCentralWidget(scroll)
 
         # ===== Header bar =====
         header_frame = QFrame()
@@ -2386,13 +2398,62 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+# ------------------- launch helpers -------------------
+
+
+def _build_splash_pixmap(icon: QIcon) -> QPixmap:
+    """Create a splash pixmap using the app icon when available."""
+    screen = QApplication.primaryScreen()
+    target_size = 360
+    if screen:
+        available = screen.availableGeometry()
+        target_size = int(min(available.width(), available.height()) * 0.35)
+        target_size = max(240, min(target_size, 512))
+
+    if not icon.isNull():
+        pixmap = icon.pixmap(target_size, target_size)
+    else:
+        pixmap = QPixmap()
+
+    if pixmap.isNull():
+        pixmap = QPixmap(target_size, target_size)
+        pixmap.fill(QColor("#1c252c"))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QColor("#9bd6ff"))
+        painter.setFont(QFont("Arial", int(target_size / 8), QFont.Bold))
+        painter.drawText(pixmap.rect(), Qt.AlignCenter, "CIP Tag\nPoller")
+        painter.end()
+
+    return pixmap
+
+
 # ------------------- main entry -------------------
 
 
 def main():
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
     app = QApplication(sys.argv)
+
+    icon_path = resource_path("ram.ico")
+    app_icon = QIcon(icon_path) if os.path.exists(icon_path) else QIcon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
+
+    splash_pixmap = _build_splash_pixmap(app_icon)
+    splash = QSplashScreen(splash_pixmap)
+    splash.setWindowFlag(Qt.WindowStaysOnTopHint)
+    splash.show()
+    app.processEvents()
+
     win = MainWindow()
+    if not app_icon.isNull():
+        win.setWindowIcon(app_icon)
     win.showMaximized()
+
+    splash.finish(win)
     sys.exit(app.exec())
 
 

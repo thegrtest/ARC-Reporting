@@ -436,6 +436,8 @@ class MainWindow(QMainWindow):
         self.current_hour_preview: Dict[str, float] = {}
         self.current_hour_start: Optional[datetime] = None
         self.hour_accumulators: Dict[str, Dict[str, float]] = {}
+        self.last_success_ts: Dict[str, datetime] = {}
+        self._stale_tracker: Dict[str, Dict[str, object]] = {}
 
         # stable tag ordering for the dashboard
         self.tag_order: List[str] = []
@@ -444,12 +446,19 @@ class MainWindow(QMainWindow):
         # last loaded settings snapshot for change detection
         self._last_settings_snapshot: Dict[str, object] = {}
 
+        # data quality controls
+        self.stale_intervals_threshold = 5
+        self.gap_threshold_minutes = 5
+        self.moving_tags: List[str] = []
+        self.thresholds: Dict[str, Dict[str, float]] = {}
+
         # default config
         self.machine_name = ""
         self.log_dir = os.path.join("logs")
         self.raw_csv_path = ""   # will be set based on current date
         self.current_log_date: date = datetime.now().date()
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
+        self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
 
         # UI
         self._build_ui()
@@ -511,9 +520,28 @@ class MainWindow(QMainWindow):
         path = self._raw_path_for_date(d)
         ensure_csv(
             path,
-            ["timestamp", "date", "time", "tag", "alias", "value", "status"],
+            ["timestamp", "date", "time", "tag", "alias", "value", "status", "qa_flag"],
         )
         return path
+
+    def _ensure_env_events_csv(self) -> None:
+        ensure_csv(
+            self.env_events_path,
+            ["timestamp", "event_type", "tag", "duration_sec"],
+        )
+
+    def _load_thresholds_from_log_dir(self) -> Dict[str, Dict[str, float]]:
+        path = os.path.join(self.log_dir, "thresholds.json")
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return {}
+        return {}
 
     # ---------------- UI construction ----------------
 
@@ -607,6 +635,20 @@ class MainWindow(QMainWindow):
         self.chunk_spin.setRange(1, 200)
         self.chunk_spin.setValue(20)
         cfg_layout.addRow(QLabel("Chunk Size (tags per read):"), self.chunk_spin)
+
+        self.stale_spin = QSpinBox()
+        self.stale_spin.setRange(2, 1000)
+        self.stale_spin.setValue(self.stale_intervals_threshold)
+        cfg_layout.addRow(QLabel("Stale after N identical reads:"), self.stale_spin)
+
+        self.gap_spin = QSpinBox()
+        self.gap_spin.setRange(1, 1440)
+        self.gap_spin.setValue(self.gap_threshold_minutes)
+        cfg_layout.addRow(QLabel("Data gap threshold (minutes):"), self.gap_spin)
+
+        self.moving_tags_edit = QLineEdit()
+        self.moving_tags_edit.setPlaceholderText("Comma-separated tag names for stale detection")
+        cfg_layout.addRow(QLabel("Tags expected to move:"), self.moving_tags_edit)
 
         # Machine state tag + behavior
         self.machine_state_tag_edit = QLineEdit()
@@ -727,7 +769,7 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(dash_header_layout)
 
         self.table = QTableWidget()
-        # Alias + Tag + 3 metrics + status
+        # Alias + Tag + 3 metrics + QA flag
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels(
             [
@@ -736,7 +778,7 @@ class MainWindow(QMainWindow):
                 "Current Value",
                 "Last Hour Avg",
                 "Current Hour Avg (so far)",
-                "Status",
+                "QA Flag",
             ]
         )
         header = self.table.horizontalHeader()
@@ -963,6 +1005,23 @@ class MainWindow(QMainWindow):
         self.log_dir_edit.setText(self.log_dir)
 
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
+        self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
+        self._ensure_env_events_csv()
+        self.thresholds = self._load_thresholds_from_log_dir()
+
+        self.stale_intervals_threshold = int(data.get("stale_intervals", 5))
+        self.stale_spin.setValue(self.stale_intervals_threshold)
+
+        self.gap_threshold_minutes = int(data.get("gap_threshold_minutes", 5))
+        self.gap_spin.setValue(self.gap_threshold_minutes)
+
+        moving_raw = data.get("moving_tags", "")
+        if isinstance(moving_raw, list):
+            moving_list = [str(x).strip() for x in moving_raw]
+        else:
+            moving_list = [x.strip() for x in str(moving_raw).split(",") if x.strip()]
+        self.moving_tags = moving_list
+        self.moving_tags_edit.setText(", ".join(self.moving_tags))
 
         # Machine state settings
         self.machine_state_tag_edit.setText(data.get("machine_state_tag", ""))
@@ -1001,6 +1060,9 @@ class MainWindow(QMainWindow):
             "pause_when_down": self.poll_mode_combo.currentIndex() == 1,
             "heartbeat_tag": self.heartbeat_tag_edit.text().strip(),
             "heartbeat_enabled": self.heartbeat_mode_combo.currentIndex() == 1,
+            "stale_intervals": self.stale_spin.value(),
+            "gap_threshold_minutes": self.gap_spin.value(),
+            "moving_tags": [t.strip() for t in self.moving_tags_edit.text().split(",") if t.strip()],
         }
         self.log_dir = data["log_dir"]
         try:
@@ -1100,10 +1162,12 @@ class MainWindow(QMainWindow):
             self.log_dir = path
             self.log_dir_edit.setText(path)
             self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
+            self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
             ensure_csv(
                 self.hourly_csv_path,
                 ["hour_start", "hour_end", "tag", "avg_value", "sample_count"],
             )
+            self._ensure_env_events_csv()
             self.current_log_date = datetime.now().date()
             self.raw_csv_path = self._ensure_raw_csv_for_date(self.current_log_date)
             self.log_message(f"Log directory set to: {path}")
@@ -1121,9 +1185,25 @@ class MainWindow(QMainWindow):
         tags_text = self.tags_edit.toPlainText().strip()
         tags, alias_map = self.parse_tags_and_aliases(tags_text)
 
+        self.log_dir = self.log_dir_edit.text().strip()
+        ensure_dir(self.log_dir)
+        self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
+        self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
+        ensure_csv(
+            self.hourly_csv_path,
+            ["hour_start", "hour_end", "tag", "avg_value", "sample_count"],
+        )
+
         machine_state_tag = self.machine_state_tag_edit.text().strip()
         heartbeat_tag = self.heartbeat_tag_edit.text().strip()
         heartbeat_enabled = (self.heartbeat_mode_combo.currentIndex() == 1)
+
+        self.stale_intervals_threshold = self.stale_spin.value()
+        self.gap_threshold_minutes = self.gap_spin.value()
+        self.moving_tags = [
+            t.strip() for t in self.moving_tags_edit.text().split(",") if t.strip()
+        ]
+        self.thresholds = self._load_thresholds_from_log_dir()
 
         if not tags and not machine_state_tag and not heartbeat_enabled:
             QMessageBox.warning(
@@ -1165,6 +1245,8 @@ class MainWindow(QMainWindow):
         self.current_hour_preview.clear()
         self.current_hour_start = None
         self.hour_accumulators.clear()
+        self.last_success_ts.clear()
+        self._stale_tracker.clear()
         self.update_dashboard()
 
         interval = self.interval_spin.value()
@@ -1174,6 +1256,7 @@ class MainWindow(QMainWindow):
         # ensure current day's raw file exists before starting
         self.current_log_date = datetime.now().date()
         self.raw_csv_path = self._ensure_raw_csv_for_date(self.current_log_date)
+        self._ensure_env_events_csv()
 
         self.poll_thread = PollThread(
             ip=ip,
@@ -1221,6 +1304,69 @@ class MainWindow(QMainWindow):
         """Handle errors emitted from PollThread (no modal boxes)."""
         self.log_message(msg)
 
+    def _update_stale_state(self, tag: str, value: object) -> bool:
+        """Return True if tag is considered stale based on repeated identical values."""
+        tracker = self._stale_tracker.setdefault(tag, {"last": None, "count": 0})
+        last_val = tracker.get("last")
+        if last_val is None:
+            tracker["count"] = 1
+        elif last_val == value:
+            tracker["count"] = int(tracker.get("count", 0)) + 1
+        else:
+            tracker["count"] = 1
+        tracker["last"] = value
+        return tracker.get("count", 0) >= self.stale_intervals_threshold
+
+    def _check_gap_event(self, tag: str, ts: datetime) -> None:
+        """Log a DATA_GAP event if the time since the last successful sample exceeds threshold."""
+        last_ts = self.last_success_ts.get(tag)
+        self.last_success_ts[tag] = ts
+        if not last_ts:
+            return
+        delta_sec = (ts - last_ts).total_seconds()
+        if delta_sec <= self.gap_threshold_minutes * 60:
+            return
+        try:
+            self._ensure_env_events_csv()
+            with open(self.env_events_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([ts.isoformat(timespec="seconds"), "DATA_GAP", tag, int(delta_sec)])
+        except Exception as e:
+            self.log_message(f"Error logging DATA_GAP event: {e}")
+
+    def _determine_qa_flag(self, tag: str, val: object, status: str) -> str:
+        status_lower = str(status).lower()
+        if status_lower != "success":
+            return "PLC_ERROR"
+        if val is None:
+            return "MISSING"
+        try:
+            num_val = float(val)
+        except Exception:
+            return "SUSPECT"
+
+        if num_val != num_val or num_val in (float("inf"), float("-inf")):
+            return "SUSPECT"
+
+        thresholds = self.thresholds.get(tag)
+        if thresholds:
+            try:
+                low = float(thresholds.get("low"))
+                high = float(thresholds.get("high"))
+                if num_val < low or num_val > high:
+                    return "OUT_OF_RANGE"
+            except Exception:
+                pass
+
+        if tag in self.moving_tags:
+            if self._update_stale_state(tag, num_val):
+                return "STALE"
+
+        if "manual" in status_lower:
+            return "MANUAL_CORRECTION"
+
+        return "OK"
+
     def handle_poll_data(self, ts_iso: str, data: Dict[str, Tuple[object, str]]):
         """
         Called from background thread with new readings.
@@ -1252,7 +1398,7 @@ class MainWindow(QMainWindow):
             else:
                 ensure_csv(
                     self.raw_csv_path,
-                    ["timestamp", "date", "time", "tag", "alias", "value", "status"],
+                    ["timestamp", "date", "time", "tag", "alias", "value", "status", "qa_flag"],
                 )
 
             date_str = ts.strftime("%Y-%m-%d")
@@ -1262,18 +1408,21 @@ class MainWindow(QMainWindow):
                 with open(self.raw_csv_path, "a", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     for tag, (val, status) in data.items():
-                        self.current_values[tag] = (val, status)
+                        qa_flag = self._determine_qa_flag(tag, val, status)
+                        self.current_values[tag] = (val, qa_flag)
                         alias = self.alias_map.get(tag, "")
                         writer.writerow(
-                            [ts_iso, date_str, time_str, tag, alias, val, status]
+                            [ts_iso, date_str, time_str, tag, alias, val, status, qa_flag]
                         )
 
-                        if isinstance(val, (int, float)) and str(status).lower() == "success":
-                            acc = self.hour_accumulators.setdefault(
-                                tag, {"sum": 0.0, "count": 0}
-                            )
-                            acc["sum"] += float(val)
-                            acc["count"] += 1
+                        if qa_flag == "OK":
+                            self._check_gap_event(tag, ts)
+                            if isinstance(val, (int, float)):
+                                acc = self.hour_accumulators.setdefault(
+                                    tag, {"sum": 0.0, "count": 0}
+                                )
+                                acc["sum"] += float(val)
+                                acc["count"] += 1
             except Exception as e:
                 self.log_message(f"Error writing raw CSV: {e}")
 
@@ -1397,9 +1546,12 @@ class MainWindow(QMainWindow):
                         if not tag:
                             continue
                         status = str(row.get("status", "")).lower()
+                        qa_flag = str(row.get("qa_flag", "")).upper()
                         try:
                             val = float(row.get("value", ""))
                         except Exception:
+                            continue
+                        if qa_flag and qa_flag != "OK":
                             continue
                         if status != "success":
                             continue
@@ -1450,7 +1602,7 @@ class MainWindow(QMainWindow):
     def update_dashboard(self):
         """
         Render table rows:
-            Alias | Tag | Current Value | Last Hour Avg | Current Hour Avg (so far) | Status
+            Alias | Tag | Current Value | Last Hour Avg | Current Hour Avg (so far) | QA Flag
         """
         if self.tag_order:
             tags = list(self.tag_order)
@@ -1465,7 +1617,11 @@ class MainWindow(QMainWindow):
         self.rows_summary_label.setText(f"Rows: {len(tags)}")
 
         for row, tag in enumerate(tags):
-            val, status = self.current_values.get(tag, ("", ""))
+            entry = self.current_values.get(tag, ("", ""))
+            if isinstance(entry, tuple) and len(entry) >= 2:
+                val, qa_flag = entry[0], entry[1]
+            else:
+                val, qa_flag = entry, ""
 
             last_avg = self.last_hour_avg.get(tag, "")
             cur_avg = self.current_hour_preview.get(tag, "")
@@ -1490,7 +1646,7 @@ class MainWindow(QMainWindow):
                 4,
                 item(f"{cur_avg:.4f}" if isinstance(cur_avg, (int, float)) else ""),
             )
-            self.table.setItem(row, 5, item(status))
+            self.table.setItem(row, 5, item(qa_flag))
 
     # ---------------- logging & lifecycle ----------------
 

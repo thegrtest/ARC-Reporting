@@ -469,7 +469,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("CIP Tag Poller & Dashboard")
-        self.resize(1300, 750)
+        self._apply_initial_size()
 
         # --- state ---
         self.poll_thread: Optional[PollThread] = None
@@ -527,6 +527,21 @@ class MainWindow(QMainWindow):
             self.hourly_csv_path,
             ["hour_start", "hour_end", "tag", "avg_value", "sample_count"],
         )
+
+    def _apply_initial_size(self) -> None:
+        """Scale the window to fit the available screen while remaining sizable."""
+        screen = QApplication.primaryScreen()
+        if screen:
+            available = screen.availableGeometry()
+            target_width = int(available.width() * 0.9)
+            target_height = int(available.height() * 0.9)
+            self.resize(target_width, target_height)
+
+            frame_geo = self.frameGeometry()
+            frame_geo.moveCenter(available.center())
+            self.move(frame_geo.topLeft())
+        else:
+            self.resize(1300, 750)
 
     # -------- tag + alias parsing --------
 
@@ -810,6 +825,7 @@ class MainWindow(QMainWindow):
         cfg_layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
         cfg_layout.setHorizontalSpacing(10)
         cfg_layout.setVerticalSpacing(6)
+        cfg_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
         # Run-lock option
         self.lockdown_checkbox = QCheckBox(
@@ -888,7 +904,8 @@ class MainWindow(QMainWindow):
 
         tags_label = QLabel("Tags to Poll (one per line):")
         self.tags_edit = QTextEdit()
-        self.tags_edit.setFixedHeight(180)
+        self.tags_edit.setMinimumHeight(160)
+        self.tags_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.tags_edit.setPlaceholderText(
             "Examples:\n"
             "Program:MainRoutine.Temp_PV | Temperature\n"

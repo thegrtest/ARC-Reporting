@@ -37,6 +37,7 @@ LOG_DIR = "logs"
 HOURLY_CSV = os.path.join(LOG_DIR, "hourly_averages.csv")
 THRESHOLDS_JSON = os.path.join(LOG_DIR, "thresholds.json")
 SETTINGS_JSON = "settings.json"  # optional: to discover tags before any data
+ENV_EVENTS_CSV = os.path.join(LOG_DIR, "env_events.csv")
 
 REFRESH_MS = 5000  # dashboard refresh interval (ms)
 
@@ -75,16 +76,27 @@ def load_latest_raw_df() -> pd.DataFrame:
     Returns empty DataFrame on any error.
     """
     path = get_latest_raw_path()
+    base_cols = [
+        "timestamp",
+        "date",
+        "time",
+        "tag",
+        "alias",
+        "value",
+        "status",
+        "qa_flag",
+    ]
+
     if not path or not os.path.exists(path):
-        return pd.DataFrame(columns=["timestamp", "date", "time", "tag", "value", "status"])
+        return pd.DataFrame(columns=base_cols)
 
     try:
         df = pd.read_csv(path)
     except Exception:
-        return pd.DataFrame(columns=["timestamp", "date", "time", "tag", "value", "status"])
+        return pd.DataFrame(columns=base_cols)
 
     # Normalize columns
-    for col in ["timestamp", "date", "time", "tag", "value", "status"]:
+    for col in base_cols:
         if col not in df.columns:
             df[col] = None
 
@@ -95,7 +107,8 @@ def load_latest_raw_df() -> pd.DataFrame:
 
     df["value_num"] = pd.to_numeric(df["value"], errors="coerce")
     df["status_str"] = df["status"].astype(str)
-    df["ok"] = df["status_str"].str.lower().eq("success")
+    df["qa_flag"] = df.get("qa_flag", "OK").fillna("OK")
+    df["ok"] = df["qa_flag"].astype(str).str.upper().eq("OK")
 
     return df
 
@@ -120,6 +133,32 @@ def load_hourly_stats() -> pd.DataFrame:
     for c in ["hour_start", "hour_end"]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
+    return df
+
+
+def load_env_events() -> pd.DataFrame:
+    """Load environmental / data quality events (including DATA_GAP)."""
+    if not os.path.exists(ENV_EVENTS_CSV):
+        return pd.DataFrame(columns=["timestamp", "event_type", "tag", "duration_sec"])
+    try:
+        df = pd.read_csv(ENV_EVENTS_CSV)
+    except Exception:
+        return pd.DataFrame(columns=["timestamp", "event_type", "tag", "duration_sec"])
+
+    if "timestamp" in df.columns:
+        try:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        except Exception:
+            df["timestamp"] = pd.NaT
+    else:
+        df["timestamp"] = pd.NaT
+
+    if "duration_sec" in df.columns:
+        try:
+            df["duration_sec"] = pd.to_numeric(df["duration_sec"], errors="coerce")
+        except Exception:
+            df["duration_sec"] = None
+
     return df
 
 
@@ -272,7 +311,9 @@ def extract_raw_stats(raw_df: pd.DataFrame):
     if "status_str" not in raw_df.columns:
         raw_df["status_str"] = raw_df.get("status", "").astype(str)
 
-    raw_df["ok"] = raw_df["status_str"].str.lower().eq("success")
+    if "qa_flag" not in raw_df.columns:
+        raw_df["qa_flag"] = "OK"
+    raw_df["ok"] = raw_df["qa_flag"].astype(str).str.upper().eq("OK")
 
     # Latest per tag
     df_sorted = raw_df.sort_values("timestamp")
@@ -352,6 +393,59 @@ def extract_last_full_hour(
         pass
 
     return result
+
+
+def compute_quality_metrics(
+    raw_df: pd.DataFrame, events_df: pd.DataFrame, tags: List[str]
+) -> Dict[str, Dict[str, float]]:
+    """Return per-tag metrics: {tag: {valid_pct, gap_count, longest_gap}}"""
+    stats: Dict[str, Dict[str, float]] = {
+        str(tag): {"valid_pct": 0.0, "gap_count": 0, "longest_gap": 0.0}
+        for tag in tags
+    }
+
+    cutoff = datetime.now() - timedelta(hours=24)
+
+    if not raw_df.empty and "timestamp" in raw_df.columns:
+        try:
+            recent = raw_df[raw_df["timestamp"] >= cutoff]
+        except Exception:
+            recent = raw_df
+
+        if not recent.empty:
+            valid_mask = recent.get("qa_flag", "OK").astype(str).str.upper().eq("OK")
+            total_counts = recent.groupby("tag").size()
+            valid_counts = recent[valid_mask].groupby("tag").size()
+            for tag, total in total_counts.items():
+                tag_str = str(tag)
+                ok_count = float(valid_counts.get(tag, 0))
+                if total > 0:
+                    stats.setdefault(tag_str, {"valid_pct": 0.0, "gap_count": 0, "longest_gap": 0.0})[
+                        "valid_pct"
+                    ] = round((ok_count / float(total)) * 100.0, 1)
+
+    if not events_df.empty and "timestamp" in events_df.columns:
+        try:
+            recent_events = events_df[events_df["timestamp"] >= cutoff]
+        except Exception:
+            recent_events = events_df
+
+        gap_events = recent_events[
+            recent_events["event_type"].astype(str).str.upper() == "DATA_GAP"
+        ]
+        if not gap_events.empty:
+            counts = gap_events.groupby("tag").size()
+            longest = gap_events.groupby("tag")["duration_sec"].max()
+            for tag, cnt in counts.items():
+                tag_str = str(tag)
+                stat = stats.setdefault(tag_str, {"valid_pct": 0.0, "gap_count": 0, "longest_gap": 0.0})
+                stat["gap_count"] = int(cnt)
+                try:
+                    stat["longest_gap"] = float(longest.get(tag, 0.0) or 0.0)
+                except Exception:
+                    stat["longest_gap"] = 0.0
+
+    return stats
 
 
 def looks_numeric_tag(tag: str) -> bool:
@@ -595,6 +689,68 @@ def build_tag_card(
     )
 
     return html.Div(style=CARD_STYLE, children=[header, gauges_row])
+
+
+def build_quality_card(stats: Dict[str, Dict[str, float]]) -> html.Div:
+    rows = []
+    for tag in sorted(stats.keys(), key=str):
+        tag_stats = stats.get(tag, {})
+        valid_pct = tag_stats.get("valid_pct", 0.0)
+        gap_count = int(tag_stats.get("gap_count", 0) or 0)
+        longest_gap = tag_stats.get("longest_gap", 0.0) or 0.0
+        rows.append(
+            html.Tr(
+                children=[
+                    html.Td(tag, style={"fontWeight": "600", "fontSize": "11px"}),
+                    html.Td(f"{valid_pct:.1f}%", style={"fontSize": "11px"}),
+                    html.Td(str(gap_count), style={"fontSize": "11px"}),
+                    html.Td(f"{longest_gap:.0f}s", style={"fontSize": "11px"}),
+                ]
+            )
+        )
+
+    table = html.Table(
+        style={
+            "width": "100%",
+            "borderCollapse": "collapse",
+            "fontSize": "11px",
+        },
+        children=[
+            html.Thead(
+                html.Tr(
+                    children=[
+                        html.Th("Tag", style={"textAlign": "left", "paddingBottom": "4px"}),
+                        html.Th(
+                            "% Valid (last 24h)",
+                            style={"textAlign": "left", "paddingBottom": "4px"},
+                        ),
+                        html.Th(
+                            "Gap count", style={"textAlign": "left", "paddingBottom": "4px"}
+                        ),
+                        html.Th(
+                            "Longest gap", style={"textAlign": "left", "paddingBottom": "4px"}
+                        ),
+                    ]
+                )
+            ),
+            html.Tbody(rows if rows else [html.Tr(html.Td("No data yet"))]),
+        ],
+    )
+
+    return html.Div(
+        style=CARD_STYLE,
+        children=[
+            html.Div(
+                "Data Quality (last 24h)",
+                style={"fontWeight": "600", "fontSize": "13px"},
+            ),
+            html.Div(
+                "QA flags drive valid %; DATA_GAP events summarize missing runs.",
+                style={"fontSize": "11px", "color": "#90a4ae"},
+            ),
+            table,
+        ],
+    )
 
 
 # ----------------- dash app -----------------
@@ -879,6 +1035,7 @@ def update_dashboard(n):
     try:
         raw_df = load_latest_raw_df()
         hourly_df = load_hourly_stats()
+        events_df = load_env_events()
         thresholds = load_thresholds()
 
         latest_by_tag, current_hour_avg, last_ts = extract_raw_stats(raw_df)
@@ -887,10 +1044,17 @@ def update_dashboard(n):
         tags_raw = set(latest_by_tag.keys())
         tags_hourly = set(last_hour_stats.keys())
         tags_cfg = set(load_configured_tags_from_settings())
-        all_tags = sorted((tags_raw | tags_hourly | tags_cfg), key=str)
+        if not events_df.empty and "tag" in events_df.columns:
+            tags_events = set(events_df["tag"].dropna().astype(str).tolist())
+        else:
+            tags_events = set()
+        all_tags = sorted((tags_raw | tags_hourly | tags_cfg | tags_events), key=str)
 
         # Filter out numeric-looking tags that somehow slipped through
         all_tags = [t for t in all_tags if not looks_numeric_tag(str(t))]
+
+        quality_stats = compute_quality_metrics(raw_df, events_df, all_tags)
+        quality_card = build_quality_card(quality_stats)
 
         if not all_tags:
             msg = "No tags found yet. Waiting for data from CIP Tag Poller..."
@@ -915,9 +1079,9 @@ def update_dashboard(n):
                 ],
             )
             last_update = "Last update: no data"
-            return [empty_card], last_update
+            return [quality_card, empty_card], last_update
 
-        cards = []
+        cards = [quality_card]
         for tag in all_tags:
             card = build_tag_card(
                 tag=tag,

@@ -60,14 +60,14 @@ from collections import deque
 from datetime import datetime, timedelta, date
 from typing import Dict, Tuple, List, Optional
 
-from PySide6.QtCore import Qt, QThread, Signal, QMutex, QMutexLocker
+from PySide6.QtCore import Qt, QThread, Signal, QMutex, QMutexLocker, QTimer
 from PySide6.QtGui import QPalette, QColor, QAction, QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QLabel, QPushButton, QTextEdit, QTableWidget,
     QTableWidgetItem, QMessageBox, QGroupBox, QFormLayout, QSpinBox,
     QFileDialog, QHeaderView, QPlainTextEdit, QStatusBar, QFrame,
-    QSpacerItem, QSizePolicy, QComboBox
+    QSpacerItem, QSizePolicy, QComboBox, QCheckBox
 )
 
 try:
@@ -484,6 +484,7 @@ class MainWindow(QMainWindow):
         self.error_timestamps = deque()  # rolling window for last hour
         self._stale_tracker: Dict[str, Dict[str, object]] = {}
         self._log_size_warned = False
+        self.lockdown_enabled = False
 
         # stable tag ordering for the dashboard
         self.tag_order: List[str] = []
@@ -810,6 +811,20 @@ class MainWindow(QMainWindow):
         cfg_layout.setHorizontalSpacing(10)
         cfg_layout.setVerticalSpacing(6)
 
+        # Run-lock option
+        self.lockdown_checkbox = QCheckBox(
+            "Run — settings locked, auto-start on launch"
+        )
+        self.lockdown_checkbox.setToolTip(
+            "When enabled, the app immediately starts polling with the saved settings, "
+            "disables configuration changes, and cannot be stopped or closed."
+        )
+        self.lockdown_checkbox.setStyleSheet(
+            "QCheckBox { font-weight: 700; color: #ffb74d; border: 1px solid #ffb74d; "
+            "padding: 6px; border-radius: 6px; }"
+        )
+        cfg_layout.addRow(self.lockdown_checkbox)
+
         # Machine name
         self.machine_name_edit = QLineEdit()
         self.machine_name_edit.setPlaceholderText("e.g. CF Duplex 15")
@@ -887,10 +902,10 @@ class MainWindow(QMainWindow):
         # Log directory selector
         dir_layout = QHBoxLayout()
         self.log_dir_edit = QLineEdit(self.log_dir)
-        browse_btn = QPushButton("Browse…")
-        browse_btn.setObjectName("secondaryButton")
+        self.browse_btn = QPushButton("Browse…")
+        self.browse_btn.setObjectName("secondaryButton")
         dir_layout.addWidget(self.log_dir_edit)
-        dir_layout.addWidget(browse_btn)
+        dir_layout.addWidget(self.browse_btn)
         cfg_layout.addRow(QLabel("Log Directory:"), dir_layout)
 
         left_layout.addWidget(cfg_group)
@@ -997,7 +1012,8 @@ class MainWindow(QMainWindow):
         self.stop_btn.clicked.connect(self.stop_polling)
         self.calc_btn.clicked.connect(self.compute_current_hour_preview)
         self.rebuild_btn.clicked.connect(self.rebuild_hourly_from_raw)
-        browse_btn.clicked.connect(self.choose_log_dir)
+        self.browse_btn.clicked.connect(self.choose_log_dir)
+        self.lockdown_checkbox.stateChanged.connect(self._apply_lockdown_state)
 
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
@@ -1227,6 +1243,11 @@ class MainWindow(QMainWindow):
         heartbeat_enabled = bool(data.get("heartbeat_enabled", False))
         self.heartbeat_mode_combo.setCurrentIndex(1 if heartbeat_enabled else 0)
 
+        self.lockdown_enabled = bool(data.get("lockdown_enabled", False))
+        prev_block = self.lockdown_checkbox.blockSignals(True)
+        self.lockdown_checkbox.setChecked(self.lockdown_enabled)
+        self.lockdown_checkbox.blockSignals(prev_block)
+
         stored_order = data.get("tag_order", [])
         if isinstance(stored_order, list):
             self.tag_order = stored_order
@@ -1238,6 +1259,7 @@ class MainWindow(QMainWindow):
             self.machine_label.setText("Machine: —")
 
         self._update_config_version_label()
+        self._apply_lockdown_state(initial_load=True)
 
     def _save_settings(self):
         """Persist all tags, aliases (via text), machine, and general settings to JSON."""
@@ -1257,6 +1279,7 @@ class MainWindow(QMainWindow):
             "stale_intervals": self.stale_spin.value(),
             "gap_threshold_minutes": self.gap_spin.value(),
             "moving_tags": [t.strip() for t in self.moving_tags_edit.text().split(",") if t.strip()],
+            "lockdown_enabled": self.lockdown_checkbox.isChecked(),
         }
         self.log_dir = data["log_dir"]
         try:
@@ -1346,9 +1369,55 @@ class MainWindow(QMainWindow):
     def _update_config_version_label(self):
         self.config_version_label.setText(self._compute_config_version_text())
 
+    def _apply_lockdown_state(self, initial_load: bool = False):
+        self.lockdown_enabled = self.lockdown_checkbox.isChecked()
+        widgets_to_lock = [
+            self.machine_name_edit,
+            self.ip_edit,
+            self.interval_spin,
+            self.chunk_spin,
+            self.stale_spin,
+            self.gap_spin,
+            self.moving_tags_edit,
+            self.machine_state_tag_edit,
+            self.poll_mode_combo,
+            self.heartbeat_tag_edit,
+            self.heartbeat_mode_combo,
+            self.tags_edit,
+            self.log_dir_edit,
+            self.browse_btn,
+        ]
+        running = bool(self.poll_thread and self.poll_thread.isRunning())
+
+        for w in widgets_to_lock:
+            w.setEnabled(not self.lockdown_enabled)
+
+        self.start_btn.setEnabled(not self.lockdown_enabled and not running)
+        self.stop_btn.setEnabled(not self.lockdown_enabled and running)
+        self.calc_btn.setEnabled(not self.lockdown_enabled)
+        self.rebuild_btn.setEnabled(not self.lockdown_enabled)
+
+        if not initial_load:
+            self._save_settings()
+        if self.lockdown_enabled and not running:
+            QTimer.singleShot(0, self._auto_start_if_locked)
+
+    def _auto_start_if_locked(self):
+        if not self.lockdown_enabled:
+            return
+        if self.poll_thread and self.poll_thread.isRunning():
+            return
+        self.log_message(
+            "Run lock enabled — automatically starting polling with saved settings."
+        )
+        self.start_polling()
+
     # ---------------- polling control ----------------
 
     def choose_log_dir(self):
+        if self.lockdown_enabled:
+            self.log_message("Run lock enabled — log directory changes are blocked.")
+            return
         path = QFileDialog.getExistingDirectory(
             self, "Select Log Directory", self.log_dir_edit.text().strip() or "."
         )
@@ -1367,6 +1436,8 @@ class MainWindow(QMainWindow):
             self.log_message(f"Log directory set to: {path}")
 
     def start_polling(self):
+        if self.lockdown_enabled and self.poll_thread and self.poll_thread.isRunning():
+            return
         if self.poll_thread and self.poll_thread.isRunning():
             QMessageBox.warning(self, "Already running", "Polling is already active.")
             return
@@ -1470,7 +1541,7 @@ class MainWindow(QMainWindow):
         self.poll_thread.start()
 
         self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
+        self.stop_btn.setEnabled(not self.lockdown_enabled)
         self.connection_status_label.setText("Status: Polling")
         self.connection_status_label.setStyleSheet("color: #a5d6a7;")
 
@@ -1482,6 +1553,9 @@ class MainWindow(QMainWindow):
         )
 
     def stop_polling(self):
+        if self.lockdown_enabled:
+            self.log_message("Run lock enabled — stop is blocked.")
+            return
         if self.poll_thread:
             self.poll_thread.stop()
             self.poll_thread.wait(5000)
@@ -1864,6 +1938,14 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg, 5000)
 
     def closeEvent(self, event):
+        if self.lockdown_enabled:
+            QMessageBox.warning(
+                self,
+                "Run lock enabled",
+                "The application cannot be closed while run lock is active.",
+            )
+            event.ignore()
+            return
         if self.poll_thread and self.poll_thread.isRunning():
             self.poll_thread.stop()
             self.poll_thread.wait(5000)

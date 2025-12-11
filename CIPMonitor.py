@@ -42,6 +42,7 @@ THRESHOLDS_JSON = os.path.join(LOG_DIR, "thresholds.json")
 SETTINGS_JSON = "settings.json"  # optional: to discover tags before any data
 ENV_EVENTS_CSV = os.path.join(LOG_DIR, "env_events.csv")
 CONFIG_CHANGES_CSV = os.path.join(LOG_DIR, "config_changes.csv")
+SYSTEM_HEALTH_JSON = os.path.join(LOG_DIR, "system_health.json")
 CONFIG_CHANGE_HEADERS = [
     "timestamp",
     "user",
@@ -236,6 +237,30 @@ def load_thresholds() -> Dict[str, Dict[str, float]]:
     except Exception:
         pass
     return {}
+
+
+def load_system_health() -> Dict[str, object]:
+    """Load system_health.json if available."""
+    default = {
+        "status": "Unknown",
+        "status_reason": "No health file yet",
+        "last_poll_success_ts": None,
+        "last_poll_error_ts": None,
+        "error_count_last_hour": None,
+        "disk_free_GB": None,
+        "log_dir_size_GB": None,
+    }
+    if not os.path.exists(SYSTEM_HEALTH_JSON):
+        return default
+    try:
+        with open(SYSTEM_HEALTH_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            default.update(data)
+    except Exception:
+        default["status"] = "Error"
+        default["status_reason"] = "Failed to read system_health.json"
+    return default
 
 
 def save_thresholds(th: Dict[str, Dict[str, float]]) -> None:
@@ -749,6 +774,52 @@ def build_tag_card(
     return html.Div(style=CARD_STYLE, children=[header, gauges_row])
 
 
+def build_system_health_card(health: Dict[str, object]) -> html.Div:
+    status = str(health.get("status", "Unknown"))
+    status_reason = str(health.get("status_reason", ""))
+    status_upper = status.lower()
+    if "critical" in status_upper:
+        color = "#ef9a9a"
+    elif "degraded" in status_upper:
+        color = "#ffb74d"
+    elif "healthy" in status_upper:
+        color = "#a5d6a7"
+    else:
+        color = "#b0bec5"
+
+    details = []
+    for label, key in [
+        ("Last poll", "last_poll_success_ts"),
+        ("Last error", "last_poll_error_ts"),
+        ("Errors (1h)", "error_count_last_hour"),
+        ("Disk free (GB)", "disk_free_GB"),
+        ("Log dir (GB)", "log_dir_size_GB"),
+    ]:
+        val = health.get(key)
+        details.append(
+            html.Div(
+                [
+                    html.Span(f"{label}: ", style={"color": "#90a4ae"}),
+                    html.Span("—" if val is None else str(val)),
+                ],
+                style={"fontSize": "11px"},
+            )
+        )
+
+    return html.Div(
+        style=CARD_STYLE,
+        children=[
+            html.Div(
+                "System Health",
+                style={"fontWeight": "600", "fontSize": "13px", "marginBottom": "6px"},
+            ),
+            html.Div(status, style={"color": color, "fontSize": "20px", "fontWeight": "700"}),
+            html.Div(status_reason, style={"fontSize": "11px", "color": "#90a4ae", "marginBottom": "6px"}),
+            html.Div(details, style={"display": "flex", "flexDirection": "column", "gap": "2px"}),
+        ],
+    )
+
+
 def build_quality_card(stats: Dict[str, Dict[str, float]]) -> html.Div:
     rows = []
     for tag in sorted(stats.keys(), key=str):
@@ -1115,6 +1186,8 @@ def update_dashboard(n):
         events_df = load_env_events()
         thresholds = load_thresholds()
         config_version = compute_config_version_text()
+        health = load_system_health()
+        health_card = build_system_health_card(health)
 
         latest_by_tag, current_hour_avg, last_ts = extract_raw_stats(raw_df)
         last_hour_stats = extract_last_full_hour(hourly_df)
@@ -1157,10 +1230,9 @@ def update_dashboard(n):
                 ],
             )
             last_update = "Last update: no data"
-            return [quality_card, empty_card], last_update
-            return [empty_card], last_update, config_version
+            return [health_card, quality_card, empty_card], last_update, config_version
 
-        cards = [quality_card]
+        cards = [health_card, quality_card]
         for tag in all_tags:
             card = build_tag_card(
                 tag=tag,

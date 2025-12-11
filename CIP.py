@@ -54,6 +54,9 @@ import json
 import time
 import hashlib
 import getpass
+import gzip
+import shutil
+from collections import deque
 from datetime import datetime, timedelta, date
 from typing import Dict, Tuple, List, Optional
 
@@ -437,7 +440,11 @@ class MainWindow(QMainWindow):
         self.current_hour_start: Optional[datetime] = None
         self.hour_accumulators: Dict[str, Dict[str, float]] = {}
         self.last_success_ts: Dict[str, datetime] = {}
+        self.last_poll_success_ts_iso: Optional[str] = None
+        self.last_poll_error_ts_iso: Optional[str] = None
+        self.error_timestamps = deque()  # rolling window for last hour
         self._stale_tracker: Dict[str, Dict[str, object]] = {}
+        self._log_size_warned = False
 
         # stable tag ordering for the dashboard
         self.tag_order: List[str] = []
@@ -459,6 +466,11 @@ class MainWindow(QMainWindow):
         self.current_log_date: date = datetime.now().date()
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
         self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
+        self.system_health_path = os.path.join(self.log_dir, "system_health.json")
+        self.log_dir_warn_gb = 5.0
+        self.disk_warn_gb = 2.0
+        self.disk_crit_gb = 1.0
+        self.compress_raw_after_days = 7
 
         # UI
         self._build_ui()
@@ -542,6 +554,148 @@ class MainWindow(QMainWindow):
         except Exception:
             return {}
         return {}
+
+    # -------- system health & storage --------
+
+    def _compute_disk_free_gb(self) -> float:
+        try:
+            usage = shutil.disk_usage(self.log_dir)
+            return round(usage.free / (1024 ** 3), 2)
+        except Exception:
+            return 0.0
+
+    def _compute_log_dir_size_gb(self) -> float:
+        total_bytes = 0
+        for root, _, files in os.walk(self.log_dir):
+            for name in files:
+                try:
+                    total_bytes += os.path.getsize(os.path.join(root, name))
+                except Exception:
+                    continue
+        return round(total_bytes / (1024 ** 3), 2)
+
+    def _compress_old_raw_csvs(self) -> None:
+        if self.compress_raw_after_days <= 0:
+            return
+        cutoff = datetime.now().date() - timedelta(days=self.compress_raw_after_days)
+        try:
+            for name in os.listdir(self.log_dir):
+                if not name.startswith("raw_data_"):
+                    continue
+                if name.endswith(".csv.gz"):
+                    continue
+                if not name.endswith(".csv"):
+                    continue
+                try:
+                    date_part = name[len("raw_data_") : -len(".csv")]
+                    file_date = datetime.fromisoformat(date_part).date()
+                except Exception:
+                    continue
+                if file_date >= cutoff:
+                    continue
+                src_path = os.path.join(self.log_dir, name)
+                dst_path = src_path + ".gz"
+                try:
+                    with open(src_path, "rb") as src, gzip.open(dst_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    os.remove(src_path)
+                    self.log_message(f"Compressed old raw CSV: {name} -> {os.path.basename(dst_path)}")
+                except Exception as e:
+                    self.log_message(f"Failed to compress {name}: {e}")
+        except Exception as e:
+            self.log_message(f"Error compressing old raw CSVs: {e}")
+
+    def _determine_health_status(
+        self,
+        now: datetime,
+        disk_free_gb: float,
+        log_size_gb: float,
+        error_count: int,
+    ) -> Tuple[str, str]:
+        status = "System Healthy"
+        reasons: List[str] = []
+
+        if self.last_poll_success_ts_iso:
+            try:
+                last_success_dt = datetime.fromisoformat(self.last_poll_success_ts_iso)
+                age = now - last_success_dt
+                if age > timedelta(minutes=5):
+                    status = "Critical"
+                    reasons.append("Polling has been stale for over 5 minutes")
+                elif age > timedelta(minutes=2):
+                    status = "Degraded"
+                    reasons.append("Polling delayed beyond 2 minutes")
+            except Exception:
+                reasons.append("Unable to parse last poll timestamp")
+        else:
+            status = "Degraded"
+            reasons.append("No successful poll recorded yet")
+
+        if disk_free_gb <= self.disk_crit_gb:
+            status = "Critical"
+            reasons.append(f"Disk free critically low ({disk_free_gb} GB)")
+        elif disk_free_gb <= self.disk_warn_gb and status != "Critical":
+            status = "Degraded"
+            reasons.append(f"Disk free low ({disk_free_gb} GB)")
+
+        if log_size_gb >= self.log_dir_warn_gb and status != "Critical":
+            status = "Degraded"
+            reasons.append(
+                f"Log folder size high ({log_size_gb} GB >= {self.log_dir_warn_gb} GB)"
+            )
+
+        if error_count >= 10:
+            status = "Critical"
+            reasons.append(f"{error_count} errors in last hour")
+        elif error_count >= 3 and status != "Critical":
+            status = "Degraded"
+            reasons.append(f"{error_count} errors in last hour")
+
+        reason_text = "; ".join(reasons) if reasons else "OK"
+        return status, reason_text
+
+    def _update_system_health(self, success_ts: Optional[datetime] = None, error: bool = False):
+        now = success_ts or datetime.now()
+        if success_ts:
+            self.last_poll_success_ts_iso = success_ts.isoformat(timespec="seconds")
+        if error:
+            self.last_poll_error_ts_iso = now.isoformat(timespec="seconds")
+            self.error_timestamps.append(now)
+
+        cutoff = now - timedelta(hours=1)
+        while self.error_timestamps and self.error_timestamps[0] < cutoff:
+            self.error_timestamps.popleft()
+        error_count = len(self.error_timestamps)
+
+        disk_free_gb = self._compute_disk_free_gb()
+        log_size_gb = self._compute_log_dir_size_gb()
+
+        if log_size_gb >= self.log_dir_warn_gb and not self._log_size_warned:
+            self._log_size_warned = True
+            self.log_message(
+                f"Warning: log directory size is {log_size_gb} GB (threshold {self.log_dir_warn_gb} GB)."
+            )
+
+        self._compress_old_raw_csvs()
+
+        status, reason = self._determine_health_status(now, disk_free_gb, log_size_gb, error_count)
+
+        health = {
+            "last_poll_success_ts": self.last_poll_success_ts_iso,
+            "last_poll_error_ts": self.last_poll_error_ts_iso,
+            "error_count_last_hour": error_count,
+            "disk_free_GB": disk_free_gb,
+            "log_dir_size_GB": log_size_gb,
+            "status": status,
+            "status_reason": reason,
+        }
+
+        try:
+            ensure_dir(self.log_dir)
+            with open(self.system_health_path, "w", encoding="utf-8") as f:
+                json.dump(health, f, indent=2)
+        except Exception as e:
+            self.log_message(f"Failed to write system health file: {e}")
 
     # ---------------- UI construction ----------------
 
@@ -1006,6 +1160,7 @@ class MainWindow(QMainWindow):
 
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
         self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
+        self.system_health_path = os.path.join(self.log_dir, "system_health.json")
         self._ensure_env_events_csv()
         self.thresholds = self._load_thresholds_from_log_dir()
 
@@ -1303,6 +1458,7 @@ class MainWindow(QMainWindow):
     def handle_poll_error(self, msg: str):
         """Handle errors emitted from PollThread (no modal boxes)."""
         self.log_message(msg)
+        self._update_system_health(error=True)
 
     def _update_stale_state(self, tag: str, value: object) -> bool:
         """Return True if tag is considered stale based on repeated identical values."""
@@ -1427,6 +1583,7 @@ class MainWindow(QMainWindow):
                 self.log_message(f"Error writing raw CSV: {e}")
 
             self.last_update_label.setText(f"Last update: {ts.strftime('%Y-%m-%d %H:%M:%S')}")
+            self._update_system_health(success_ts=ts)
             self.update_dashboard()
         except Exception as e:
             self.log_message(f"Error handling poll data: {e}")
@@ -1506,7 +1663,9 @@ class MainWindow(QMainWindow):
         raw_files = []
         try:
             for name in os.listdir(self.log_dir):
-                if name.startswith("raw_data_") and name.endswith(".csv"):
+                if not name.startswith("raw_data_"):
+                    continue
+                if name.endswith(".csv") or name.endswith(".csv.gz"):
                     raw_files.append(os.path.join(self.log_dir, name))
         except Exception as e:
             self.log_message(f"Error listing raw files: {e}")
@@ -1531,7 +1690,8 @@ class MainWindow(QMainWindow):
         try:
             buckets: Dict[Tuple[datetime, str], Dict[str, float]] = {}
             for path in sorted(raw_files):
-                with open(path, "r", encoding="utf-8") as f:
+                open_func = gzip.open if path.endswith(".gz") else open
+                with open_func(path, "rt", encoding="utf-8") as f:
                     reader = csv.DictReader(f)
                     for row in reader:
                         ts_str = row.get("timestamp", "")

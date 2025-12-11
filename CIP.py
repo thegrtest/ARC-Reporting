@@ -7,16 +7,24 @@ CIP Tag Poller & Dashboard (PySide6, dark themed, production-ready)
 Features
 --------
 - Polls a list of PLC tags at a configurable interval (default 10s) using pylogix.
-- Logs all raw samples to logs/raw_data.csv (timestamp, tag, value, status).
+- Logs all raw samples to logs/raw_data_YYYY-MM-DD.csv:
+    timestamp, date, time, tag, alias, value, status
 - Aggregates data into hourly averages (1–2pm, 2–3pm, …) and writes to
   logs/hourly_averages.csv with UPSERT semantics:
   for each (hour_start, tag) there is at most one row (latest wins).
 - Dark, professional GUI showing:
-    Tag | Current Value | Last Hour Avg | Current Hour Avg (so far) | Status
+    Alias | Tag | Current Value | Last Hour Avg | Current Hour Avg (so far) | Status
 - Button to compute current hour averages (display only).
-- Button to recompute/rebuild hourly_averages.csv from raw_data.csv.
-- Settings (machine, IP, tags, interval, chunk size, log dir) are remembered
-  in settings.json so we can relaunch fast.
+- Button to recompute/rebuild hourly_averages.csv from all daily raw_data_*.csv.
+- Settings (machine, IP, tags+aliases, interval, chunk size, log dir, machine-state tag,
+  polling mode, heartbeat tag/mode) are remembered in settings.json.
+
+Tag + Alias Input
+-----------------
+In the “Tags to Poll” box, each line may be either:
+    Program:MainRoutine.MyTag1
+    Program:MainRoutine.Flow_PV | Flow
+The part after '|' (if present) is used as the alias. Aliases are optional.
 
 Reliability / Always-on
 -----------------------
@@ -25,6 +33,17 @@ Reliability / Always-on
 - Read errors are caught and logged, not fatal.
 - If a multi-read hits "too many parameters", the thread automatically falls
   back to single-tag reads for that batch.
+- Optional machine-state gating:
+    - Reads a DINT machine state tag (e.g. RotaryKiln_OperationState).
+    - If "Pause when machine down" is selected, the thread:
+        * Always reads the state tag every cycle.
+        * Only polls other tags when state == 3 (Processing).
+        * Automatically resumes full polling when state returns to 3.
+- Optional heartbeat writer:
+    - Writes a toggling BOOL/DINT heartbeat every cycle to a configured tag.
+    - If polling stops or connection is lost, heartbeat stops changing.
+    - PLC should implement a watchdog on this tag to safely stop the machine
+      if heartbeat has not changed within a configured timeout.
 - No modal message boxes from the background thread, to avoid freezes.
 """
 
@@ -33,7 +52,7 @@ import os
 import csv
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Dict, Tuple, List, Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, QMutex, QMutexLocker
@@ -43,7 +62,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QLabel, QPushButton, QTextEdit, QTableWidget,
     QTableWidgetItem, QMessageBox, QGroupBox, QFormLayout, QSpinBox,
     QFileDialog, QHeaderView, QPlainTextEdit, QStatusBar, QFrame,
-    QSpacerItem, QSizePolicy
+    QSpacerItem, QSizePolicy, QComboBox
 )
 
 try:
@@ -51,6 +70,17 @@ try:
     PYLOGIX_AVAILABLE = True
 except Exception:  # ImportError or others
     PYLOGIX_AVAILABLE = False
+
+
+# Machine state enumeration for logging / readability
+# 0=OFF, 1=Warm up, 2=Idle, 3=Processing, 4=Shutdown
+MACHINE_STATE_MAP = {
+    0: "OFF",
+    1: "Warm up",
+    2: "Idle",
+    3: "Processing",
+    4: "Shutdown",
+}
 
 
 # ------------------- helpers -------------------
@@ -95,6 +125,10 @@ class PollThread(QThread):
     - If per-read errors occur, it logs and continues.
     - If a multi-read hits 'too many parameters', it falls back to
       single-tag reads automatically.
+    - Optional machine-state gating: always read the configured state tag,
+      and only poll main tags when state == 3 (Processing).
+    - Optional heartbeat writer: writes a toggling BOOL/DINT every cycle
+      to a configured heartbeat tag.
     """
 
     data_ready = Signal(str, dict)
@@ -102,7 +136,6 @@ class PollThread(QThread):
     info = Signal(str)
 
     # Conservative upper bound for CIP multi-read requests.
-    # 10 tags per read is very safe for typical ControlLogix/CompactLogix setups.
     MAX_SAFE_CHUNK = 10
 
     def __init__(
@@ -112,12 +145,18 @@ class PollThread(QThread):
         interval_sec: int = 10,
         chunk_size: int = 20,
         reconnect_delay_sec: int = 10,
+        machine_state_tag: Optional[str] = None,
+        pause_when_down: bool = False,
+        heartbeat_tag: Optional[str] = None,
+        heartbeat_enabled: bool = False,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self.ip = ip
-        # keep the raw order; this will be used in the table as well
-        self.tags = [t for t in tags if t.strip()]
+
+        # main tags to poll (excluding machine-state logic)
+        self.tags_main = [t for t in tags if t.strip()]
+
         self.interval_sec = max(1, int(interval_sec))
 
         # clamp chunk size to a safe upper bound
@@ -133,11 +172,23 @@ class PollThread(QThread):
             self._clamped_chunk_msg = ""
             self.chunk_size = user_chunk
 
+        # Machine state control
+        self.machine_state_tag = (machine_state_tag or "").strip()
+        self.pause_when_down = bool(pause_when_down)
+
+        # Heartbeat control
+        self.heartbeat_tag = (heartbeat_tag or "").strip()
+        self.heartbeat_enabled = bool(heartbeat_enabled and self.heartbeat_tag)
+        self._heartbeat_value = False  # toggled each cycle when enabled
+
         # How long to wait before reattempting a PLC connection after failure
         self.reconnect_delay_sec = max(1, int(reconnect_delay_sec))
 
         self._running = False
         self._mutex = QMutex()
+
+        # For logging pause/resume transitions
+        self._main_poll_paused = False
 
     def stop(self):
         with QMutexLocker(self._mutex):
@@ -168,16 +219,13 @@ class PollThread(QThread):
         except Exception as e:
             msg = str(e).lower()
             if "too many parameters" in msg or "too many attributes" in msg:
-                # PLC rejected the multi-read; fall back to single-tag reads
                 self.info.emit(
                     "PLC reported 'too many parameters' on multi-read; "
                     "falling back to single-tag reads for this batch."
                 )
             else:
-                # Other read error; re-raise to be handled by caller
                 raise
         else:
-            # Multi-read succeeded; capture results
             for r in res:
                 tag = getattr(r, "TagName", "(unknown)")
                 val = getattr(r, "Value", None)
@@ -200,9 +248,38 @@ class PollThread(QThread):
                     results[t] = (val, st)
             except Exception as e:
                 self.error.emit(f"Single-tag read error for '{tag}': {e}")
-                # mark as failed but keep going
                 results[tag] = (None, f"Error: {e}")
         return results
+
+    def _decode_machine_state(self, val) -> Optional[int]:
+        """Try to coerce the PLC value to an int state code."""
+        try:
+            if isinstance(val, (int, float)):
+                return int(val)
+            if isinstance(val, str) and val.strip() != "":
+                return int(float(val))
+        except Exception:
+            return None
+        return None
+
+    def _write_heartbeat(self, comm: "PLC"):
+        """
+        Write a toggling heartbeat (0/1) to the configured heartbeat tag.
+        Any errors are logged but do not break the polling loop.
+        """
+        if not self.heartbeat_enabled or not self.heartbeat_tag:
+            return
+        try:
+            self._heartbeat_value = not self._heartbeat_value
+            value_to_write = int(self._heartbeat_value)
+            r = comm.Write(self.heartbeat_tag, value_to_write)
+            status = getattr(r, "Status", "Unknown")
+            if str(status).lower() != "success":
+                self.error.emit(
+                    f"Heartbeat write failed for '{self.heartbeat_tag}': {status}"
+                )
+        except Exception as e:
+            self.error.emit(f"Heartbeat write error for '{self.heartbeat_tag}': {e}")
 
     # ---------- main thread loop ----------
 
@@ -211,14 +288,13 @@ class PollThread(QThread):
             self.error.emit("pylogix is not installed. Run: pip install pylogix")
             return
 
-        if not self.tags:
-            self.error.emit("No tags specified to poll.")
+        if not self.tags_main and not self.machine_state_tag and not self.heartbeat_enabled:
+            self.error.emit("No tags, machine state, or heartbeat configured.")
             return
 
         with QMutexLocker(self._mutex):
             self._running = True
 
-        # Log any chunk_size clamping once we have signals active
         if getattr(self, "_clamped_chunk_msg", ""):
             self.info.emit(self._clamped_chunk_msg)
 
@@ -229,34 +305,91 @@ class PollThread(QThread):
                     comm.IPAddress = self.ip
                     self.info.emit(
                         f"Connected to PLC at {self.ip} "
-                        f"({len(self.tags)} tags, chunk_size={self.chunk_size})"
+                        f"({len(self.tags_main)} main tags, chunk_size={self.chunk_size}, "
+                        f"machine_state_tag={self.machine_state_tag or 'None'}, "
+                        f"pause_when_down={self.pause_when_down}, "
+                        f"heartbeat_tag={self.heartbeat_tag or 'None'}, "
+                        f"heartbeat_enabled={self.heartbeat_enabled})"
                     )
 
-                    # Inner polling loop while connection is alive
+                    self._main_poll_paused = False
+
                     while self._should_run():
                         start_t = time.time()
                         all_results: Dict[str, Tuple[object, str]] = {}
+                        current_state_val: Optional[int] = None
 
+                        # 1) Always read machine state tag first (if configured)
+                        if self.machine_state_tag:
+                            try:
+                                state_dict = self._multi_read_with_fallback(
+                                    comm, [self.machine_state_tag]
+                                )
+                                all_results.update(state_dict)
+                                if self.machine_state_tag in state_dict:
+                                    v, st = state_dict[self.machine_state_tag]
+                                    if str(st).lower() == "success":
+                                        current_state_val = self._decode_machine_state(v)
+                            except Exception as e:
+                                self.error.emit(
+                                    f"State tag read error '{self.machine_state_tag}': {e}"
+                                )
+
+                        # 2) Decide whether to pause main polling
+                        pause_main = False
+                        if (
+                            self.pause_when_down
+                            and current_state_val is not None
+                        ):
+                            if current_state_val != 3:  # 3 == Processing
+                                pause_main = True
+
+                        # 3) Log transitions pause<->resume
+                        if pause_main != self._main_poll_paused:
+                            self._main_poll_paused = pause_main
+                            state_name = (
+                                MACHINE_STATE_MAP.get(current_state_val, str(current_state_val))
+                                if current_state_val is not None
+                                else "Unknown"
+                            )
+                            if pause_main:
+                                self.info.emit(
+                                    f"Machine state={current_state_val} ({state_name}); "
+                                    "pausing main tag polling (state-only + heartbeat mode)."
+                                )
+                            else:
+                                self.info.emit(
+                                    f"Machine state={current_state_val} ({state_name}); "
+                                    "resuming full tag polling."
+                                )
+
+                        # 4) If not paused, read main tags
                         try:
-                            # batched multi-reads so many tags are handled efficiently,
-                            # with automatic fallback if PLC complains.
-                            for batch in chunked(self.tags, self.chunk_size):
-                                if not batch:
-                                    continue
-                                batch_results = self._multi_read_with_fallback(comm, batch)
-                                all_results.update(batch_results)
+                            if (not pause_main) and self.tags_main:
+                                main_tags = [
+                                    t for t in self.tags_main
+                                    if t != self.machine_state_tag
+                                ]
+                                for batch in chunked(main_tags, self.chunk_size):
+                                    if not batch:
+                                        continue
+                                    batch_results = self._multi_read_with_fallback(
+                                        comm, batch
+                                    )
+                                    all_results.update(batch_results)
                         except Exception as e:
-                            # per-cycle read error; log and retry next cycle
                             self.error.emit(f"Read error: {e}")
                             time.sleep(self.interval_sec)
                             continue
+
+                        # 5) Heartbeat write
+                        self._write_heartbeat(comm)
 
                         ts_iso = datetime.now().isoformat(timespec="seconds")
                         self.data_ready.emit(ts_iso, all_results)
 
                         elapsed = time.time() - start_t
                         sleep_for = max(0.0, self.interval_sec - elapsed)
-                        # Sleep in small slices so stop() can interrupt quickly
                         end_time = time.time() + sleep_for
                         while time.time() < end_time:
                             if not self._should_run():
@@ -264,9 +397,7 @@ class PollThread(QThread):
                             time.sleep(0.1)
 
             except Exception as e:
-                # Connection-level failure: log and retry after a delay
                 self.error.emit(f"PLC connection error: {e}")
-                # Wait reconnect_delay_sec, but stay responsive to stop()
                 end_time = time.time() + self.reconnect_delay_sec
                 while time.time() < end_time:
                     if not self._should_run():
@@ -298,11 +429,14 @@ class MainWindow(QMainWindow):
 
         # stable tag ordering for the dashboard
         self.tag_order: List[str] = []
+        # tag -> alias mapping
+        self.alias_map: Dict[str, str] = {}
 
         # default config
         self.machine_name = ""
         self.log_dir = os.path.join("logs")
-        self.raw_csv_path = os.path.join(self.log_dir, "raw_data.csv")
+        self.raw_csv_path = ""   # will be set based on current date
+        self.current_log_date: date = datetime.now().date()
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
 
         # UI
@@ -310,12 +444,63 @@ class MainWindow(QMainWindow):
         self._apply_dark_theme()
         self._load_settings()  # populates fields and paths
 
-        # ensure CSVs
-        ensure_csv(self.raw_csv_path, ["timestamp", "tag", "value", "status"])
+        # init daily raw path
+        self.current_log_date = datetime.now().date()
+        self.raw_csv_path = self._ensure_raw_csv_for_date(self.current_log_date)
+
+        # ensure hourly CSV
         ensure_csv(
             self.hourly_csv_path,
             ["hour_start", "hour_end", "tag", "avg_value", "sample_count"],
         )
+
+    # -------- tag + alias parsing --------
+
+    @staticmethod
+    def parse_tags_and_aliases(text: str) -> Tuple[List[str], Dict[str, str]]:
+        """
+        Parse tags text area into:
+            tags:      [tag1, tag2, ...]
+            alias_map: {tag: alias}
+        Syntax per line:
+            TAG
+            TAG | Alias
+        """
+        tags: List[str] = []
+        alias_map: Dict[str, str] = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "|" in line:
+                tag_part, alias_part = line.split("|", 1)
+                tag = tag_part.strip()
+                alias = alias_part.strip()
+            else:
+                tag = line
+                alias = ""
+            if not tag:
+                continue
+            tags.append(tag)
+            if alias:
+                alias_map[tag] = alias
+        return tags, alias_map
+
+    # -------- raw CSV path helpers (daily rotation) --------
+
+    def _raw_path_for_date(self, d: date) -> str:
+        """Return raw_data CSV path for a given date."""
+        fname = f"raw_data_{d.isoformat()}.csv"
+        return os.path.join(self.log_dir, fname)
+
+    def _ensure_raw_csv_for_date(self, d: date) -> str:
+        """Ensure daily raw CSV exists for given date; return its path."""
+        path = self._raw_path_for_date(d)
+        ensure_csv(
+            path,
+            ["timestamp", "date", "time", "tag", "alias", "value", "status"],
+        )
+        return path
 
     # ---------------- UI construction ----------------
 
@@ -376,7 +561,7 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(16, 16, 16, 16)
         left_layout.setSpacing(12)
 
-        # Connection / tags group (styled as a simple vertical layout)
+        # Configuration group
         cfg_group = QGroupBox("Configuration")
         cfg_group.setObjectName("cardGroupBox")
         cfg_layout = QFormLayout(cfg_group)
@@ -404,11 +589,44 @@ class MainWindow(QMainWindow):
         self.chunk_spin.setValue(20)
         cfg_layout.addRow(QLabel("Chunk Size (tags per read):"), self.chunk_spin)
 
+        # Machine state tag + behavior
+        self.machine_state_tag_edit = QLineEdit()
+        self.machine_state_tag_edit.setPlaceholderText(
+            "e.g. Program:MainRoutine.RotaryKiln_OperationState"
+        )
+        cfg_layout.addRow(QLabel("Machine State Tag (DINT):"), self.machine_state_tag_edit)
+
+        self.poll_mode_combo = QComboBox()
+        self.poll_mode_combo.addItems([
+            "Poll always",
+            "Pause when machine down",
+        ])
+        cfg_layout.addRow(QLabel("Polling Mode:"), self.poll_mode_combo)
+
+        # Heartbeat config
+        self.heartbeat_tag_edit = QLineEdit()
+        self.heartbeat_tag_edit.setPlaceholderText(
+            "e.g. Program:MainRoutine.RotaryKiln_Heartbeat"
+        )
+        cfg_layout.addRow(QLabel("Heartbeat Tag (BOOL/DINT):"), self.heartbeat_tag_edit)
+
+        self.heartbeat_mode_combo = QComboBox()
+        self.heartbeat_mode_combo.addItems([
+            "Disabled",
+            "Enabled",
+        ])
+        cfg_layout.addRow(QLabel("Heartbeat Mode:"), self.heartbeat_mode_combo)
+
         tags_label = QLabel("Tags to Poll (one per line):")
         self.tags_edit = QTextEdit()
-        self.tags_edit.setFixedHeight(160)
+        self.tags_edit.setFixedHeight(180)
         self.tags_edit.setPlaceholderText(
-            "e.g.\nProgram:MainRoutine.MyTag1\nProgram:MainRoutine.MyTag2\n..."
+            "Examples:\n"
+            "Program:MainRoutine.Temp_PV | Temperature\n"
+            "Program:MainRoutine.Pressure_PV | Pressure\n"
+            "Program:MainRoutine.Flow_PV\n"
+            "\n"
+            "Each line:  TAG  or  TAG | Alias"
         )
         cfg_layout.addRow(tags_label, self.tags_edit)
 
@@ -459,7 +677,7 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log_edit)
         left_layout.addWidget(log_group, stretch=1)
 
-        # Bottom spacer to keep things tight at top
+        # Bottom spacer
         left_layout.addSpacerItem(
             QSpacerItem(20, 10, QSizePolicy.Minimum, QSizePolicy.Expanding)
         )
@@ -473,7 +691,6 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(16, 16, 16, 16)
         right_layout.setSpacing(12)
 
-        # Dashboard header
         dash_header_layout = QHBoxLayout()
         dash_title = QLabel("Tag Dashboard")
         dash_title_font = QFont()
@@ -490,11 +707,12 @@ class MainWindow(QMainWindow):
 
         right_layout.addLayout(dash_header_layout)
 
-        # Table
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
+        # Alias + Tag + 3 metrics + status
+        self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels(
             [
+                "Alias",
                 "Tag",
                 "Current Value",
                 "Last Hour Avg",
@@ -503,11 +721,12 @@ class MainWindow(QMainWindow):
             ]
         )
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Alias
+        header.setSectionResizeMode(1, QHeaderView.Stretch)           # Tag
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
 
         right_layout.addWidget(self.table, stretch=1)
 
@@ -526,7 +745,6 @@ class MainWindow(QMainWindow):
         self.rebuild_btn.clicked.connect(self.rebuild_hourly_from_raw)
         browse_btn.clicked.connect(self.choose_log_dir)
 
-        # Menu (exit)
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         self.menuBar().addAction(exit_action)
@@ -549,12 +767,11 @@ class MainWindow(QMainWindow):
         palette.setColor(QPalette.Button, QColor(32, 36, 42))
         palette.setColor(QPalette.ButtonText, Qt.white)
         palette.setColor(QPalette.BrightText, Qt.red)
-        palette.setColor(QPalette.Highlight, QColor(76, 175, 80))  # green accent
+        palette.setColor(QPalette.Highlight, QColor(76, 175, 80))
         palette.setColor(QPalette.HighlightedText, Qt.white)
 
         app.setPalette(palette)
 
-        # Global stylesheet – VisionFinal-like, card-based, flat buttons
         app.setStyleSheet(
             """
             QMainWindow {
@@ -602,7 +819,7 @@ class MainWindow(QMainWindow):
                 color: #b0bec5;
                 font-size: 11px;
             }
-            QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox {
+            QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
                 background-color: #181c22;
                 border: 1px solid #2b323c;
                 border-radius: 4px;
@@ -610,7 +827,8 @@ class MainWindow(QMainWindow):
                 color: #e0e6ed;
                 selection-background-color: #4caf50;
             }
-            QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus {
+            QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus,
+            QSpinBox:focus, QComboBox:focus {
                 border: 1px solid #4caf50;
             }
             QTableWidget {
@@ -694,7 +912,7 @@ class MainWindow(QMainWindow):
     # ---------------- settings ----------------
 
     def _load_settings(self):
-        """Load machine, tags, and general settings from JSON."""
+        """Load machine, tags (with aliases), and general settings from JSON."""
         if not os.path.exists(self.SETTINGS_FILE):
             return
         try:
@@ -711,12 +929,25 @@ class MainWindow(QMainWindow):
         self.interval_spin.setValue(int(data.get("interval", 10)))
         self.chunk_spin.setValue(int(data.get("chunk_size", 20)))
 
-        self.tags_edit.setPlainText(data.get("tags", ""))
+        tags_text = data.get("tags", "")
+        self.tags_edit.setPlainText(tags_text)
+        # parse aliases from stored tags text
+        _, self.alias_map = self.parse_tags_and_aliases(tags_text)
 
         self.log_dir = data.get("log_dir", self.log_dir)
         self.log_dir_edit.setText(self.log_dir)
-        self.raw_csv_path = os.path.join(self.log_dir, "raw_data.csv")
+
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
+
+        # Machine state settings
+        self.machine_state_tag_edit.setText(data.get("machine_state_tag", ""))
+        pause_when_down = bool(data.get("pause_when_down", False))
+        self.poll_mode_combo.setCurrentIndex(1 if pause_when_down else 0)
+
+        # Heartbeat settings
+        self.heartbeat_tag_edit.setText(data.get("heartbeat_tag", ""))
+        heartbeat_enabled = bool(data.get("heartbeat_enabled", False))
+        self.heartbeat_mode_combo.setCurrentIndex(1 if heartbeat_enabled else 0)
 
         stored_order = data.get("tag_order", [])
         if isinstance(stored_order, list):
@@ -729,15 +960,19 @@ class MainWindow(QMainWindow):
             self.machine_label.setText("Machine: —")
 
     def _save_settings(self):
-        """Persist all tags, machine, and general settings to JSON."""
+        """Persist all tags, aliases (via text), machine, and general settings to JSON."""
         data = {
             "machine_name": self.machine_name_edit.text().strip(),
             "ip": self.ip_edit.text().strip(),
             "interval": self.interval_spin.value(),
             "chunk_size": self.chunk_spin.value(),
-            "tags": self.tags_edit.toPlainText(),
+            "tags": self.tags_edit.toPlainText(),  # aliases encoded in text
             "log_dir": self.log_dir_edit.text().strip(),
             "tag_order": self.tag_order,
+            "machine_state_tag": self.machine_state_tag_edit.text().strip(),
+            "pause_when_down": self.poll_mode_combo.currentIndex() == 1,
+            "heartbeat_tag": self.heartbeat_tag_edit.text().strip(),
+            "heartbeat_enabled": self.heartbeat_mode_combo.currentIndex() == 1,
         }
         try:
             with open(self.SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -754,13 +989,13 @@ class MainWindow(QMainWindow):
         if path:
             self.log_dir = path
             self.log_dir_edit.setText(path)
-            self.raw_csv_path = os.path.join(self.log_dir, "raw_data.csv")
             self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
-            ensure_csv(self.raw_csv_path, ["timestamp", "tag", "value", "status"])
             ensure_csv(
                 self.hourly_csv_path,
                 ["hour_start", "hour_end", "tag", "avg_value", "sample_count"],
             )
+            self.current_log_date = datetime.now().date()
+            self.raw_csv_path = self._ensure_raw_csv_for_date(self.current_log_date)
             self.log_message(f"Log directory set to: {path}")
 
     def start_polling(self):
@@ -774,9 +1009,19 @@ class MainWindow(QMainWindow):
             return
 
         tags_text = self.tags_edit.toPlainText().strip()
-        tags = [line.strip() for line in tags_text.splitlines() if line.strip()]
-        if not tags:
-            QMessageBox.warning(self, "No tags", "Please enter at least one tag to poll.")
+        tags, alias_map = self.parse_tags_and_aliases(tags_text)
+
+        machine_state_tag = self.machine_state_tag_edit.text().strip()
+        heartbeat_tag = self.heartbeat_tag_edit.text().strip()
+        heartbeat_enabled = (self.heartbeat_mode_combo.currentIndex() == 1)
+
+        if not tags and not machine_state_tag and not heartbeat_enabled:
+            QMessageBox.warning(
+                self,
+                "No tags",
+                "Please enter at least one tag to poll, a machine state tag, "
+                "or enable a heartbeat tag.",
+            )
             return
 
         if len(tags) > 200:
@@ -787,8 +1032,16 @@ class MainWindow(QMainWindow):
                 "but consider keeping it to a few dozen for better responsiveness.",
             )
 
-        self.tag_order = list(tags)
+        # stable ordering for the dashboard
+        tag_order = list(tags)
+        if machine_state_tag and machine_state_tag not in tag_order:
+            tag_order.append(machine_state_tag)
+        if heartbeat_tag and heartbeat_tag not in tag_order:
+            tag_order.append(heartbeat_tag)
+        self.tag_order = tag_order
+        self.alias_map = alias_map  # keep for CSV + table
 
+        # machine name / header
         self.machine_name = self.machine_name_edit.text().strip()
         if self.machine_name:
             self.setWindowTitle(f"CIP Tag Poller & Dashboard - {self.machine_name}")
@@ -806,6 +1059,11 @@ class MainWindow(QMainWindow):
 
         interval = self.interval_spin.value()
         chunk_size = self.chunk_spin.value()
+        pause_when_down = (self.poll_mode_combo.currentIndex() == 1)
+
+        # ensure current day's raw file exists before starting
+        self.current_log_date = datetime.now().date()
+        self.raw_csv_path = self._ensure_raw_csv_for_date(self.current_log_date)
 
         self.poll_thread = PollThread(
             ip=ip,
@@ -813,6 +1071,10 @@ class MainWindow(QMainWindow):
             interval_sec=interval,
             chunk_size=chunk_size,
             reconnect_delay_sec=10,
+            machine_state_tag=machine_state_tag,
+            pause_when_down=pause_when_down,
+            heartbeat_tag=heartbeat_tag,
+            heartbeat_enabled=heartbeat_enabled,
             parent=self,
         )
         self.poll_thread.data_ready.connect(self.handle_poll_data)
@@ -824,8 +1086,12 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.connection_status_label.setText("Status: Polling")
         self.connection_status_label.setStyleSheet("color: #a5d6a7;")
+
+        mode_txt = "Pause when machine down" if pause_when_down else "Poll always"
+        hb_txt = "enabled" if heartbeat_enabled else "disabled"
         self.log_message(
-            f"Started polling every {interval} seconds for {len(tags)} tag(s)."
+            f"Started polling every {interval} seconds for {len(tags)} tag(s) "
+            f"(mode={mode_txt}, heartbeat {hb_txt})."
         )
 
     def stop_polling(self):
@@ -842,17 +1108,14 @@ class MainWindow(QMainWindow):
     # ---------------- data handling ----------------
 
     def handle_poll_error(self, msg: str):
-        """
-        Handle errors emitted from PollThread.
-        No modal message boxes here; just log and keep running.
-        """
+        """Handle errors emitted from PollThread (no modal boxes)."""
         self.log_message(msg)
 
     def handle_poll_data(self, ts_iso: str, data: Dict[str, Tuple[object, str]]):
         """
         Called from background thread with new readings.
         - Update current values
-        - Append to raw CSV
+        - Append to daily raw CSV (raw_data_YYYY-MM-DD.csv)
         - Update hourly accumulators and roll over when hour changes
         """
         try:
@@ -871,14 +1134,29 @@ class MainWindow(QMainWindow):
                 self.hour_accumulators.clear()
                 self.current_hour_preview.clear()
 
-            ensure_csv(self.raw_csv_path, ["timestamp", "tag", "value", "status"])
+            # Daily rotation: if date changed, switch raw CSV
+            log_date = ts.date()
+            if log_date != self.current_log_date or not self.raw_csv_path:
+                self.current_log_date = log_date
+                self.raw_csv_path = self._ensure_raw_csv_for_date(self.current_log_date)
+            else:
+                ensure_csv(
+                    self.raw_csv_path,
+                    ["timestamp", "date", "time", "tag", "alias", "value", "status"],
+                )
+
+            date_str = ts.strftime("%Y-%m-%d")
+            time_str = ts.strftime("%H:%M:%S")
 
             try:
                 with open(self.raw_csv_path, "a", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     for tag, (val, status) in data.items():
                         self.current_values[tag] = (val, status)
-                        writer.writerow([ts_iso, tag, val, status])
+                        alias = self.alias_map.get(tag, "")
+                        writer.writerow(
+                            [ts_iso, date_str, time_str, tag, alias, val, status]
+                        )
 
                         if isinstance(val, (int, float)) and str(status).lower() == "success":
                             acc = self.hour_accumulators.setdefault(
@@ -895,9 +1173,7 @@ class MainWindow(QMainWindow):
             self.log_message(f"Error handling poll data: {e}")
 
     def finalize_previous_hour(self):
-        """
-        Compute averages for tags in the previous hour and write to hourly CSV.
-        """
+        """Compute averages for tags in the previous hour and write to hourly CSV."""
         if self.current_hour_start is None or not self.hour_accumulators:
             return
 
@@ -958,47 +1234,79 @@ class MainWindow(QMainWindow):
         self.log_message("Computed current hour averages (display only).")
 
     def rebuild_hourly_from_raw(self):
-        if not os.path.exists(self.raw_csv_path):
+        """
+        Recompute all hourly averages from all raw_data_YYYY-MM-DD.csv
+        files in the log directory and rewrite hourly_averages.csv.
+        """
+        if not os.path.isdir(self.log_dir):
             QMessageBox.warning(
-                self, "No Raw Data", "Raw CSV does not exist; nothing to rebuild."
+                self, "No Raw Data", "Log directory does not exist; nothing to rebuild."
             )
             return
 
-        self.log_message("Rebuilding hourly averages from raw data...")
+        raw_files = []
+        try:
+            for name in os.listdir(self.log_dir):
+                if name.startswith("raw_data_") and name.endswith(".csv"):
+                    raw_files.append(os.path.join(self.log_dir, name))
+        except Exception as e:
+            self.log_message(f"Error listing raw files: {e}")
+            QMessageBox.critical(
+                self, "Error", f"Failed to list raw data files:\n{e}"
+            )
+            return
+
+        if not raw_files:
+            QMessageBox.warning(
+                self,
+                "No Raw Data",
+                "No raw_data_YYYY-MM-DD.csv files found; nothing to rebuild.",
+            )
+            return
+
+        self.log_message(
+            f"Rebuilding hourly averages from {len(raw_files)} raw data file(s)..."
+        )
         records: Dict[Tuple[str, str], Tuple[str, float, int]] = {}
 
         try:
-            with open(self.raw_csv_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                buckets: Dict[Tuple[datetime, str], Dict[str, float]] = {}
-                for row in reader:
-                    try:
-                        ts = datetime.fromisoformat(row["timestamp"])
-                    except Exception:
-                        continue
-                    tag = row["tag"]
-                    status = str(row.get("status", "")).lower()
-                    try:
-                        val = float(row["value"])
-                    except Exception:
-                        continue
-                    if status != "success":
-                        continue
-                    hstart = hour_bucket(ts)
-                    key = (hstart, tag)
-                    acc = buckets.setdefault(key, {"sum": 0.0, "count": 0})
-                    acc["sum"] += val
-                    acc["count"] += 1
+            buckets: Dict[Tuple[datetime, str], Dict[str, float]] = {}
+            for path in sorted(raw_files):
+                with open(path, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        ts_str = row.get("timestamp", "")
+                        if not ts_str:
+                            continue
+                        try:
+                            ts = datetime.fromisoformat(ts_str)
+                        except Exception:
+                            continue
 
-                for (hstart, tag), acc in buckets.items():
-                    if acc["count"] <= 0:
-                        continue
-                    hstart_iso = hstart.isoformat(timespec="seconds")
-                    hend_iso = (hstart + timedelta(hours=1)).isoformat(
-                        timespec="seconds"
-                    )
-                    avg = acc["sum"] / acc["count"]
-                    records[(hstart_iso, tag)] = (hend_iso, avg, int(acc["count"]))
+                        tag = row.get("tag", "")
+                        if not tag:
+                            continue
+                        status = str(row.get("status", "")).lower()
+                        try:
+                            val = float(row.get("value", ""))
+                        except Exception:
+                            continue
+                        if status != "success":
+                            continue
+
+                        hstart = hour_bucket(ts)
+                        key = (hstart, tag)
+                        acc = buckets.setdefault(key, {"sum": 0.0, "count": 0})
+                        acc["sum"] += val
+                        acc["count"] += 1
+
+            for (hstart, tag), acc in buckets.items():
+                if acc["count"] <= 0:
+                    continue
+                hstart_iso = hstart.isoformat(timespec="seconds")
+                hend_iso = (hstart + timedelta(hours=1)).isoformat(timespec="seconds")
+                avg = acc["sum"] / acc["count"]
+                records[(hstart_iso, tag)] = (hend_iso, avg, int(acc["count"]))
         except Exception as e:
             self.log_message(f"Error rebuilding hourly from raw: {e}")
             QMessageBox.critical(
@@ -1032,7 +1340,7 @@ class MainWindow(QMainWindow):
     def update_dashboard(self):
         """
         Render table rows:
-            Tag | Current Value | Last Hour Avg | Current Hour Avg (so far) | Status
+            Alias | Tag | Current Value | Last Hour Avg | Current Hour Avg (so far) | Status
         """
         if self.tag_order:
             tags = list(self.tag_order)
@@ -1052,24 +1360,27 @@ class MainWindow(QMainWindow):
             last_avg = self.last_hour_avg.get(tag, "")
             cur_avg = self.current_hour_preview.get(tag, "")
 
+            alias = self.alias_map.get(tag, "")
+
             def item(text):
                 it = QTableWidgetItem(str(text))
                 it.setFlags(it.flags() & ~Qt.ItemIsEditable)
                 return it
 
-            self.table.setItem(row, 0, item(tag))
-            self.table.setItem(row, 1, item(val))
+            self.table.setItem(row, 0, item(alias))
+            self.table.setItem(row, 1, item(tag))
+            self.table.setItem(row, 2, item(val))
             self.table.setItem(
                 row,
-                2,
+                3,
                 item(f"{last_avg:.4f}" if isinstance(last_avg, (int, float)) else ""),
             )
             self.table.setItem(
                 row,
-                3,
+                4,
                 item(f"{cur_avg:.4f}" if isinstance(cur_avg, (int, float)) else ""),
             )
-            self.table.setItem(row, 4, item(status))
+            self.table.setItem(row, 5, item(status))
 
     # ---------------- logging & lifecycle ----------------
 

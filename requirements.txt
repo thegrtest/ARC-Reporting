@@ -1,5 +1,5 @@
 pandas
-Dash
+dash
 dash-daq
 PySide6
 pylogix

@@ -16,7 +16,7 @@ Exposes a network dashboard with:
     - Color-coded gauges using thresholds.json (configurable in Thresholds tab).
 
 Run:
-    python cip_dash_server.py
+    python CIPMonitor.py
 
 Then open:
     http://<this_machine_ip>:8050

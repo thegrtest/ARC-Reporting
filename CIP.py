@@ -464,12 +464,25 @@ class PollThread(QThread):
             else:
                 raise
         else:
+            too_many_via_status = False
             for r in res:
-                tag = getattr(r, "TagName", "(unknown)")
-                val = getattr(r, "Value", None)
-                st = getattr(r, "Status", "(unknown)")
-                results[tag] = (val, st)
-            return results
+                status_text = str(getattr(r, "Status", "")).lower()
+                if "too many parameters" in status_text or "too many attributes" in status_text:
+                    too_many_via_status = True
+                    break
+
+            if not too_many_via_status:
+                for r in res:
+                    tag = getattr(r, "TagName", "(unknown)")
+                    val = getattr(r, "Value", None)
+                    st = getattr(r, "Status", "(unknown)")
+                    results[tag] = (val, st)
+                return results
+
+            self.info.emit(
+                "PLC status indicated 'too many parameters' on multi-read; "
+                "falling back to single-tag reads for this batch."
+            )
 
         # Fallback path: single-tag reads
         for tag in batch:

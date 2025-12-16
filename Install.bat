@@ -143,7 +143,7 @@ if not exist "%RUN_BAT%" (
 )
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$runBat = Resolve-Path '%RUN_BAT%' -ErrorAction Stop;" ^
+  "$runBat = (Resolve-Path '%RUN_BAT%' -ErrorAction Stop).ProviderPath;" ^
   "$root = Split-Path -Parent $runBat;" ^
   "$desktop = [Environment]::GetFolderPath('Desktop');" ^
   "$shortcutPath = Join-Path $desktop '%APP_NAME%.lnk';" ^

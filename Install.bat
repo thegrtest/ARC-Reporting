@@ -129,43 +129,37 @@ REM ------------------------------------------------------------
 REM STEP 6/6: Create Run.bat + Desktop shortcut
 REM ------------------------------------------------------------
 call :LOGI "STEP 6/6: Creating launcher and Desktop shortcut..."
+call :WRITE_LAUNCHER "%RUN_BAT%"
+if errorlevel 1 (
+  call :LOGE "Failed to create launcher at %RUN_BAT%"
+  pause
+  exit /b 1
+)
 
-> "%RUN_BAT%" (
-  echo @echo off
-  echo setlocal EnableExtensions
-  echo set "ROOT=%%~dp0"
-  echo if "%%ROOT:~-1%%"=="\" set "ROOT=%%ROOT:~0,-1%%"
-  echo set "PY=%%ROOT%%\.venv\Scripts\python.exe"
-  echo if not exist "%%PY%%" ^(
-  echo   echo [ERROR] venv not found. Run Install.bat first.
-  echo   pause
-  echo   exit /b 1
-  echo ^)
-  echo cd /d "%%ROOT%%"
-  echo if /I "%%~1"=="monitor" ^(
-  echo   echo Starting CIPMonitor.py (Dash dashboard on port 8050)...
-  echo   "%%PY%%" "CIPMonitor.py"
-  echo ^) else ^(
-  echo   echo Starting CIP.py (PySide6 poller GUI)...
-  echo   "%%PY%%" "CIP.py"
-  echo ^)
-  echo if errorlevel 1 ^(
-  echo   echo.
-  echo   echo [ERROR] Program exited with an error.
-  echo   pause
-  echo ^)
+if not exist "%RUN_BAT%" (
+  call :LOGE "Launcher missing after creation: %RUN_BAT%"
+  pause
+  exit /b 1
 )
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$WshShell = New-Object -ComObject WScript.Shell;" ^
-  "$Desktop = [Environment]::GetFolderPath('Desktop');" ^
-  "$ShortcutPath = Join-Path $Desktop '%APP_NAME%.lnk';" ^
-  "if(Test-Path $ShortcutPath){Remove-Item $ShortcutPath -Force};" ^
-  "$Shortcut = $WshShell.CreateShortcut($ShortcutPath);" ^
-  "$Shortcut.TargetPath = '%RUN_BAT%';" ^
-  "$Shortcut.WorkingDirectory = '%ROOT%';" ^
-  "if (Test-Path '%ICON_FILE%') { $Shortcut.IconLocation = '%ICON_FILE%,0'; }" ^
-  "$Shortcut.Save();" >> "%LOG%" 2>&1
+  "$runBat = Resolve-Path '%RUN_BAT%' -ErrorAction Stop;" ^
+  "$root = Split-Path -Parent $runBat;" ^
+  "$desktop = [Environment]::GetFolderPath('Desktop');" ^
+  "$shortcutPath = Join-Path $desktop '%APP_NAME%.lnk';" ^
+  "if(Test-Path $shortcutPath){Remove-Item $shortcutPath -Force};" ^
+  "$shell = New-Object -ComObject WScript.Shell;" ^
+  "$shortcut = $shell.CreateShortcut($shortcutPath);" ^
+  "$shortcut.TargetPath = $runBat;" ^
+  "$shortcut.WorkingDirectory = $root;" ^
+  "if (Test-Path '%ICON_FILE%') { $shortcut.IconLocation = '%ICON_FILE%,0'; }" ^
+  "$shortcut.Save();" >> "%LOG%" 2>&1
+
+if errorlevel 1 (
+  call :LOGE "Desktop shortcut creation failed. See install.log for details."
+  pause
+  exit /b 1
+)
 
 call :LOGI "Install complete."
 echo.
@@ -177,6 +171,44 @@ exit /b 0
 
 
 REM ================= Helpers =================
+:WRITE_LAUNCHER
+setlocal EnableExtensions
+set "TARGET=%~1"
+if "%TARGET%"=="" (
+  endlocal & exit /b 1
+)
+
+> "%TARGET%" (
+  echo @echo off
+  echo setlocal EnableExtensions EnableDelayedExpansion
+  echo set "ROOT=%%~dp0"
+  echo if "%%ROOT:~-1%%"=="\" set "ROOT=%%ROOT:~0,-1%%"
+  echo set "PY=%%ROOT%%\.venv\Scripts\python.exe"
+  echo if not exist "%%PY%%" ^(
+  echo   echo [ERROR] Python virtual environment not found at:
+  echo   echo ^ ^ "%%PY%%"
+  echo   echo Run Install.bat to set up dependencies.
+  echo   pause
+  echo   exit /b 1
+  echo ^)
+  echo cd /d "%%ROOT%%"
+  echo if /I "%%~1"=="monitor" ^(
+  echo   echo Starting CIPMonitor.py ^(Dash dashboard on port 8050^)...
+  echo   "%%PY%%" "CIPMonitor.py"
+  echo ^) else ^(
+  echo   echo Starting CIP.py ^(PySide6 poller GUI^)...
+  echo   "%%PY%%" "CIP.py"
+  echo ^)
+  echo if errorlevel 1 ^(
+  echo   echo.
+  echo   echo [ERROR] Program exited with an error.
+  echo   pause
+  echo ^)
+  echo endlocal
+)
+
+endlocal & exit /b 0
+
 :LOGI
 echo [INFO] %~1
 >> "%LOG%" echo [INFO] %~1

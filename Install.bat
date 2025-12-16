@@ -2,20 +2,20 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
-REM RemVision Installer (Pinned + venv, inline deps) - STABLE
-REM - Robust Python 3.10 install (python.org + winget fallback)
-REM - Always rebuilds venv (prevents old-path pip)
-REM - Installs deps INLINE (no requirements file, avoids '' invalid requirement)
-REM - Creates Run_RemVision.bat and Desktop shortcut with remington.ico
+REM ARC-Reporting Installer (venv + requirements.txt)
+REM - Ensures Python 3.10 is available (python.org + winget fallback)
+REM - Rebuilds venv each run to avoid stale paths
+REM - Installs dependencies from requirements.txt (pandas, dash, dash-daq, PySide6, pylogix)
+REM - Creates Run_ARC-Reporting.bat and Desktop shortcut
 REM ============================================================
 
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
-set "APP_NAME=RemVision"
+set "APP_NAME=ARC-Reporting"
 set "VENV_DIR=%ROOT%\.venv"
 set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
-set "RUN_BAT=%ROOT%\Run_RemVision.bat"
+set "RUN_BAT=%ROOT%\Run_ARC-Reporting.bat"
 set "ICON_FILE=%ROOT%\remington.ico"
 set "LOG=%ROOT%\install.log"
 
@@ -99,35 +99,18 @@ if errorlevel 1 (
 )
 
 REM ------------------------------------------------------------
-REM STEP 5/6: Install dependencies INLINE (no -r file)
+REM STEP 5/6: Install dependencies from requirements.txt
 REM ------------------------------------------------------------
-call :LOGI "STEP 5/6: Installing dependencies (may take several minutes)..."
+call :LOGI "STEP 5/6: Installing dependencies (may take a few minutes)..."
 
-REM We install PyTorch CPU wheels from PyTorch index + PyPI for everything else
-"%VENV_PY%" -m pip install --upgrade ^
-  --index-url https://download.pytorch.org/whl/cpu ^
-  --extra-index-url https://pypi.org/simple ^
-  "torch==2.9.1+cpu" ^
-  "torchaudio==2.9.1+cpu" ^
-  "torchvision==0.24.1+cpu" ^
-  "absl-py==2.3.1" ^
-  "loguru==0.7.3" ^
-  "opencv-python==4.12.0.88" ^
-  "pillow==12.0.0" ^
-  "pycocotools==2.0.10" ^
-  "PySide6==6.10.0" ^
-  "PySide6_Addons==6.10.0" ^
-  "PySide6_Essentials==6.10.0" ^
-  "PyYAML==6.0.3" ^
-  "QDarkStyle==3.2.3" ^
-  "requests==2.32.5" ^
-  "tabulate==0.9.0" ^
-  "tensorboard==2.20.0" ^
-  "tensorboard-data-server==0.7.2" ^
-  "tqdm==4.67.1" ^
-  "matplotlib" ^
-  "psutil" ^
-  "thop" >> "%LOG%" 2>&1
+if not exist "%ROOT%\requirements.txt" (
+  call :LOGE "requirements.txt not found in %ROOT%"
+  echo [ERROR] Missing requirements.txt next to Install.bat.
+  pause
+  exit /b 1
+)
+
+"%VENV_PY%" -m pip install --upgrade -r "%ROOT%\requirements.txt" >> "%LOG%" 2>&1
 
 if errorlevel 1 (
   call :LOGE "Dependency install failed."
@@ -139,7 +122,7 @@ if errorlevel 1 (
 call :LOGI "Dependencies installed."
 
 REM ------------------------------------------------------------
-REM STEP 6/6: Create Run_RemVision.bat + Desktop shortcut
+REM STEP 6/6: Create Run_ARC-Reporting.bat + Desktop shortcut
 REM ------------------------------------------------------------
 call :LOGI "STEP 6/6: Creating launcher and Desktop shortcut..."
 
@@ -150,12 +133,18 @@ call :LOGI "STEP 6/6: Creating launcher and Desktop shortcut..."
   echo if "%%ROOT:~-1%%"=="\" set "ROOT=%%ROOT:~0,-1%%"
   echo set "PY=%%ROOT%%\.venv\Scripts\python.exe"
   echo if not exist "%%PY%%" ^(
-  echo   echo [ERROR] venv not found. Run installer.
+  echo   echo [ERROR] venv not found. Run Install.bat first.
   echo   pause
   echo   exit /b 1
   echo ^)
   echo cd /d "%%ROOT%%"
-  echo "%%PY%%" "main.py"
+  echo if /I "%%~1"=="monitor" ^(
+  echo   echo Starting CIPMonitor.py (Dash dashboard on port 8050)...
+  echo   "%%PY%%" "CIPMonitor.py"
+  echo ^) else ^(
+  echo   echo Starting CIP.py (PySide6 poller GUI)...
+  echo   "%%PY%%" "CIP.py"
+  echo ^)
   echo if errorlevel 1 ^(
   echo   echo.
   echo   echo [ERROR] Program exited with an error.
@@ -177,7 +166,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
 call :LOGI "Install complete."
 echo.
 echo [OK] Installed %APP_NAME%.
-echo [OK] Desktop shortcut created (Run_RemVision.bat + remington.ico)
+echo [OK] Desktop shortcut created (Run_ARC-Reporting.bat)
 echo [OK] Log: "%LOG%"
 pause
 exit /b 0
@@ -218,7 +207,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 set "PY_VER=3.10.11"
 set "PY_INSTALLER=python-%PY_VER%-amd64.exe"
 set "PY_URL=https://www.python.org/ftp/python/%PY_VER%/%PY_INSTALLER%"
-set "TMP=%TEMP%\REMVISION_SETUP"
+set "TMP=%TEMP%\ARC_REPORTING_SETUP"
 if not exist "%TMP%" mkdir "%TMP%" >nul 2>&1
 set "PY_INSTALLER_PATH=%TMP%\%PY_INSTALLER%"
 

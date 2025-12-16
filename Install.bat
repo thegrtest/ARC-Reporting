@@ -3,6 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
 REM ARC-Reporting Installer (venv + requirements.txt)
+REM Publisher: TKG
 REM - Ensures Python 3.10 is available (python.org + winget fallback)
 REM - Rebuilds venv each run to avoid stale paths
 REM - Installs dependencies from requirements.txt (pandas, dash, dash-daq, PySide6, pylogix)
@@ -18,17 +19,20 @@ set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
 set "RUN_BAT=%ROOT%\Run.bat"
 set "ICON_FILE=%ROOT%\Ram.ico"
 set "LOG=%ROOT%\install.log"
+set "PUBLISHER=TKG"
 
 > "%LOG%" (
   echo ============================================================
   echo %APP_NAME% Install Log - %DATE% %TIME%
   echo Root: "%ROOT%"
+  echo Publisher: %PUBLISHER%
   echo ============================================================
 )
 
 call :LOGI "============================================================"
 call :LOGI "%APP_NAME% Installer"
 call :LOGI "Root: %ROOT%"
+call :LOGI "Publisher: %PUBLISHER%"
 call :LOGI "Log : %LOG%"
 call :LOGI "============================================================"
 

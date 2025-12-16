@@ -6,7 +6,7 @@ REM ARC-Reporting Installer (venv + requirements.txt)
 REM - Ensures Python 3.10 is available (python.org + winget fallback)
 REM - Rebuilds venv each run to avoid stale paths
 REM - Installs dependencies from requirements.txt (pandas, dash, dash-daq, PySide6, pylogix)
-REM - Creates Run_ARC-Reporting.bat and Desktop shortcut
+REM - Creates Run.bat and Desktop shortcut
 REM ============================================================
 
 set "ROOT=%~dp0"
@@ -15,8 +15,8 @@ if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "APP_NAME=ARC-Reporting"
 set "VENV_DIR=%ROOT%\.venv"
 set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
-set "RUN_BAT=%ROOT%\Run_ARC-Reporting.bat"
-set "ICON_FILE=%ROOT%\remington.ico"
+set "RUN_BAT=%ROOT%\Run.bat"
+set "ICON_FILE=%ROOT%\Ram.ico"
 set "LOG=%ROOT%\install.log"
 
 > "%LOG%" (
@@ -122,7 +122,7 @@ if errorlevel 1 (
 call :LOGI "Dependencies installed."
 
 REM ------------------------------------------------------------
-REM STEP 6/6: Create Run_ARC-Reporting.bat + Desktop shortcut
+REM STEP 6/6: Create Run.bat + Desktop shortcut
 REM ------------------------------------------------------------
 call :LOGI "STEP 6/6: Creating launcher and Desktop shortcut..."
 
@@ -166,7 +166,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
 call :LOGI "Install complete."
 echo.
 echo [OK] Installed %APP_NAME%.
-echo [OK] Desktop shortcut created (Run_ARC-Reporting.bat)
+echo [OK] Desktop shortcut created (Run.bat)
 echo [OK] Log: "%LOG%"
 pause
 exit /b 0

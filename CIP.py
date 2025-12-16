@@ -56,6 +56,7 @@ import hashlib
 import getpass
 import gzip
 import shutil
+import traceback
 from collections import deque
 from datetime import datetime, timedelta, date
 from typing import Dict, Tuple, List, Optional
@@ -2484,4 +2485,36 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:  # pragma: no cover - defensive startup guard
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "startup_error.log")
+        tb_text = traceback.format_exc()
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().isoformat()}] {exc}\n\n{tb_text}")
+        except Exception:
+            log_path = None
+
+        message_lines = [
+            "CIP Tag Poller failed to start.",
+            f"Error: {exc}",
+        ]
+        if log_path:
+            message_lines.append(f"Details were written to {log_path}.")
+
+        print("\n".join(message_lines), file=sys.stderr)
+
+        try:
+            app = QApplication.instance()
+            owns_app = False
+            if app is None:
+                app = QApplication(sys.argv)
+                owns_app = True
+            QMessageBox.critical(None, "CIP startup error", "\n".join(message_lines))
+            if owns_app:
+                app.quit()
+        except Exception:
+            pass
+
+        sys.exit(1)

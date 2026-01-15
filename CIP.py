@@ -2218,6 +2218,7 @@ class MainWindow(QMainWindow):
         calc_tags = self._epa_calc_tag_names()
 
         results: Dict[str, Tuple[float, str]] = {}
+        status_success = "success"
         pollutant_map = [
             ("NOx", self.epa_nox_tag, True),
             ("CO", self.epa_co_tag, True),
@@ -2250,7 +2251,7 @@ class MainWindow(QMainWindow):
                 continue
             lb_hr = self._ppmv_to_lb_hr(corrected_ppmv, flow, mw)
             calc_tag = calc_tags[pollutant]
-            results[calc_tag] = (lb_hr, "success")
+            results[calc_tag] = (lb_hr, status_success)
             self.alias_map.setdefault(calc_tag, f"{pollutant} (lb/hr)")
             self.units_map.setdefault(calc_tag, "lb/hr")
 

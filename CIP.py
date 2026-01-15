@@ -862,6 +862,12 @@ class MainWindow(QMainWindow):
         self.epa_ref_o2_pct = 3.0
         self.epa_nox_tag = ""
         self.epa_co_tag = ""
+        self.production_product_tag = ""
+        self.production_weight_tag = ""
+        self.production_weight_units = ""
+        self.production_weight_limits_enabled = False
+        self.production_weight_min = 0.0
+        self.production_weight_max = 0.0
         self.log_dir = os.path.join("logs")
         self.raw_csv_path = ""   # will be set based on current date
         self.current_log_date: date = datetime.now().date()
@@ -1471,6 +1477,47 @@ class MainWindow(QMainWindow):
         self.epa_co_tag_edit = QLineEdit()
         self.epa_co_tag_edit.setPlaceholderText("e.g. Program:MainRoutine.CO_PPMV")
         cfg_layout.addRow(QLabel("CO Tag (PPMV):"), self.epa_co_tag_edit)
+
+        production_label = QLabel("Production Tracking")
+        production_label.setStyleSheet("font-weight: 600; color: #b0bec5; padding-top: 6px;")
+        cfg_layout.addRow(production_label)
+
+        self.production_product_tag_edit = QLineEdit()
+        self.production_product_tag_edit.setPlaceholderText(
+            "e.g. Program:MainRoutine.ProductCode"
+        )
+        cfg_layout.addRow(QLabel("Product Tag:"), self.production_product_tag_edit)
+
+        self.production_weight_tag_edit = QLineEdit()
+        self.production_weight_tag_edit.setPlaceholderText(
+            "e.g. Program:MainRoutine.ProductWeight_Total"
+        )
+        cfg_layout.addRow(QLabel("Weight Tag:"), self.production_weight_tag_edit)
+
+        self.production_weight_units_edit = QLineEdit()
+        self.production_weight_units_edit.setPlaceholderText("e.g. lb, kg, tons")
+        cfg_layout.addRow(QLabel("Weight Units:"), self.production_weight_units_edit)
+
+        self.production_weight_limits_checkbox = QCheckBox("Enable weight limits")
+        self.production_weight_limits_checkbox.setChecked(False)
+        cfg_layout.addRow(self.production_weight_limits_checkbox)
+
+        self.production_weight_min_spin = QDoubleSpinBox()
+        self.production_weight_min_spin.setRange(0.0, 1_000_000_000.0)
+        self.production_weight_min_spin.setDecimals(2)
+        self.production_weight_min_spin.setValue(self.production_weight_min)
+        self.production_weight_max_spin = QDoubleSpinBox()
+        self.production_weight_max_spin.setRange(0.0, 1_000_000_000.0)
+        self.production_weight_max_spin.setDecimals(2)
+        self.production_weight_max_spin.setValue(self.production_weight_max)
+
+        cfg_layout.addRow(QLabel("Weight Min Limit:"), self.production_weight_min_spin)
+        cfg_layout.addRow(QLabel("Weight Max Limit:"), self.production_weight_max_spin)
+
+        self.production_weight_limits_checkbox.stateChanged.connect(
+            self._toggle_production_weight_limits
+        )
+        self._toggle_production_weight_limits(self.production_weight_limits_checkbox.checkState())
 
         # Machine state tag + behavior
         self.machine_state_tag_edit = QLineEdit()
@@ -2233,6 +2280,32 @@ class MainWindow(QMainWindow):
         self.epa_co_tag = str(data.get("epa_co_tag", "") or "")
         self.epa_co_tag_edit.setText(self.epa_co_tag)
 
+        production_data = data.get("production_tracking", {})
+        if not isinstance(production_data, dict):
+            production_data = {}
+        self.production_product_tag = str(production_data.get("product_tag", "") or "")
+        self.production_weight_tag = str(production_data.get("weight_tag", "") or "")
+        self.production_weight_units = str(production_data.get("weight_units", "") or "")
+        limits_data = production_data.get("limits", {})
+        if not isinstance(limits_data, dict):
+            limits_data = {}
+        self.production_weight_limits_enabled = bool(limits_data.get("enabled", False))
+        weight_min = _to_float(limits_data.get("min"))
+        weight_max = _to_float(limits_data.get("max"))
+        if weight_min is None:
+            weight_min = self.production_weight_min
+        if weight_max is None:
+            weight_max = self.production_weight_max
+        self.production_weight_min = weight_min
+        self.production_weight_max = weight_max
+        self.production_product_tag_edit.setText(self.production_product_tag)
+        self.production_weight_tag_edit.setText(self.production_weight_tag)
+        self.production_weight_units_edit.setText(self.production_weight_units)
+        self.production_weight_limits_checkbox.setChecked(self.production_weight_limits_enabled)
+        self.production_weight_min_spin.setValue(self.production_weight_min)
+        self.production_weight_max_spin.setValue(self.production_weight_max)
+        self._toggle_production_weight_limits(self.production_weight_limits_checkbox.checkState())
+
         # Machine state settings
         self.machine_state_tag_edit.setText(data.get("machine_state_tag", ""))
         pause_when_down = bool(data.get("pause_when_down", False))
@@ -2300,6 +2373,24 @@ class MainWindow(QMainWindow):
             "epa_ref_o2_pct": self.epa_ref_o2_spin.value(),
             "epa_nox_tag": self.epa_nox_tag_edit.text().strip(),
             "epa_co_tag": self.epa_co_tag_edit.text().strip(),
+            "production_tracking": {
+                "product_tag": self.production_product_tag_edit.text().strip(),
+                "weight_tag": self.production_weight_tag_edit.text().strip(),
+                "weight_units": self.production_weight_units_edit.text().strip(),
+                "limits": {
+                    "enabled": self.production_weight_limits_checkbox.isChecked(),
+                    "min": (
+                        self.production_weight_min_spin.value()
+                        if self.production_weight_limits_checkbox.isChecked()
+                        else None
+                    ),
+                    "max": (
+                        self.production_weight_max_spin.value()
+                        if self.production_weight_limits_checkbox.isChecked()
+                        else None
+                    ),
+                },
+            },
             "lockdown_enabled": self.lockdown_checkbox.isChecked(),
         }
         self.log_dir = data["log_dir"]
@@ -2378,6 +2469,7 @@ class MainWindow(QMainWindow):
             ("epa_ref_o2_pct", "EPA reference O2"),
             ("epa_nox_tag", "EPA NOx tag"),
             ("epa_co_tag", "EPA CO tag"),
+            ("production_tracking", "Production tracking"),
         ]
         for key, label in watched_fields:
             old_val = None if old is None else old.get(key)
@@ -2418,6 +2510,12 @@ class MainWindow(QMainWindow):
             self.epa_ref_o2_spin,
             self.epa_nox_tag_edit,
             self.epa_co_tag_edit,
+            self.production_product_tag_edit,
+            self.production_weight_tag_edit,
+            self.production_weight_units_edit,
+            self.production_weight_limits_checkbox,
+            self.production_weight_min_spin,
+            self.production_weight_max_spin,
             self.machine_state_tag_edit,
             self.poll_mode_combo,
             self.heartbeat_tag_edit,
@@ -2449,6 +2547,11 @@ class MainWindow(QMainWindow):
             self._save_settings()
         if self.lockdown_enabled and not running:
             QTimer.singleShot(0, self._auto_start_if_locked)
+
+    def _toggle_production_weight_limits(self, _state: int) -> None:
+        enabled = self.production_weight_limits_checkbox.isChecked()
+        self.production_weight_min_spin.setEnabled(enabled)
+        self.production_weight_max_spin.setEnabled(enabled)
 
     def _auto_start_if_locked(self):
         if not self.lockdown_enabled:
@@ -2598,6 +2701,24 @@ class MainWindow(QMainWindow):
         for epa_tag in epa_tags:
             if epa_tag and epa_tag not in tags:
                 tags.append(epa_tag)
+
+        self.production_product_tag = self.production_product_tag_edit.text().strip()
+        self.production_weight_tag = self.production_weight_tag_edit.text().strip()
+        self.production_weight_units = self.production_weight_units_edit.text().strip()
+        self.production_weight_limits_enabled = self.production_weight_limits_checkbox.isChecked()
+        self.production_weight_min = self.production_weight_min_spin.value()
+        self.production_weight_max = self.production_weight_max_spin.value()
+
+        if self.production_product_tag and self.production_product_tag not in tags:
+            tags.append(self.production_product_tag)
+        if self.production_weight_tag and self.production_weight_tag not in tags:
+            tags.append(self.production_weight_tag)
+        if self.production_product_tag:
+            alias_map.setdefault(self.production_product_tag, "Product")
+        if self.production_weight_tag:
+            alias_map.setdefault(self.production_weight_tag, "Product Weight")
+            if self.production_weight_units:
+                self.units_map.setdefault(self.production_weight_tag, self.production_weight_units)
 
         if not tags and not machine_state_tag and not heartbeat_enabled:
             QMessageBox.warning(

@@ -846,7 +846,12 @@ class MainWindow(QMainWindow):
         self.stale_intervals_threshold = 5
         self.gap_threshold_minutes = 5
         self.moving_tags: List[str] = []
-        self.thresholds: Dict[str, Dict[str, float]] = {}
+        self.thresholds: Dict[str, Dict[str, object]] = {}
+        self.thresholds_table: Optional[QTableWidget] = None
+        self.thresholds_sync_btn: Optional[QPushButton] = None
+        self.thresholds_save_btn: Optional[QPushButton] = None
+        self.thresholds_reload_btn: Optional[QPushButton] = None
+        self.thresholds_add_btn: Optional[QPushButton] = None
 
         # default config
         self.machine_name = ""
@@ -872,6 +877,7 @@ class MainWindow(QMainWindow):
         # UI
         self._build_ui()
         self._apply_dark_theme()
+        self._populate_thresholds_table({}, None)
         self._load_settings()  # populates fields and paths
         self._update_config_version_label()
 
@@ -1005,7 +1011,7 @@ class MainWindow(QMainWindow):
             ["timestamp", "event_type", "tag", "duration_sec"],
         )
 
-    def _load_thresholds_from_log_dir(self) -> Dict[str, Dict[str, float]]:
+    def _load_thresholds_from_log_dir(self) -> Dict[str, Dict[str, object]]:
         path = os.path.join(self.log_dir, "thresholds.json")
         if not os.path.exists(path):
             return {}
@@ -1017,6 +1023,142 @@ class MainWindow(QMainWindow):
         except Exception:
             return {}
         return {}
+
+    def _save_thresholds_to_log_dir(self) -> None:
+        if not self.thresholds_table:
+            return
+        self.thresholds = self._collect_thresholds_from_table()
+        path = os.path.join(self.log_dir, "thresholds.json")
+        try:
+            ensure_dir(self.log_dir)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.thresholds, f, indent=2)
+            self.log_message(f"Thresholds saved to {path}")
+        except Exception as e:
+            self.log_message(f"Failed to save thresholds: {e}")
+
+    def _collect_thresholds_from_table(self) -> Dict[str, Dict[str, object]]:
+        if not self.thresholds_table:
+            return {}
+
+        thresholds: Dict[str, Dict[str, object]] = {}
+        for row in range(self.thresholds_table.rowCount()):
+            tag_item = self.thresholds_table.item(row, 0)
+            if not tag_item:
+                continue
+            tag = tag_item.text().strip()
+            if not tag:
+                continue
+            entry: Dict[str, object] = {}
+
+            alias_item = self.thresholds_table.item(row, 1)
+            alias = alias_item.text().strip() if alias_item else ""
+            if alias:
+                entry["alias"] = alias
+
+            units_item = self.thresholds_table.item(row, 2)
+            units = units_item.text().strip() if units_item else ""
+            if units:
+                entry["units"] = units
+
+            low_oper = _to_float(self._table_cell_text(row, 3))
+            high_oper = _to_float(self._table_cell_text(row, 4))
+            low_limit = _to_float(self._table_cell_text(row, 5))
+            high_limit = _to_float(self._table_cell_text(row, 6))
+
+            if low_oper is not None:
+                entry["low_oper"] = low_oper
+            if high_oper is not None:
+                entry["high_oper"] = high_oper
+            if low_limit is not None:
+                entry["low_limit"] = low_limit
+            if high_limit is not None:
+                entry["high_limit"] = high_limit
+
+            thresholds[tag] = entry
+
+        return thresholds
+
+    def _table_cell_text(self, row: int, column: int) -> str:
+        if not self.thresholds_table:
+            return ""
+        item = self.thresholds_table.item(row, column)
+        return item.text().strip() if item else ""
+
+    def _populate_thresholds_table(
+        self,
+        thresholds: Dict[str, Dict[str, object]],
+        tags_order: Optional[List[str]] = None,
+    ) -> None:
+        if not self.thresholds_table:
+            return
+
+        ordered_tags: List[str] = []
+        if tags_order:
+            ordered_tags.extend(tags_order)
+        for tag in thresholds.keys():
+            if tag not in ordered_tags:
+                ordered_tags.append(tag)
+
+        if not ordered_tags:
+            ordered_tags = [""]
+
+        self.thresholds_table.setRowCount(len(ordered_tags))
+
+        for row, tag in enumerate(ordered_tags):
+            entry = thresholds.get(tag, {})
+            alias = ""
+            if isinstance(entry, dict):
+                alias = str(entry.get("alias", "") or "")
+            if not alias:
+                alias = self.alias_map.get(tag, "")
+
+            self._set_threshold_item(row, 0, tag)
+            self._set_threshold_item(row, 1, alias)
+            self._set_threshold_item(row, 2, str(entry.get("units", "") or ""))
+            self._set_threshold_item(row, 3, self._format_threshold_value(entry.get("low_oper")))
+            self._set_threshold_item(row, 4, self._format_threshold_value(entry.get("high_oper")))
+            self._set_threshold_item(row, 5, self._format_threshold_value(entry.get("low_limit")))
+            self._set_threshold_item(row, 6, self._format_threshold_value(entry.get("high_limit")))
+
+        self.thresholds_table.resizeRowsToContents()
+
+    @staticmethod
+    def _format_threshold_value(value: object) -> str:
+        return "" if value is None else str(value)
+
+    def _set_threshold_item(self, row: int, column: int, text: str) -> None:
+        if not self.thresholds_table:
+            return
+        item = QTableWidgetItem(text)
+        self.thresholds_table.setItem(row, column, item)
+
+    def _sync_thresholds_from_tags(self) -> None:
+        if not self.thresholds_table:
+            return
+        tags_text = self.tags_edit.toPlainText()
+        tags, alias_map = self.parse_tags_and_aliases(tags_text)
+
+        current = self._collect_thresholds_from_table()
+        for tag in tags:
+            entry = current.get(tag, {})
+            if alias_map.get(tag) and not entry.get("alias"):
+                entry["alias"] = alias_map[tag]
+            current[tag] = entry
+
+        self._populate_thresholds_table(current, tags_order=tags)
+
+    def _reload_thresholds_from_disk(self) -> None:
+        self.thresholds = self._load_thresholds_from_log_dir()
+        tags, _ = self.parse_tags_and_aliases(self.tags_edit.toPlainText())
+        self._populate_thresholds_table(self.thresholds, tags_order=tags)
+
+    def _add_threshold_row(self) -> None:
+        if not self.thresholds_table:
+            return
+        row = self.thresholds_table.rowCount()
+        self.thresholds_table.insertRow(row)
+        self.thresholds_table.scrollToBottom()
 
     # -------- system health & storage --------
 
@@ -1399,6 +1541,63 @@ class MainWindow(QMainWindow):
         )
         cfg_layout.addRow(tags_label, self.tags_edit)
 
+        thresholds_container = QWidget()
+        thresholds_layout = QVBoxLayout(thresholds_container)
+        thresholds_layout.setContentsMargins(0, 0, 0, 0)
+        thresholds_layout.setSpacing(6)
+
+        thresholds_help = QLabel(
+            "Set optional operating ranges and regulatory limits per tag. "
+            "Leave blank to auto-range. Saved to thresholds.json in the log directory."
+        )
+        thresholds_help.setWordWrap(True)
+        thresholds_help.setStyleSheet("color: #90a4ae; font-size: 11px;")
+
+        self.thresholds_table = QTableWidget()
+        self.thresholds_table.setColumnCount(7)
+        self.thresholds_table.setHorizontalHeaderLabels(
+            [
+                "Tag",
+                "Alias",
+                "Units",
+                "Low Oper",
+                "High Oper",
+                "Low Limit",
+                "High Limit",
+            ]
+        )
+        self.thresholds_table.setAlternatingRowColors(True)
+        self.thresholds_table.setMinimumHeight(200)
+        thresholds_header = self.thresholds_table.horizontalHeader()
+        thresholds_header.setSectionResizeMode(0, QHeaderView.Stretch)
+        thresholds_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        thresholds_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        thresholds_header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        thresholds_header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        thresholds_header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        thresholds_header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+
+        thresholds_btn_layout = QHBoxLayout()
+        self.thresholds_add_btn = QPushButton("Add Row")
+        self.thresholds_add_btn.setObjectName("secondaryButton")
+        self.thresholds_sync_btn = QPushButton("Sync From Tags")
+        self.thresholds_sync_btn.setObjectName("secondaryButton")
+        self.thresholds_save_btn = QPushButton("Save Thresholds")
+        self.thresholds_save_btn.setObjectName("primaryButton")
+        self.thresholds_reload_btn = QPushButton("Reload")
+        self.thresholds_reload_btn.setObjectName("secondaryButton")
+        thresholds_btn_layout.addWidget(self.thresholds_add_btn)
+        thresholds_btn_layout.addWidget(self.thresholds_sync_btn)
+        thresholds_btn_layout.addWidget(self.thresholds_reload_btn)
+        thresholds_btn_layout.addStretch(1)
+        thresholds_btn_layout.addWidget(self.thresholds_save_btn)
+
+        thresholds_layout.addWidget(thresholds_help)
+        thresholds_layout.addWidget(self.thresholds_table)
+        thresholds_layout.addLayout(thresholds_btn_layout)
+
+        cfg_layout.addRow(QLabel("Thresholds:"), thresholds_container)
+
         # Log directory selector
         dir_layout = QHBoxLayout()
         self.log_dir_edit = QLineEdit(self.log_dir)
@@ -1563,6 +1762,10 @@ class MainWindow(QMainWindow):
         self.rebuild_btn.clicked.connect(self.rebuild_hourly_from_raw)
         self.browse_btn.clicked.connect(self.choose_log_dir)
         self.lockdown_checkbox.stateChanged.connect(self._apply_lockdown_state)
+        self.thresholds_add_btn.clicked.connect(self._add_threshold_row)
+        self.thresholds_sync_btn.clicked.connect(self._sync_thresholds_from_tags)
+        self.thresholds_save_btn.clicked.connect(self._save_thresholds_to_log_dir)
+        self.thresholds_reload_btn.clicked.connect(self._reload_thresholds_from_disk)
 
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
@@ -2057,6 +2260,9 @@ class MainWindow(QMainWindow):
         if isinstance(stored_order, list):
             self.tag_order = stored_order
 
+        tags_for_thresholds = self.tag_order or self.parse_tags_and_aliases(tags_text)[0]
+        self._populate_thresholds_table(self.thresholds, tags_order=tags_for_thresholds or None)
+
         if self.machine_name:
             self.setWindowTitle(f"CIP Tag Poller & Dashboard - {self.machine_name}")
             self.machine_label.setText(f"Machine: {self.machine_name}")
@@ -2103,6 +2309,7 @@ class MainWindow(QMainWindow):
             self._log_settings_changes(old_data, data, "Updated via desktop app")
             self._last_settings_snapshot = dict(data)
             self._update_config_version_label()
+            self._save_thresholds_to_log_dir()
         except Exception as e:
             print(f"Failed to save settings: {e}", file=sys.stderr)
 
@@ -2219,13 +2426,19 @@ class MainWindow(QMainWindow):
             self.writeback_interval_spin,
             self.writeback_mappings_edit,
             self.tags_edit,
+            self.thresholds_table,
+            self.thresholds_add_btn,
+            self.thresholds_sync_btn,
+            self.thresholds_save_btn,
+            self.thresholds_reload_btn,
             self.log_dir_edit,
             self.browse_btn,
         ]
         running = bool(self.poll_thread and self.poll_thread.isRunning())
 
         for w in widgets_to_lock:
-            w.setEnabled(not self.lockdown_enabled)
+            if w:
+                w.setEnabled(not self.lockdown_enabled)
 
         self.start_btn.setEnabled(not self.lockdown_enabled and not running)
         self.stop_btn.setEnabled(not self.lockdown_enabled and running)
@@ -2274,6 +2487,7 @@ class MainWindow(QMainWindow):
             self.current_log_date = datetime.now().date()
             self.raw_csv_path = self._ensure_raw_csv_for_date(self.current_log_date)
             self._load_latest_rolling_12hr()
+            self._reload_thresholds_from_disk()
             self.log_message(f"Log directory set to: {path}")
 
     def _start_poll_watchdog(self) -> None:
@@ -2368,6 +2582,7 @@ class MainWindow(QMainWindow):
         self.moving_tags = [
             t.strip() for t in self.moving_tags_edit.text().split(",") if t.strip()
         ]
+        self._save_thresholds_to_log_dir()
         self.thresholds = self._load_thresholds_from_log_dir()
         self.units_map.clear()
 

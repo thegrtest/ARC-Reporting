@@ -3087,14 +3087,20 @@ class MainWindow(QMainWindow):
 
                         if qa_flag == "OK":
                             self._check_gap_event(tag, ts)
-                            if isinstance(val, (int, float)):
+                            num_val = self._safe_float(val)
+                            if self._is_valid_number(num_val):
                                 acc = self.minute_accumulators.setdefault(
                                     tag, {"sum": 0.0, "count": 0}
                                 )
-                                acc["sum"] += float(val)
+                                acc["sum"] += float(num_val)
                                 acc["count"] += 1
             except Exception as e:
                 self.log_message(f"Error writing raw CSV: {e}")
+
+            self.current_hour_preview.clear()
+            self.current_hour_preview.update(
+                self._hour_average_snapshot(include_partial_minute=True)
+            )
 
             if self.writeback_thread and self.writeback_thread.isRunning():
                 self.writeback_thread.update_averages(self._current_hour_averages())

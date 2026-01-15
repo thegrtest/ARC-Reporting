@@ -981,6 +981,7 @@ class MainWindow(QMainWindow):
         if not mappings:
             return {}
         alias_to_tag = {alias: tag for tag, alias in self.alias_map.items() if alias}
+        ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
         resolved: Dict[str, str] = {}
         for alias, target_tag in mappings.items():
             source_tag = alias_to_tag.get(alias)
@@ -992,6 +993,8 @@ class MainWindow(QMainWindow):
                     f"Writeback mapping skipped: alias '{alias}' not found in configured tags."
                 )
                 continue
+            if source_tag in ppm_to_lbhr:
+                source_tag = ppm_to_lbhr[source_tag]
             resolved[source_tag] = target_tag
         return resolved
 

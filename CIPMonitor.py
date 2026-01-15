@@ -1205,6 +1205,10 @@ def build_tag_card(
         if fallback_entry:
             last_lb_hr_avg = fallback_entry[0]
     live_lb_hr_val = current_hour_avg.get(lb_hr_tag, float("nan")) if lb_hr_tag else float("nan")
+    if lb_hr_tag and rolling_lb_hr_avg != rolling_lb_hr_avg:
+        rolling_entry = rolling_12hr_stats.get(lb_hr_tag)
+        if rolling_entry:
+            rolling_lb_hr_avg = rolling_entry[0]
 
     # If we have no live "current" value but we do have a last full hour,
     # use that for the current gauge so it doesn't display "non-numeric".

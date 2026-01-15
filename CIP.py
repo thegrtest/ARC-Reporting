@@ -3562,6 +3562,8 @@ class MainWindow(QMainWindow):
             lbhr_last_avg = self.last_hour_avg.get(lbhr_tag, "") if lbhr_tag else ""
             lbhr_cur_avg = self.current_hour_preview.get(lbhr_tag, "") if lbhr_tag else ""
             lbhr_roll_avg = self.rolling_12hr_lbhr_avg.get(tag, "")
+            if lbhr_tag and not self._is_valid_number(lbhr_roll_avg):
+                lbhr_roll_avg = self.rolling_12hr_avg.get(lbhr_tag, "")
 
             alias = self.alias_map.get(tag, "")
 

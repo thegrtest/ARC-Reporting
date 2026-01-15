@@ -659,6 +659,114 @@ class PollThread(QThread):
         self.info.emit("Polling thread stopped.")
 
 
+class WritebackThread(QThread):
+    """
+    Writes current-hour averages back to PLC tags at a configured interval.
+    Uses a separate PLC connection from the polling thread.
+    """
+
+    info = Signal(str)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        ip: str,
+        interval_sec: int,
+        writeback_map: Dict[str, str],
+        reconnect_delay_sec: int = 10,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.ip = ip
+        self.interval_sec = max(1, int(interval_sec))
+        self.writeback_map = dict(writeback_map)
+        self.reconnect_delay_sec = max(1, int(reconnect_delay_sec))
+
+        self._running = False
+        self._mutex = QMutex()
+        self._avg_mutex = QMutex()
+        self._current_averages: Dict[str, float] = {}
+
+    def stop(self):
+        with QMutexLocker(self._mutex):
+            self._running = False
+
+    def _should_run(self) -> bool:
+        with QMutexLocker(self._mutex):
+            return self._running
+
+    def update_averages(self, averages: Dict[str, float]) -> None:
+        with QMutexLocker(self._avg_mutex):
+            self._current_averages = dict(averages)
+
+    def _snapshot_averages(self) -> Dict[str, float]:
+        with QMutexLocker(self._avg_mutex):
+            return dict(self._current_averages)
+
+    def _write_values(self, comm: "PLC", averages: Dict[str, float]) -> None:
+        for source_tag, target_tag in self.writeback_map.items():
+            if source_tag not in averages:
+                continue
+            value = averages.get(source_tag)
+            if value is None:
+                continue
+            try:
+                r = comm.Write(target_tag, float(value))
+                status = getattr(r, "Status", "Unknown")
+                if str(status).lower() != "success":
+                    self.error.emit(
+                        f"Writeback failed for '{source_tag}' -> '{target_tag}': {status}"
+                    )
+            except Exception as e:
+                self.error.emit(
+                    f"Writeback error for '{source_tag}' -> '{target_tag}': {e}"
+                )
+
+    def run(self):
+        if not PYLOGIX_AVAILABLE:
+            self.error.emit("pylogix is not installed. Run: pip install pylogix")
+            return
+
+        if not self.writeback_map:
+            self.error.emit("Writeback is enabled but no mappings are configured.")
+            return
+
+        with QMutexLocker(self._mutex):
+            self._running = True
+
+        while self._should_run():
+            try:
+                with PLC() as comm:
+                    comm.IPAddress = self.ip
+                    self.info.emit(
+                        f"Connected to PLC at {self.ip} for hourly average writeback "
+                        f"({len(self.writeback_map)} mapping(s), interval={self.interval_sec}s)."
+                    )
+
+                    while self._should_run():
+                        start_t = time.time()
+                        averages = self._snapshot_averages()
+                        if averages:
+                            self._write_values(comm, averages)
+
+                        elapsed = time.time() - start_t
+                        sleep_for = max(0.0, self.interval_sec - elapsed)
+                        end_time = time.time() + sleep_for
+                        while time.time() < end_time:
+                            if not self._should_run():
+                                break
+                            time.sleep(0.1)
+            except Exception as e:
+                self.error.emit(f"Writeback PLC connection error: {e}")
+                end_time = time.time() + self.reconnect_delay_sec
+                while time.time() < end_time:
+                    if not self._should_run():
+                        break
+                    time.sleep(0.5)
+
+        self.info.emit("Writeback thread stopped.")
+
+
 # ------------------- main window -------------------
 
 
@@ -683,6 +791,7 @@ class MainWindow(QMainWindow):
 
         # --- state ---
         self.poll_thread: Optional[PollThread] = None
+        self.writeback_thread: Optional[WritebackThread] = None
         self.current_values: Dict[str, Tuple[object, str]] = {}
         self.last_hour_avg: Dict[str, float] = {}
         self.current_hour_preview: Dict[str, float] = {}
@@ -697,6 +806,7 @@ class MainWindow(QMainWindow):
         self.lockdown_enabled = False
         self.gauge_cards: Dict[str, GaugeCard] = {}
         self._gauge_spacer: Optional[QSpacerItem] = None
+        self.writeback_interval_sec = 60
 
         # stable tag ordering for the dashboard
         self.tag_order: List[str] = []
@@ -786,6 +896,51 @@ class MainWindow(QMainWindow):
             if alias:
                 alias_map[tag] = alias
         return tags, alias_map
+
+    @staticmethod
+    def parse_writeback_mappings(text: str) -> Dict[str, str]:
+        """
+        Parse writeback mappings into {alias: plc_tag}.
+        Accepts lines like:
+            Alias | PLC_Tag
+            Alias -> PLC_Tag
+        """
+        mappings: Dict[str, str] = {}
+        for line in text.splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            if "|" in raw:
+                alias_part, tag_part = raw.split("|", 1)
+            elif "->" in raw:
+                alias_part, tag_part = raw.split("->", 1)
+            else:
+                continue
+            alias = alias_part.strip()
+            tag = tag_part.strip()
+            if not alias or not tag:
+                continue
+            mappings[alias] = tag
+        return mappings
+
+    def _resolve_writeback_targets(self, mappings: Dict[str, str]) -> Dict[str, str]:
+        """Resolve alias mappings into {source_tag: plc_tag} using current alias map."""
+        if not mappings:
+            return {}
+        alias_to_tag = {alias: tag for tag, alias in self.alias_map.items() if alias}
+        resolved: Dict[str, str] = {}
+        for alias, target_tag in mappings.items():
+            source_tag = alias_to_tag.get(alias)
+            if not source_tag:
+                if alias in self.tag_order or alias in self.alias_map:
+                    source_tag = alias
+            if not source_tag:
+                self.log_message(
+                    f"Writeback mapping skipped: alias '{alias}' not found in configured tags."
+                )
+                continue
+            resolved[source_tag] = target_tag
+        return resolved
 
     # -------- raw CSV path helpers (daily rotation) --------
 
@@ -1117,6 +1272,33 @@ class MainWindow(QMainWindow):
             "Enabled",
         ])
         cfg_layout.addRow(QLabel("Heartbeat Mode:"), self.heartbeat_mode_combo)
+
+        # Writeback config
+        self.writeback_enabled_checkbox = QCheckBox(
+            "Enable writeback of current hour averages"
+        )
+        self.writeback_enabled_checkbox.setToolTip(
+            "When enabled, the app writes the current-hour average for each "
+            "mapped alias back to its PLC tag at the configured interval."
+        )
+        cfg_layout.addRow(self.writeback_enabled_checkbox)
+
+        self.writeback_interval_spin = QSpinBox()
+        self.writeback_interval_spin.setRange(1, 3600)
+        self.writeback_interval_spin.setValue(self.writeback_interval_sec)
+        cfg_layout.addRow(QLabel("Writeback Interval (seconds):"), self.writeback_interval_spin)
+
+        writeback_label = QLabel("Writeback Mappings (Alias | PLC Tag):")
+        self.writeback_mappings_edit = QTextEdit()
+        self.writeback_mappings_edit.setMinimumHeight(110)
+        self.writeback_mappings_edit.setPlaceholderText(
+            "Examples:\n"
+            "Temperature | Program:MainRoutine.Temp_Avg_PLC\n"
+            "Pressure | Program:MainRoutine.Pressure_Avg_PLC\n"
+            "\n"
+            "Each line:  Alias  |  PLC Tag to receive current-hour average"
+        )
+        cfg_layout.addRow(writeback_label, self.writeback_mappings_edit)
 
         tags_label = QLabel("Tags to Poll (one per line):")
         self.tags_edit = QTextEdit()
@@ -1623,6 +1805,14 @@ class MainWindow(QMainWindow):
         heartbeat_enabled = bool(data.get("heartbeat_enabled", False))
         self.heartbeat_mode_combo.setCurrentIndex(1 if heartbeat_enabled else 0)
 
+        # Writeback settings
+        writeback_enabled = bool(data.get("writeback_enabled", False))
+        self.writeback_enabled_checkbox.setChecked(writeback_enabled)
+        self.writeback_interval_sec = int(data.get("writeback_interval_sec", 60))
+        self.writeback_interval_spin.setValue(self.writeback_interval_sec)
+        writeback_mappings = data.get("writeback_mappings", "")
+        self.writeback_mappings_edit.setPlainText(str(writeback_mappings))
+
         self.lockdown_enabled = bool(data.get("lockdown_enabled", False))
         prev_block = self.lockdown_checkbox.blockSignals(True)
         self.lockdown_checkbox.setChecked(self.lockdown_enabled)
@@ -1656,6 +1846,9 @@ class MainWindow(QMainWindow):
             "pause_when_down": self.poll_mode_combo.currentIndex() == 1,
             "heartbeat_tag": self.heartbeat_tag_edit.text().strip(),
             "heartbeat_enabled": self.heartbeat_mode_combo.currentIndex() == 1,
+            "writeback_enabled": self.writeback_enabled_checkbox.isChecked(),
+            "writeback_interval_sec": self.writeback_interval_spin.value(),
+            "writeback_mappings": self.writeback_mappings_edit.toPlainText(),
             "stale_intervals": self.stale_spin.value(),
             "gap_threshold_minutes": self.gap_spin.value(),
             "moving_tags": [t.strip() for t in self.moving_tags_edit.text().split(",") if t.strip()],
@@ -1726,6 +1919,9 @@ class MainWindow(QMainWindow):
             ("pause_when_down", "Machine state gating"),
             ("heartbeat_tag", "Heartbeat tag"),
             ("heartbeat_enabled", "Heartbeat mode"),
+            ("writeback_enabled", "Writeback enabled"),
+            ("writeback_interval_sec", "Writeback interval"),
+            ("writeback_mappings", "Writeback mappings"),
         ]
         for key, label in watched_fields:
             old_val = None if old is None else old.get(key)
@@ -1763,6 +1959,9 @@ class MainWindow(QMainWindow):
             self.poll_mode_combo,
             self.heartbeat_tag_edit,
             self.heartbeat_mode_combo,
+            self.writeback_enabled_checkbox,
+            self.writeback_interval_spin,
+            self.writeback_mappings_edit,
             self.tags_edit,
             self.log_dir_edit,
             self.browse_btn,
@@ -1920,6 +2119,8 @@ class MainWindow(QMainWindow):
         self.poll_thread.info.connect(self.log_message)
         self.poll_thread.start()
 
+        self._start_writeback_thread(ip)
+
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(not self.lockdown_enabled)
         self.connection_status_label.setText("Status: Polling")
@@ -1940,11 +2141,41 @@ class MainWindow(QMainWindow):
             self.poll_thread.stop()
             self.poll_thread.wait(5000)
             self.poll_thread = None
+        if self.writeback_thread:
+            self.writeback_thread.stop()
+            self.writeback_thread.wait(5000)
+            self.writeback_thread = None
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.connection_status_label.setText("Status: Stopped")
         self.connection_status_label.setStyleSheet("color: #ef9a9a;")
         self.log_message("Stopped polling.")
+
+    def _start_writeback_thread(self, ip: str) -> None:
+        if not self.writeback_enabled_checkbox.isChecked():
+            return
+
+        mappings = self.parse_writeback_mappings(
+            self.writeback_mappings_edit.toPlainText()
+        )
+        resolved = self._resolve_writeback_targets(mappings)
+        if not resolved:
+            self.log_message(
+                "Writeback enabled but no valid alias mappings were found; skipping."
+            )
+            return
+
+        interval_sec = self.writeback_interval_spin.value()
+        self.writeback_thread = WritebackThread(
+            ip=ip,
+            interval_sec=interval_sec,
+            writeback_map=resolved,
+            parent=self,
+        )
+        self.writeback_thread.info.connect(self.log_message)
+        self.writeback_thread.error.connect(self.handle_poll_error)
+        self.writeback_thread.update_averages(self._current_hour_averages())
+        self.writeback_thread.start()
 
     # ---------------- data handling ----------------
 
@@ -2083,11 +2314,21 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.log_message(f"Error writing raw CSV: {e}")
 
+            if self.writeback_thread and self.writeback_thread.isRunning():
+                self.writeback_thread.update_averages(self._current_hour_averages())
+
             self.last_update_label.setText(f"Last update: {ts.strftime('%Y-%m-%d %H:%M:%S')}")
             self._update_system_health(success_ts=ts)
             self.update_dashboard()
         except Exception as e:
             self.log_message(f"Error handling poll data: {e}")
+
+    def _current_hour_averages(self) -> Dict[str, float]:
+        averages: Dict[str, float] = {}
+        for tag, acc in self.hour_accumulators.items():
+            if acc.get("count", 0) > 0:
+                averages[tag] = acc["sum"] / acc["count"]
+        return averages
 
     def finalize_previous_hour(self):
         """Compute averages for tags in the previous hour and write to hourly CSV."""
@@ -2417,6 +2658,9 @@ class MainWindow(QMainWindow):
         if self.poll_thread and self.poll_thread.isRunning():
             self.poll_thread.stop()
             self.poll_thread.wait(5000)
+        if self.writeback_thread and self.writeback_thread.isRunning():
+            self.writeback_thread.stop()
+            self.writeback_thread.wait(5000)
         self._save_settings()
         event.accept()
 

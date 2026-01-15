@@ -3026,12 +3026,6 @@ class MainWindow(QMainWindow):
         """
         try:
             data = dict(data)
-            epa_results = self._compute_epa_method19(data)
-            if epa_results:
-                for calc_tag in epa_results:
-                    if calc_tag not in self.tag_order:
-                        self.tag_order.append(calc_tag)
-                data.update(epa_results)
 
             try:
                 ts = datetime.fromisoformat(ts_iso)
@@ -3071,6 +3065,17 @@ class MainWindow(QMainWindow):
             time_str = ts.strftime("%H:%M:%S")
 
             try:
+                # --- inject EPA Method 19 derived lb/hr tags into the same datapath ---
+                try:
+                    derived = self._compute_epa_method19(data)
+                    if derived:
+                        for calc_tag in derived:
+                            if calc_tag not in self.tag_order:
+                                self.tag_order.append(calc_tag)
+                        data.update(derived)
+                except Exception as e:
+                    self.log_message(f"EPA Method 19 compute failed: {e}")
+
                 with open(self.raw_csv_path, "a", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     for tag, (val, status) in data.items():

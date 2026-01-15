@@ -3668,6 +3668,9 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(tags))
         self.rows_summary_label.setText(f"Rows: {len(tags)}")
 
+        last_avg_lookup = dict(self.last_hour_avg)
+        cur_avg_lookup = dict(self.current_hour_preview)
+
         for row, tag in enumerate(tags):
             entry = self.current_values.get(tag, ("", ""))
             if isinstance(entry, tuple) and len(entry) >= 2:
@@ -3679,8 +3682,15 @@ class MainWindow(QMainWindow):
             cur_avg = self.current_hour_preview.get(tag, "")
             roll_avg = self.rolling_12hr_avg.get(tag, "")
             lbhr_tag = ppm_to_lbhr.get(tag)
-            lbhr_last_avg = self.last_hour_avg.get(lbhr_tag, "") if lbhr_tag else ""
-            lbhr_cur_avg = self.current_hour_preview.get(lbhr_tag, "") if lbhr_tag else ""
+            lbhr_last_avg = ""
+            lbhr_cur_avg = ""
+            if tag in ppm_to_lbhr:
+                derived_last = self._compute_lbhr_from_avg(tag, last_avg_lookup)
+                if derived_last is not None:
+                    lbhr_last_avg = derived_last
+                derived_cur = self._compute_lbhr_from_avg(tag, cur_avg_lookup)
+                if derived_cur is not None:
+                    lbhr_cur_avg = derived_cur
             lbhr_roll_avg = self.rolling_12hr_lbhr_avg.get(tag, "")
             if lbhr_tag and not self._is_valid_number(lbhr_roll_avg):
                 lbhr_roll_avg = self.rolling_12hr_avg.get(lbhr_tag, "")

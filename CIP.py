@@ -2252,8 +2252,6 @@ class MainWindow(QMainWindow):
             lb_hr = self._ppmv_to_lb_hr(corrected_ppmv, flow, mw)
             calc_tag = calc_tags[pollutant]
             results[calc_tag] = (lb_hr, status_success)
-            self.alias_map.setdefault(calc_tag, f"{pollutant} (lb/hr)")
-            self.units_map.setdefault(calc_tag, "lb/hr")
 
         return results
 
@@ -3073,9 +3071,6 @@ class MainWindow(QMainWindow):
                 try:
                     derived = self._compute_epa_method19(data)
                     if derived:
-                        for calc_tag in derived:
-                            if calc_tag not in self.tag_order:
-                                self.tag_order.append(calc_tag)
                         data.update(derived)
                 except Exception as e:
                     self.log_message(f"EPA Method 19 compute failed: {e}")

@@ -862,7 +862,7 @@ class MainWindow(QMainWindow):
         # ensure hourly CSV
         ensure_csv(
             self.hourly_csv_path,
-            ["hour_start", "hour_end", "tag", "avg_value", "sample_count"],
+            ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
         )
 
     def _apply_initial_size(self) -> None:
@@ -1454,8 +1454,8 @@ class MainWindow(QMainWindow):
         table_layout.addLayout(dash_header_layout)
 
         self.table = QTableWidget()
-        # Alias + Tag + 3 metrics + QA flag
-        self.table.setColumnCount(6)
+        # Alias + Tag + 5 metrics + QA flag
+        self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels(
             [
                 "Alias",
@@ -1463,6 +1463,8 @@ class MainWindow(QMainWindow):
                 "Current Value",
                 "Last Hour Avg",
                 "Current Hour Avg (so far)",
+                "Last Hour Avg (lb/hr)",
+                "Current Hour Avg (lb/hr)",
                 "QA Flag",
             ]
         )
@@ -1473,6 +1475,8 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
 
         table_layout.addWidget(self.table, stretch=1)
 
@@ -1801,6 +1805,17 @@ class MainWindow(QMainWindow):
             "CO": "EPA19:CO_LBHR",
             "O2": "EPA19:O2_LBHR",
         }
+
+    def _epa_ppm_to_lbhr_map(self) -> Dict[str, str]:
+        calc_tags = self._epa_calc_tag_names()
+        mapping: Dict[str, str] = {}
+        if self.epa_nox_tag:
+            mapping[self.epa_nox_tag] = calc_tags["NOx"]
+        if self.epa_co_tag:
+            mapping[self.epa_co_tag] = calc_tags["CO"]
+        if self.epa_o2_tag:
+            mapping[self.epa_o2_tag] = calc_tags["O2"]
+        return mapping
 
     def _get_numeric_from_poll(self, data: Dict[str, Tuple[object, str]], tag: str) -> Optional[float]:
         if not tag:
@@ -2204,10 +2219,10 @@ class MainWindow(QMainWindow):
             self.log_dir_edit.setText(path)
             self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
             self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
-            ensure_csv(
-                self.hourly_csv_path,
-                ["hour_start", "hour_end", "tag", "avg_value", "sample_count"],
-            )
+        ensure_csv(
+            self.hourly_csv_path,
+            ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+        )
             self._ensure_env_events_csv()
             self.current_log_date = datetime.now().date()
             self.raw_csv_path = self._ensure_raw_csv_for_date(self.current_log_date)
@@ -2234,7 +2249,7 @@ class MainWindow(QMainWindow):
         self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
         ensure_csv(
             self.hourly_csv_path,
-            ["hour_start", "hour_end", "tag", "avg_value", "sample_count"],
+            ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
         )
 
         machine_state_tag = self.machine_state_tag_edit.text().strip()
@@ -2589,7 +2604,7 @@ class MainWindow(QMainWindow):
         hour_start_iso = hour_start.isoformat(timespec="seconds")
         hour_end_iso = hour_end.isoformat(timespec="seconds")
 
-        records: Dict[Tuple[str, str], Tuple[str, float, int]] = {}
+        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]] = {}
         try:
             if os.path.exists(self.hourly_csv_path):
                 with open(self.hourly_csv_path, "r", encoding="utf-8") as f:
@@ -2598,11 +2613,20 @@ class MainWindow(QMainWindow):
                         key = (row["hour_start"], row["tag"])
                         records[key] = (
                             row["hour_end"],
-                            float(row["avg_value"]),
+                            self._safe_float(row.get("avg_value")),
+                            self._safe_float(row.get("avg_lb_hr")),
                             int(row.get("sample_count", "0") or 0),
                         )
         except Exception as e:
             self.log_message(f"Error reading hourly CSV for upsert: {e}")
+
+        ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
+        lbhr_avgs: Dict[str, float] = {}
+        for tag, acc in self.hour_accumulators.items():
+            if acc["count"] <= 0:
+                continue
+            if isinstance(acc["sum"], (int, float)):
+                lbhr_avgs[tag] = acc["sum"] / acc["count"]
 
         self.last_hour_avg.clear()
         for tag, acc in self.hour_accumulators.items():
@@ -2611,20 +2635,35 @@ class MainWindow(QMainWindow):
             avg = acc["sum"] / acc["count"]
             self.last_hour_avg[tag] = avg
             key = (hour_start_iso, tag)
-            records[key] = (hour_end_iso, avg, int(acc["count"]))
+            existing = records.get(key)
+            existing_lb_hr = existing[2] if existing else None
+            lbhr_avg = existing_lb_hr
+            mapped_tag = ppm_to_lbhr.get(tag)
+            if mapped_tag:
+                lbhr_avg = lbhr_avgs.get(mapped_tag, existing_lb_hr)
+            records[key] = (hour_end_iso, avg, lbhr_avg, int(acc["count"]))
 
         try:
             ensure_csv(
                 self.hourly_csv_path,
-                ["hour_start", "hour_end", "tag", "avg_value", "sample_count"],
+                ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
             )
             with open(self.hourly_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(
-                    ["hour_start", "hour_end", "tag", "avg_value", "sample_count"]
+                    ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"]
                 )
-                for (hs, tag), (he, avg, cnt) in sorted(records.items()):
-                    writer.writerow([hs, he, tag, avg, cnt])
+                for (hs, tag), (he, avg, lbhr_avg, cnt) in sorted(records.items()):
+                    writer.writerow(
+                        [
+                            hs,
+                            he,
+                            tag,
+                            "" if avg is None else avg,
+                            "" if lbhr_avg is None else lbhr_avg,
+                            cnt,
+                        ]
+                    )
             self.log_message(
                 f"Hourly averages upserted for hour starting {hour_start_iso}."
             )
@@ -2676,7 +2715,7 @@ class MainWindow(QMainWindow):
         self.log_message(
             f"Rebuilding hourly averages from {len(raw_files)} raw data file(s)..."
         )
-        records: Dict[Tuple[str, str], Tuple[str, float, int]] = {}
+        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]] = {}
 
         try:
             buckets: Dict[Tuple[datetime, str], Dict[str, float]] = {}
@@ -2719,7 +2758,7 @@ class MainWindow(QMainWindow):
                 hstart_iso = hstart.isoformat(timespec="seconds")
                 hend_iso = (hstart + timedelta(hours=1)).isoformat(timespec="seconds")
                 avg = acc["sum"] / acc["count"]
-                records[(hstart_iso, tag)] = (hend_iso, avg, int(acc["count"]))
+                records[(hstart_iso, tag)] = (hend_iso, avg, None, int(acc["count"]))
         except Exception as e:
             self.log_message(f"Error rebuilding hourly from raw: {e}")
             QMessageBox.critical(
@@ -2727,18 +2766,42 @@ class MainWindow(QMainWindow):
             )
             return
 
+        ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
+        if ppm_to_lbhr:
+            for (hstart_iso, tag), (hend_iso, avg, lbhr_avg, count) in list(records.items()):
+                lbhr_tag = ppm_to_lbhr.get(tag)
+                if not lbhr_tag:
+                    continue
+                lbhr_record = records.get((hstart_iso, lbhr_tag))
+                if lbhr_record:
+                    records[(hstart_iso, tag)] = (
+                        hend_iso,
+                        avg,
+                        lbhr_record[1],
+                        count,
+                    )
+
         try:
             ensure_csv(
                 self.hourly_csv_path,
-                ["hour_start", "hour_end", "tag", "avg_value", "sample_count"],
+                ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
             )
             with open(self.hourly_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(
-                    ["hour_start", "hour_end", "tag", "avg_value", "sample_count"]
+                    ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"]
                 )
-                for (hs, tag), (he, avg, cnt) in sorted(records.items()):
-                    writer.writerow([hs, he, tag, avg, cnt])
+                for (hs, tag), (he, avg, lbhr_avg, cnt) in sorted(records.items()):
+                    writer.writerow(
+                        [
+                            hs,
+                            he,
+                            tag,
+                            "" if avg is None else avg,
+                            "" if lbhr_avg is None else lbhr_avg,
+                            cnt,
+                        ]
+                    )
             self.log_message(
                 f"Rebuilt hourly averages for {len(records)} (hour, tag) pairs."
             )
@@ -2753,7 +2816,8 @@ class MainWindow(QMainWindow):
     def update_dashboard(self):
         """
         Render table rows:
-            Alias | Tag | Current Value | Last Hour Avg | Current Hour Avg (so far) | QA Flag
+            Alias | Tag | Current Value | Last Hour Avg | Current Hour Avg (so far)
+            | Last Hour Avg (lb/hr) | Current Hour Avg (lb/hr) | QA Flag
         """
         if self.tag_order:
             tags = list(self.tag_order)
@@ -2764,6 +2828,7 @@ class MainWindow(QMainWindow):
                 | set(self.current_hour_preview.keys())
             )
 
+        ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
         self.table.setRowCount(len(tags))
         self.rows_summary_label.setText(f"Rows: {len(tags)}")
 
@@ -2776,6 +2841,9 @@ class MainWindow(QMainWindow):
 
             last_avg = self.last_hour_avg.get(tag, "")
             cur_avg = self.current_hour_preview.get(tag, "")
+            lbhr_tag = ppm_to_lbhr.get(tag)
+            lbhr_last_avg = self.last_hour_avg.get(lbhr_tag, "") if lbhr_tag else ""
+            lbhr_cur_avg = self.current_hour_preview.get(lbhr_tag, "") if lbhr_tag else ""
 
             alias = self.alias_map.get(tag, "")
 
@@ -2797,7 +2865,17 @@ class MainWindow(QMainWindow):
                 4,
                 item(f"{cur_avg:.4f}" if isinstance(cur_avg, (int, float)) else ""),
             )
-            self.table.setItem(row, 5, item(qa_flag))
+            self.table.setItem(
+                row,
+                5,
+                item(f"{lbhr_last_avg:.4f}" if isinstance(lbhr_last_avg, (int, float)) else ""),
+            )
+            self.table.setItem(
+                row,
+                6,
+                item(f"{lbhr_cur_avg:.4f}" if isinstance(lbhr_cur_avg, (int, float)) else ""),
+            )
+            self.table.setItem(row, 7, item(qa_flag))
 
         self._update_gauges(tags)
 

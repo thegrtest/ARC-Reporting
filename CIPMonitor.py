@@ -255,23 +255,26 @@ def load_raw_history(max_days: int = 30) -> pd.DataFrame:
 def load_hourly_stats() -> pd.DataFrame:
     """
     Load hourly averages as DataFrame with columns:
-        hour_start, hour_end, tag, avg_value, sample_count
+        hour_start, hour_end, tag, avg_value, avg_lb_hr, sample_count
     Returns empty DataFrame on any error.
     """
     if not os.path.exists(HOURLY_CSV):
         return pd.DataFrame(
-            columns=["hour_start", "hour_end", "tag", "avg_value", "sample_count"]
+            columns=["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"]
         )
     try:
         df = pd.read_csv(HOURLY_CSV)
     except Exception:
         return pd.DataFrame(
-            columns=["hour_start", "hour_end", "tag", "avg_value", "sample_count"]
+            columns=["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"]
         )
 
     for c in ["hour_start", "hour_end"]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
+    for c in ["avg_value", "avg_lb_hr"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 
@@ -643,6 +646,32 @@ def load_configured_tags_from_settings() -> List[str]:
     return tags
 
 
+def load_epa_ppm_to_lbhr_map() -> Dict[str, str]:
+    if not os.path.exists(SETTINGS_JSON):
+        return {}
+    try:
+        with open(SETTINGS_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    mapping: Dict[str, str] = {}
+    nox_tag = str(data.get("epa_nox_tag", "") or "")
+    co_tag = str(data.get("epa_co_tag", "") or "")
+    o2_tag = str(data.get("epa_o2_tag", "") or "")
+
+    if nox_tag:
+        mapping[nox_tag] = "EPA19:NOx_LBHR"
+    if co_tag:
+        mapping[co_tag] = "EPA19:CO_LBHR"
+    if o2_tag:
+        mapping[o2_tag] = "EPA19:O2_LBHR"
+    return mapping
+
+
 # ----------------- helpers: classification & ranges -----------------
 
 
@@ -792,13 +821,13 @@ def extract_raw_stats(raw_df: pd.DataFrame):
 
 def extract_last_full_hour(
     hourly_df: pd.DataFrame,
-) -> Dict[str, Tuple[float, datetime, datetime, int]]:
+) -> Dict[str, Tuple[float, float, datetime, datetime, int]]:
     """
     From hourly_df, extract for each tag the last full hour:
-        {tag: (avg_value, hour_start, hour_end, sample_count)}
+        {tag: (avg_value, avg_lb_hr, hour_start, hour_end, sample_count)}
     Any row with sample_count <= 0 is treated as "no data".
     """
-    result: Dict[str, Tuple[float, datetime, datetime, int]] = {}
+    result: Dict[str, Tuple[float, float, datetime, datetime, int]] = {}
     if hourly_df.empty or "tag" not in hourly_df.columns:
         return result
 
@@ -815,13 +844,17 @@ def extract_last_full_hour(
                 cnt = 0
             if cnt <= 0:
                 # treat as no data
-                result[str(tag)] = (float("nan"), hs, he, 0)
+                result[str(tag)] = (float("nan"), float("nan"), hs, he, 0)
                 continue
             try:
                 avg = float(row["avg_value"])
             except Exception:
                 avg = float("nan")
-            result[str(tag)] = (avg, hs, he, cnt)
+            try:
+                avg_lb_hr = float(row.get("avg_lb_hr"))
+            except Exception:
+                avg_lb_hr = float("nan")
+            result[str(tag)] = (avg, avg_lb_hr, hs, he, cnt)
     except Exception:
         pass
 
@@ -1060,9 +1093,10 @@ GAUGE_CONTAINER_STYLE = {
 def build_tag_card(
     tag: str,
     latest: Dict[str, Tuple[float, str]],
-    last_hour_stats: Dict[str, Tuple[float, datetime, datetime, int]],
+    last_hour_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
     current_hour_avg: Dict[str, float],
     thresholds: Dict[str, Dict[str, object]],
+    lb_hr_map: Dict[str, str],
 ) -> html.Div:
     """
     Build a card with three gauges for a single tag:
@@ -1072,10 +1106,17 @@ def build_tag_card(
     """
     # base values
     cur_val, cur_plc_status = latest.get(tag, (float("nan"), "No data"))
-    last_avg, hs, he, sample_count = last_hour_stats.get(
-        tag, (float("nan"), None, None, 0)
+    last_avg, last_lb_hr_avg, hs, he, sample_count = last_hour_stats.get(
+        tag, (float("nan"), float("nan"), None, None, 0)
     )
     live_hr_val = current_hour_avg.get(tag, float("nan"))
+
+    lb_hr_tag = lb_hr_map.get(tag)
+    if lb_hr_tag and last_lb_hr_avg != last_lb_hr_avg:
+        fallback_entry = last_hour_stats.get(lb_hr_tag)
+        if fallback_entry:
+            last_lb_hr_avg = fallback_entry[0]
+    live_lb_hr_val = current_hour_avg.get(lb_hr_tag, float("nan")) if lb_hr_tag else float("nan")
 
     # If we have no live "current" value but we do have a last full hour,
     # use that for the current gauge so it doesn't display "non-numeric".
@@ -1150,6 +1191,8 @@ def build_tag_card(
             f"(samples: {sample_count}, eval: {last_status_eval})"
             f"{limit_note(last_avg)}"
         )
+        if last_lb_hr_avg == last_lb_hr_avg:
+            last_label_text = f"{last_label_text} • lb/hr avg: {last_lb_hr_avg:.2f}"
     else:
         last_label_text = "Last full hour: no data"
 
@@ -1159,6 +1202,8 @@ def build_tag_card(
             f"(current hour, eval: {live_hr_status_eval})"
             f"{limit_note(live_hr_val)}"
         )
+        if live_lb_hr_val == live_lb_hr_val:
+            live_hr_label_text = f"{live_hr_label_text} • lb/hr avg: {live_lb_hr_val:.2f}"
     else:
         live_hr_label_text = "Live hourly average: no data"
 
@@ -1945,6 +1990,7 @@ def update_dashboard(n):
 
         latest_by_tag, current_hour_avg, last_ts = extract_raw_stats(raw_df)
         last_hour_stats = extract_last_full_hour(hourly_df)
+        lb_hr_map = load_epa_ppm_to_lbhr_map()
 
         tags_raw = set(latest_by_tag.keys())
         tags_hourly = set(last_hour_stats.keys())
@@ -1994,6 +2040,7 @@ def update_dashboard(n):
                 last_hour_stats=last_hour_stats,
                 current_hour_avg=current_hour_avg,
                 thresholds=thresholds,
+                lb_hr_map=lb_hr_map,
             )
             cards.append(card)
 

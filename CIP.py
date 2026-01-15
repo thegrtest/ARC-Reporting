@@ -3434,32 +3434,28 @@ class MainWindow(QMainWindow):
             self.log_message(f"Error reading hourly CSV for upsert: {e}")
 
         ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
-        lbhr_avgs: Dict[str, float] = {}
+        avg_lookup: Dict[str, float] = {}
         for tag, acc in self.hour_accumulators.items():
             if acc["count"] <= 0:
                 continue
             if isinstance(acc["sum"], (int, float)):
-                lbhr_avgs[tag] = acc["sum"] / acc["count"]
-
-        avg_lookup = dict(lbhr_avgs)
+                avg_lookup[tag] = acc["sum"] / acc["count"]
 
         self.last_hour_avg.clear()
+        self.last_hour_avg.update(avg_lookup)
+
         for tag, acc in self.hour_accumulators.items():
             if acc["count"] <= 0:
                 continue
-            avg = acc["sum"] / acc["count"]
-            self.last_hour_avg[tag] = avg
+            avg = avg_lookup[tag]
             key = (hour_start_iso, tag)
             existing = records.get(key)
             existing_lb_hr = existing[2] if existing else None
             lbhr_avg = existing_lb_hr
-            mapped_tag = ppm_to_lbhr.get(tag)
-            if mapped_tag:
-                lbhr_avg = lbhr_avgs.get(mapped_tag, existing_lb_hr)
-                if lbhr_avg is None:
-                    derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
-                    if derived_lbhr is not None:
-                        lbhr_avg = derived_lbhr
+            if tag in ppm_to_lbhr:
+                derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
+                if derived_lbhr is not None:
+                    lbhr_avg = derived_lbhr
             records[key] = (hour_end_iso, avg, lbhr_avg, int(acc["count"]))
 
         try:
@@ -3672,6 +3668,9 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(tags))
         self.rows_summary_label.setText(f"Rows: {len(tags)}")
 
+        last_avg_lookup = dict(self.last_hour_avg)
+        cur_avg_lookup = dict(self.current_hour_preview)
+
         for row, tag in enumerate(tags):
             entry = self.current_values.get(tag, ("", ""))
             if isinstance(entry, tuple) and len(entry) >= 2:
@@ -3683,8 +3682,15 @@ class MainWindow(QMainWindow):
             cur_avg = self.current_hour_preview.get(tag, "")
             roll_avg = self.rolling_12hr_avg.get(tag, "")
             lbhr_tag = ppm_to_lbhr.get(tag)
-            lbhr_last_avg = self.last_hour_avg.get(lbhr_tag, "") if lbhr_tag else ""
-            lbhr_cur_avg = self.current_hour_preview.get(lbhr_tag, "") if lbhr_tag else ""
+            lbhr_last_avg = ""
+            lbhr_cur_avg = ""
+            if tag in ppm_to_lbhr:
+                derived_last = self._compute_lbhr_from_avg(tag, last_avg_lookup)
+                if derived_last is not None:
+                    lbhr_last_avg = derived_last
+                derived_cur = self._compute_lbhr_from_avg(tag, cur_avg_lookup)
+                if derived_cur is not None:
+                    lbhr_cur_avg = derived_cur
             lbhr_roll_avg = self.rolling_12hr_lbhr_avg.get(tag, "")
             if lbhr_tag and not self._is_valid_number(lbhr_roll_avg):
                 lbhr_roll_avg = self.rolling_12hr_avg.get(lbhr_tag, "")

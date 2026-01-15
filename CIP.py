@@ -78,7 +78,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QMessageBox, QGroupBox, QFormLayout, QSpinBox,
     QFileDialog, QHeaderView, QPlainTextEdit, QStatusBar, QFrame,
     QSpacerItem, QSizePolicy, QComboBox, QCheckBox, QScrollArea, QTabWidget,
-    QProgressBar, QSplashScreen
+    QProgressBar, QSplashScreen, QDoubleSpinBox
 )
 
 try:
@@ -780,6 +780,13 @@ class MainWindow(QMainWindow):
         "new_value",
         "reason",
     ]
+    EPA19_STD_O2_PCT = 20.9
+    EPA19_MOLAR_VOLUME_SCF = 385.8
+    EPA19_MOLECULAR_WEIGHTS = {
+        "NOx": 46.0,  # as NO2
+        "CO": 28.01,
+        "O2": 32.0,
+    }
 
     def __init__(self):
         super().__init__()
@@ -807,6 +814,7 @@ class MainWindow(QMainWindow):
         self.gauge_cards: Dict[str, GaugeCard] = {}
         self._gauge_spacer: Optional[QSpacerItem] = None
         self.writeback_interval_sec = 60
+        self.units_map: Dict[str, str] = {}
 
         # stable tag ordering for the dashboard
         self.tag_order: List[str] = []
@@ -823,6 +831,13 @@ class MainWindow(QMainWindow):
 
         # default config
         self.machine_name = ""
+        self.epa_enabled = False
+        self.epa_flow_tag = ""
+        self.epa_o2_tag = ""
+        self.epa_o2_units = "percent"
+        self.epa_ref_o2_pct = 3.0
+        self.epa_nox_tag = ""
+        self.epa_co_tag = ""
         self.log_dir = os.path.join("logs")
         self.raw_csv_path = ""   # will be set based on current date
         self.current_log_date: date = datetime.now().date()
@@ -1244,6 +1259,44 @@ class MainWindow(QMainWindow):
         self.moving_tags_edit = QLineEdit()
         self.moving_tags_edit.setPlaceholderText("Comma-separated tag names for stale detection")
         cfg_layout.addRow(QLabel("Tags expected to move:"), self.moving_tags_edit)
+
+        epa_label = QLabel("EPA Method 19 (PPMV → lb/hr)")
+        epa_label.setStyleSheet("font-weight: 600; color: #b0bec5; padding-top: 6px;")
+        cfg_layout.addRow(epa_label)
+
+        self.epa_enabled_checkbox = QCheckBox("Enable EPA Method 19 conversions")
+        self.epa_enabled_checkbox.setToolTip(
+            "Calculates lb/hr from PPMV using EPA Method 19 with a dry standard flow rate."
+        )
+        cfg_layout.addRow(self.epa_enabled_checkbox)
+
+        self.epa_flow_tag_edit = QLineEdit()
+        self.epa_flow_tag_edit.setPlaceholderText("e.g. Program:MainRoutine.StackFlow_DSCFM")
+        cfg_layout.addRow(QLabel("Air Flow Tag (dscfm):"), self.epa_flow_tag_edit)
+
+        self.epa_o2_tag_edit = QLineEdit()
+        self.epa_o2_tag_edit.setPlaceholderText("e.g. Program:MainRoutine.O2_PV")
+        cfg_layout.addRow(QLabel("O2 Tag (for correction):"), self.epa_o2_tag_edit)
+
+        self.epa_o2_units_combo = QComboBox()
+        self.epa_o2_units_combo.addItem("% O2", "percent")
+        self.epa_o2_units_combo.addItem("PPMV", "ppmv")
+        cfg_layout.addRow(QLabel("O2 Units:"), self.epa_o2_units_combo)
+
+        self.epa_ref_o2_spin = QDoubleSpinBox()
+        self.epa_ref_o2_spin.setRange(0.0, 20.9)
+        self.epa_ref_o2_spin.setSingleStep(0.1)
+        self.epa_ref_o2_spin.setDecimals(2)
+        self.epa_ref_o2_spin.setValue(self.epa_ref_o2_pct)
+        cfg_layout.addRow(QLabel("Reference O2 (%):"), self.epa_ref_o2_spin)
+
+        self.epa_nox_tag_edit = QLineEdit()
+        self.epa_nox_tag_edit.setPlaceholderText("e.g. Program:MainRoutine.NOx_PPMV")
+        cfg_layout.addRow(QLabel("NOx Tag (PPMV):"), self.epa_nox_tag_edit)
+
+        self.epa_co_tag_edit = QLineEdit()
+        self.epa_co_tag_edit.setPlaceholderText("e.g. Program:MainRoutine.CO_PPMV")
+        cfg_layout.addRow(QLabel("CO Tag (PPMV):"), self.epa_co_tag_edit)
 
         # Machine state tag + behavior
         self.machine_state_tag_edit = QLineEdit()
@@ -1741,6 +1794,114 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
+    @staticmethod
+    def _epa_calc_tag_names() -> Dict[str, str]:
+        return {
+            "NOx": "EPA19:NOx_LBHR",
+            "CO": "EPA19:CO_LBHR",
+            "O2": "EPA19:O2_LBHR",
+        }
+
+    def _get_numeric_from_poll(self, data: Dict[str, Tuple[object, str]], tag: str) -> Optional[float]:
+        if not tag:
+            return None
+        entry = data.get(tag)
+        if entry is None:
+            return None
+        if isinstance(entry, tuple) and len(entry) >= 2:
+            val, status = entry[0], entry[1]
+            if str(status).lower() != "success":
+                return None
+        else:
+            val = entry
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    def _epa_o2_values(self, raw_o2: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+        if raw_o2 is None:
+            return None, None
+        if self.epa_o2_units == "ppmv":
+            o2_ppmv = raw_o2
+            o2_pct = raw_o2 / 10000.0
+        else:
+            o2_pct = raw_o2
+            o2_ppmv = raw_o2 * 10000.0
+        return o2_pct, o2_ppmv
+
+    def _correct_ppmv_for_o2(self, ppmv: float, o2_pct: float) -> Optional[float]:
+        if ppmv is None:
+            return None
+        if o2_pct is None:
+            return None
+        ref = float(self.epa_ref_o2_pct)
+        if not (0.0 <= o2_pct < self.EPA19_STD_O2_PCT):
+            return None
+        if not (0.0 <= ref < self.EPA19_STD_O2_PCT):
+            return None
+        return ppmv * (self.EPA19_STD_O2_PCT - ref) / (self.EPA19_STD_O2_PCT - o2_pct)
+
+    def _ppmv_to_lb_hr(self, ppmv: float, flow_scfm: float, molecular_weight: float) -> float:
+        return (
+            ppmv
+            * flow_scfm
+            * 60.0
+            * molecular_weight
+            / (1_000_000.0 * self.EPA19_MOLAR_VOLUME_SCF)
+        )
+
+    def _compute_epa_method19(self, data: Dict[str, Tuple[object, str]]) -> Dict[str, Tuple[float, str]]:
+        if not self.epa_enabled:
+            return {}
+
+        flow = self._get_numeric_from_poll(data, self.epa_flow_tag)
+        if flow is None:
+            return {}
+
+        raw_o2 = self._get_numeric_from_poll(data, self.epa_o2_tag)
+        o2_pct, o2_ppmv = self._epa_o2_values(raw_o2)
+        calc_tags = self._epa_calc_tag_names()
+
+        results: Dict[str, Tuple[float, str]] = {}
+        pollutant_map = [
+            ("NOx", self.epa_nox_tag, True),
+            ("CO", self.epa_co_tag, True),
+            ("O2", self.epa_o2_tag, False),
+        ]
+
+        for pollutant, tag, needs_correction in pollutant_map:
+            if not tag:
+                continue
+            raw_val = self._get_numeric_from_poll(data, tag)
+            if raw_val is None:
+                continue
+            if pollutant == "O2":
+                ppmv = o2_ppmv if tag == self.epa_o2_tag else raw_val
+            else:
+                ppmv = raw_val
+            if ppmv is None:
+                continue
+            if needs_correction:
+                if o2_pct is None:
+                    continue
+                corrected_ppmv = self._correct_ppmv_for_o2(ppmv, o2_pct)
+                if corrected_ppmv is None:
+                    continue
+            else:
+                corrected_ppmv = ppmv
+
+            mw = self.EPA19_MOLECULAR_WEIGHTS.get(pollutant)
+            if mw is None:
+                continue
+            lb_hr = self._ppmv_to_lb_hr(corrected_ppmv, flow, mw)
+            calc_tag = calc_tags[pollutant]
+            results[calc_tag] = (lb_hr, "success")
+            self.alias_map.setdefault(calc_tag, f"{pollutant} (lb/hr)")
+            self.units_map.setdefault(calc_tag, "lb/hr")
+
+        return results
+
     # ---------------- settings ----------------
 
     def _load_settings(self):
@@ -1794,6 +1955,23 @@ class MainWindow(QMainWindow):
             moving_list = [x.strip() for x in str(moving_raw).split(",") if x.strip()]
         self.moving_tags = moving_list
         self.moving_tags_edit.setText(", ".join(self.moving_tags))
+
+        self.epa_enabled = bool(data.get("epa_enabled", False))
+        self.epa_enabled_checkbox.setChecked(self.epa_enabled)
+        self.epa_flow_tag = str(data.get("epa_flow_tag", "") or "")
+        self.epa_flow_tag_edit.setText(self.epa_flow_tag)
+        self.epa_o2_tag = str(data.get("epa_o2_tag", "") or "")
+        self.epa_o2_tag_edit.setText(self.epa_o2_tag)
+        self.epa_o2_units = str(data.get("epa_o2_units", "percent") or "percent")
+        o2_index = self.epa_o2_units_combo.findData(self.epa_o2_units)
+        if o2_index >= 0:
+            self.epa_o2_units_combo.setCurrentIndex(o2_index)
+        self.epa_ref_o2_pct = float(data.get("epa_ref_o2_pct", self.epa_ref_o2_pct))
+        self.epa_ref_o2_spin.setValue(self.epa_ref_o2_pct)
+        self.epa_nox_tag = str(data.get("epa_nox_tag", "") or "")
+        self.epa_nox_tag_edit.setText(self.epa_nox_tag)
+        self.epa_co_tag = str(data.get("epa_co_tag", "") or "")
+        self.epa_co_tag_edit.setText(self.epa_co_tag)
 
         # Machine state settings
         self.machine_state_tag_edit.setText(data.get("machine_state_tag", ""))
@@ -1852,6 +2030,13 @@ class MainWindow(QMainWindow):
             "stale_intervals": self.stale_spin.value(),
             "gap_threshold_minutes": self.gap_spin.value(),
             "moving_tags": [t.strip() for t in self.moving_tags_edit.text().split(",") if t.strip()],
+            "epa_enabled": self.epa_enabled_checkbox.isChecked(),
+            "epa_flow_tag": self.epa_flow_tag_edit.text().strip(),
+            "epa_o2_tag": self.epa_o2_tag_edit.text().strip(),
+            "epa_o2_units": self.epa_o2_units_combo.currentData(),
+            "epa_ref_o2_pct": self.epa_ref_o2_spin.value(),
+            "epa_nox_tag": self.epa_nox_tag_edit.text().strip(),
+            "epa_co_tag": self.epa_co_tag_edit.text().strip(),
             "lockdown_enabled": self.lockdown_checkbox.isChecked(),
         }
         self.log_dir = data["log_dir"]
@@ -1922,6 +2107,13 @@ class MainWindow(QMainWindow):
             ("writeback_enabled", "Writeback enabled"),
             ("writeback_interval_sec", "Writeback interval"),
             ("writeback_mappings", "Writeback mappings"),
+            ("epa_enabled", "EPA Method 19 enabled"),
+            ("epa_flow_tag", "EPA flow tag"),
+            ("epa_o2_tag", "EPA O2 tag"),
+            ("epa_o2_units", "EPA O2 units"),
+            ("epa_ref_o2_pct", "EPA reference O2"),
+            ("epa_nox_tag", "EPA NOx tag"),
+            ("epa_co_tag", "EPA CO tag"),
         ]
         for key, label in watched_fields:
             old_val = None if old is None else old.get(key)
@@ -1955,6 +2147,13 @@ class MainWindow(QMainWindow):
             self.stale_spin,
             self.gap_spin,
             self.moving_tags_edit,
+            self.epa_enabled_checkbox,
+            self.epa_flow_tag_edit,
+            self.epa_o2_tag_edit,
+            self.epa_o2_units_combo,
+            self.epa_ref_o2_spin,
+            self.epa_nox_tag_edit,
+            self.epa_co_tag_edit,
             self.machine_state_tag_edit,
             self.poll_mode_combo,
             self.heartbeat_tag_edit,
@@ -2048,6 +2247,20 @@ class MainWindow(QMainWindow):
             t.strip() for t in self.moving_tags_edit.text().split(",") if t.strip()
         ]
         self.thresholds = self._load_thresholds_from_log_dir()
+        self.units_map.clear()
+
+        self.epa_enabled = self.epa_enabled_checkbox.isChecked()
+        self.epa_flow_tag = self.epa_flow_tag_edit.text().strip()
+        self.epa_o2_tag = self.epa_o2_tag_edit.text().strip()
+        self.epa_o2_units = self.epa_o2_units_combo.currentData() or "percent"
+        self.epa_ref_o2_pct = self.epa_ref_o2_spin.value()
+        self.epa_nox_tag = self.epa_nox_tag_edit.text().strip()
+        self.epa_co_tag = self.epa_co_tag_edit.text().strip()
+
+        epa_tags = [self.epa_flow_tag, self.epa_o2_tag, self.epa_nox_tag, self.epa_co_tag]
+        for epa_tag in epa_tags:
+            if epa_tag and epa_tag not in tags:
+                tags.append(epa_tag)
 
         if not tags and not machine_state_tag and not heartbeat_enabled:
             QMessageBox.warning(
@@ -2066,6 +2279,20 @@ class MainWindow(QMainWindow):
                 "but consider keeping it to a few dozen for better responsiveness.",
             )
 
+        if self.epa_enabled:
+            if not self.epa_flow_tag:
+                self.log_message(
+                    "EPA Method 19 is enabled, but no air flow tag is configured."
+                )
+            if not self.epa_o2_tag:
+                self.log_message(
+                    "EPA Method 19 is enabled, but no O2 correction tag is configured."
+                )
+            if not (self.epa_nox_tag or self.epa_co_tag or self.epa_o2_tag):
+                self.log_message(
+                    "EPA Method 19 is enabled, but no NOx/CO/O2 pollutant tags are configured."
+                )
+
         # stable ordering for the dashboard
         tag_order = list(tags)
         if machine_state_tag and machine_state_tag not in tag_order:
@@ -2074,6 +2301,20 @@ class MainWindow(QMainWindow):
             tag_order.append(heartbeat_tag)
         self.tag_order = tag_order
         self.alias_map = alias_map  # keep for CSV + table
+
+        if self.epa_enabled:
+            calc_tags = self._epa_calc_tag_names()
+            for pollutant, calc_tag in calc_tags.items():
+                if pollutant == "NOx" and not self.epa_nox_tag:
+                    continue
+                if pollutant == "CO" and not self.epa_co_tag:
+                    continue
+                if pollutant == "O2" and not self.epa_o2_tag:
+                    continue
+                if calc_tag not in self.tag_order:
+                    self.tag_order.append(calc_tag)
+                self.alias_map.setdefault(calc_tag, f"{pollutant} (lb/hr)")
+                self.units_map.setdefault(calc_tag, "lb/hr")
 
         # machine name / header
         self.machine_name = self.machine_name_edit.text().strip()
@@ -2263,6 +2504,14 @@ class MainWindow(QMainWindow):
         - Update hourly accumulators and roll over when hour changes
         """
         try:
+            data = dict(data)
+            epa_results = self._compute_epa_method19(data)
+            if epa_results:
+                for calc_tag in epa_results:
+                    if calc_tag not in self.tag_order:
+                        self.tag_order.append(calc_tag)
+                data.update(epa_results)
+
             try:
                 ts = datetime.fromisoformat(ts_iso)
             except Exception:
@@ -2571,6 +2820,8 @@ class MainWindow(QMainWindow):
             thresholds_entry = self.thresholds.get(tag, {}) if isinstance(self.thresholds.get(tag, {}), dict) else {}
             alias = thresholds_entry.get("alias") if isinstance(thresholds_entry.get("alias"), str) else None
             units = thresholds_entry.get("units") if isinstance(thresholds_entry.get("units"), str) else ""
+            if not units and tag in self.units_map:
+                units = self.units_map.get(tag, "")
 
             low_oper = _to_float(thresholds_entry.get("low_oper"))
             high_oper = _to_float(thresholds_entry.get("high_oper"))

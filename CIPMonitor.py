@@ -7,6 +7,7 @@ Dash web dashboard for CIP Tag Poller
 Reads:
     logs/raw_data_YYYY-MM-DD.csv   (latest day for live/current & live-hour avg)
     logs/hourly_averages.csv       (hourly aggregates)
+    logs/rolling_12hr_averages.csv (rolling 12-hour averages)
 
 Exposes a network dashboard with:
     - For EVERY tag:
@@ -56,6 +57,7 @@ except ModuleNotFoundError as exc:
 
 LOG_DIR = "logs"
 HOURLY_CSV = os.path.join(LOG_DIR, "hourly_averages.csv")
+ROLLING_12HR_CSV = os.path.join(LOG_DIR, "rolling_12hr_averages.csv")
 THRESHOLDS_JSON = os.path.join(LOG_DIR, "thresholds.json")
 SETTINGS_JSON = "settings.json"  # optional: to discover tags before any data
 ENV_EVENTS_CSV = os.path.join(LOG_DIR, "env_events.csv")
@@ -273,6 +275,46 @@ def load_hourly_stats() -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
     for c in ["avg_value", "avg_lb_hr"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def load_rolling_12hr_stats() -> pd.DataFrame:
+    """
+    Load rolling 12-hour averages as DataFrame with columns:
+        window_start, window_end, tag, avg_value, avg_lb_hr, hours_count
+    Returns empty DataFrame on any error.
+    """
+    if not os.path.exists(ROLLING_12HR_CSV):
+        return pd.DataFrame(
+            columns=[
+                "window_start",
+                "window_end",
+                "tag",
+                "avg_value",
+                "avg_lb_hr",
+                "hours_count",
+            ]
+        )
+    try:
+        df = pd.read_csv(ROLLING_12HR_CSV)
+    except Exception:
+        return pd.DataFrame(
+            columns=[
+                "window_start",
+                "window_end",
+                "tag",
+                "avg_value",
+                "avg_lb_hr",
+                "hours_count",
+            ]
+        )
+
+    for c in ["window_start", "window_end"]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+    for c in ["avg_value", "avg_lb_hr", "hours_count"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
@@ -861,6 +903,47 @@ def extract_last_full_hour(
     return result
 
 
+def extract_latest_rolling_12hr(
+    rolling_df: pd.DataFrame,
+) -> Dict[str, Tuple[float, float, datetime, datetime, int]]:
+    """
+    From rolling_df, extract the latest 12-hour window per tag:
+        {tag: (avg_value, avg_lb_hr, window_start, window_end, hours_count)}
+    Any row with hours_count <= 0 is treated as "no data".
+    """
+    result: Dict[str, Tuple[float, float, datetime, datetime, int]] = {}
+    if rolling_df.empty or "tag" not in rolling_df.columns:
+        return result
+
+    try:
+        df = rolling_df.copy()
+        df = df.sort_values("window_end")
+        for tag, group in df.groupby("tag"):
+            row = group.iloc[-1]
+            ws = row.get("window_start")
+            we = row.get("window_end")
+            try:
+                cnt = int(row.get("hours_count", 0))
+            except Exception:
+                cnt = 0
+            if cnt <= 0:
+                result[str(tag)] = (float("nan"), float("nan"), ws, we, 0)
+                continue
+            try:
+                avg = float(row.get("avg_value"))
+            except Exception:
+                avg = float("nan")
+            try:
+                avg_lb_hr = float(row.get("avg_lb_hr"))
+            except Exception:
+                avg_lb_hr = float("nan")
+            result[str(tag)] = (avg, avg_lb_hr, ws, we, cnt)
+    except Exception:
+        pass
+
+    return result
+
+
 def compute_quality_metrics(
     raw_df: pd.DataFrame, events_df: pd.DataFrame, tags: List[str]
 ) -> Dict[str, Dict[str, float]]:
@@ -1094,19 +1177,24 @@ def build_tag_card(
     tag: str,
     latest: Dict[str, Tuple[float, str]],
     last_hour_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
+    rolling_12hr_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
     current_hour_avg: Dict[str, float],
     thresholds: Dict[str, Dict[str, object]],
     lb_hr_map: Dict[str, str],
 ) -> html.Div:
     """
-    Build a card with three gauges for a single tag:
+    Build a card with gauges for a single tag:
         - Current Value (falls back to last full hour if no live sample)
         - Last Full Hour
         - Live Hourly Average (current hour so far)
+        - Rolling 12-hour Average (from hourly averages)
     """
     # base values
     cur_val, cur_plc_status = latest.get(tag, (float("nan"), "No data"))
     last_avg, last_lb_hr_avg, hs, he, sample_count = last_hour_stats.get(
+        tag, (float("nan"), float("nan"), None, None, 0)
+    )
+    rolling_avg, rolling_lb_hr_avg, ws, we, rolling_count = rolling_12hr_stats.get(
         tag, (float("nan"), float("nan"), None, None, 0)
     )
     live_hr_val = current_hour_avg.get(tag, float("nan"))
@@ -1137,7 +1225,7 @@ def build_tag_card(
     high_limit = entry.get("high_limit")
 
     # Derive gauge ranges using operational thresholds first, then limits, then data
-    sample_vals = [cur_val, last_avg, live_hr_val]
+    sample_vals = [cur_val, last_avg, live_hr_val, rolling_avg]
     low_for_range = low_oper if low_oper is not None else low_limit
     high_for_range = high_oper if high_oper is not None else high_limit
     low_eff, high_eff, gmin, gmax = compute_gauge_range(
@@ -1152,10 +1240,12 @@ def build_tag_card(
     cur_status_eval = classify_value(cur_val, low_for_class, high_for_class)
     last_status_eval = classify_value(last_avg, low_for_class, high_for_class)
     live_hr_status_eval = classify_value(live_hr_val, low_for_class, high_for_class)
+    rolling_status_eval = classify_value(rolling_avg, low_for_class, high_for_class)
 
     cur_color = status_color(cur_status_eval)
     last_color = status_color(last_status_eval)
     live_hr_color = status_color(live_hr_status_eval)
+    rolling_color = status_color(rolling_status_eval)
 
     # Hard-limit exceedance text (if provided)
     def limit_note(value: float) -> str:
@@ -1206,6 +1296,25 @@ def build_tag_card(
             live_hr_label_text = f"{live_hr_label_text} • lb/hr avg: {live_lb_hr_val:.2f}"
     else:
         live_hr_label_text = "Live hourly average: no data"
+
+    if rolling_avg == rolling_avg and ws is not None and we is not None and rolling_count > 0:
+        try:
+            ws_s = ws.strftime("%Y-%m-%d %H:%M")
+            we_s = we.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            ws_s = str(ws)
+            we_s = str(we)
+        rolling_label_text = (
+            f"Rolling 12h {ws_s}–{we_s}: {rolling_avg:.2f} "
+            f"(hours: {rolling_count}, eval: {rolling_status_eval})"
+            f"{limit_note(rolling_avg)}"
+        )
+        if rolling_lb_hr_avg == rolling_lb_hr_avg:
+            rolling_label_text = (
+                f"{rolling_label_text} • lb/hr avg: {rolling_lb_hr_avg:.2f}"
+            )
+    else:
+        rolling_label_text = "Rolling 12-hour average: no data"
 
     gauge_size = 170
 
@@ -1269,6 +1378,28 @@ def build_tag_card(
         ],
     )
 
+    rolling_gauge = html.Div(
+        style=GAUGE_CONTAINER_STYLE,
+        children=[
+            html.Div(
+                "Rolling 12-Hour Avg",
+                style={"marginBottom": "4px", "fontWeight": "600"},
+            ),
+            daq.Gauge(
+                id={"type": "gauge", "tag": tag, "kind": "rolling_12hr"},
+                min=gmin,
+                max=gmax,
+                value=rolling_avg if rolling_avg == rolling_avg else gmin,
+                showCurrentValue=True,
+                color=rolling_color,
+                label="",
+                size=gauge_size,
+                units="",
+            ),
+            html.Div(rolling_label_text, style={"fontSize": "11px", "marginTop": "4px"}),
+        ],
+    )
+
     display_name = alias or tag
     subtitle_bits = []
     if alias:
@@ -1315,7 +1446,7 @@ def build_tag_card(
 
     gauges_row = html.Div(
         style=GAUGE_ROW_STYLE,
-        children=[current_gauge, last_hour_gauge, live_hour_gauge],
+        children=[current_gauge, last_hour_gauge, live_hour_gauge, rolling_gauge],
     )
 
     return html.Div(style=CARD_STYLE, children=[header, gauges_row])
@@ -1982,6 +2113,7 @@ def update_dashboard(n):
     try:
         raw_df = load_latest_raw_df()
         hourly_df = load_hourly_stats()
+        rolling_df = load_rolling_12hr_stats()
         events_df = load_env_events()
         thresholds = load_thresholds()
         config_version = compute_config_version_text()
@@ -1990,6 +2122,7 @@ def update_dashboard(n):
 
         latest_by_tag, current_hour_avg, last_ts = extract_raw_stats(raw_df)
         last_hour_stats = extract_last_full_hour(hourly_df)
+        rolling_12hr_stats = extract_latest_rolling_12hr(rolling_df)
         lb_hr_map = load_epa_ppm_to_lbhr_map()
 
         tags_raw = set(latest_by_tag.keys())
@@ -2038,6 +2171,7 @@ def update_dashboard(n):
                 tag=tag,
                 latest=latest_by_tag,
                 last_hour_stats=last_hour_stats,
+                rolling_12hr_stats=rolling_12hr_stats,
                 current_hour_avg=current_hour_avg,
                 thresholds=thresholds,
                 lb_hr_map=lb_hr_map,

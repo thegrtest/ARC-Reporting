@@ -12,6 +12,8 @@ Features
 - Aggregates data into hourly averages (1–2pm, 2–3pm, …) and writes to
   logs/hourly_averages.csv with UPSERT semantics:
   for each (hour_start, tag) there is at most one row (latest wins).
+- Computes rolling 12-hour averages from hourly aggregates and writes to
+  logs/rolling_12hr_averages.csv for dashboard display and reporting.
 - Dark, professional GUI showing:
     Alias | Tag | Current Value | Last Hour Avg | Current Hour Avg (so far) | Status
 - Button to compute current hour averages (display only).
@@ -802,6 +804,8 @@ class MainWindow(QMainWindow):
         self.current_values: Dict[str, Tuple[object, str]] = {}
         self.last_hour_avg: Dict[str, float] = {}
         self.current_hour_preview: Dict[str, float] = {}
+        self.rolling_12hr_avg: Dict[str, float] = {}
+        self.rolling_12hr_lbhr_avg: Dict[str, float] = {}
         self.current_hour_start: Optional[datetime] = None
         self.hour_accumulators: Dict[str, Dict[str, float]] = {}
         self.last_success_ts: Dict[str, datetime] = {}
@@ -842,6 +846,7 @@ class MainWindow(QMainWindow):
         self.raw_csv_path = ""   # will be set based on current date
         self.current_log_date: date = datetime.now().date()
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
+        self.rolling_12hr_csv_path = os.path.join(self.log_dir, "rolling_12hr_averages.csv")
         self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
         self.system_health_path = os.path.join(self.log_dir, "system_health.json")
         self.log_dir_warn_gb = 5.0
@@ -864,6 +869,11 @@ class MainWindow(QMainWindow):
             self.hourly_csv_path,
             ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
         )
+        ensure_csv(
+            self.rolling_12hr_csv_path,
+            ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"],
+        )
+        self._load_latest_rolling_12hr()
 
     def _apply_initial_size(self) -> None:
         """Scale the window to fit the available screen while remaining sizable."""
@@ -1454,8 +1464,8 @@ class MainWindow(QMainWindow):
         table_layout.addLayout(dash_header_layout)
 
         self.table = QTableWidget()
-        # Alias + Tag + 5 metrics + QA flag
-        self.table.setColumnCount(8)
+        # Alias + Tag + 7 metrics + QA flag
+        self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels(
             [
                 "Alias",
@@ -1465,6 +1475,8 @@ class MainWindow(QMainWindow):
                 "Current Hour Avg (so far)",
                 "Last Hour Avg (lb/hr)",
                 "Current Hour Avg (lb/hr)",
+                "Rolling 12 Hr Avg",
+                "Rolling 12 Hr Avg (lb/hr)",
                 "QA Flag",
             ]
         )
@@ -1477,6 +1489,8 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(9, QHeaderView.ResizeToContents)
 
         table_layout.addWidget(self.table, stretch=1)
 
@@ -1952,10 +1966,16 @@ class MainWindow(QMainWindow):
         self.log_dir_edit.setText(self.log_dir)
 
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
+        self.rolling_12hr_csv_path = os.path.join(self.log_dir, "rolling_12hr_averages.csv")
         self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
         self.system_health_path = os.path.join(self.log_dir, "system_health.json")
         self._ensure_env_events_csv()
         self.thresholds = self._load_thresholds_from_log_dir()
+        ensure_csv(
+            self.rolling_12hr_csv_path,
+            ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"],
+        )
+        self._load_latest_rolling_12hr()
 
         self.stale_intervals_threshold = int(data.get("stale_intervals", 5))
         self.stale_spin.setValue(self.stale_intervals_threshold)
@@ -2218,14 +2238,20 @@ class MainWindow(QMainWindow):
             self.log_dir = path
             self.log_dir_edit.setText(path)
             self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
+            self.rolling_12hr_csv_path = os.path.join(self.log_dir, "rolling_12hr_averages.csv")
             self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
-        ensure_csv(
-            self.hourly_csv_path,
-            ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
-        )
+            ensure_csv(
+                self.hourly_csv_path,
+                ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+            )
+            ensure_csv(
+                self.rolling_12hr_csv_path,
+                ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"],
+            )
             self._ensure_env_events_csv()
             self.current_log_date = datetime.now().date()
             self.raw_csv_path = self._ensure_raw_csv_for_date(self.current_log_date)
+            self._load_latest_rolling_12hr()
             self.log_message(f"Log directory set to: {path}")
 
     def start_polling(self):
@@ -2246,11 +2272,17 @@ class MainWindow(QMainWindow):
         self.log_dir = self.log_dir_edit.text().strip()
         ensure_dir(self.log_dir)
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
+        self.rolling_12hr_csv_path = os.path.join(self.log_dir, "rolling_12hr_averages.csv")
         self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
         ensure_csv(
             self.hourly_csv_path,
             ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
         )
+        ensure_csv(
+            self.rolling_12hr_csv_path,
+            ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"],
+        )
+        self._load_latest_rolling_12hr()
 
         machine_state_tag = self.machine_state_tag_edit.text().strip()
         heartbeat_tag = self.heartbeat_tag_edit.text().strip()
@@ -2594,6 +2626,202 @@ class MainWindow(QMainWindow):
                 averages[tag] = acc["sum"] / acc["count"]
         return averages
 
+    @staticmethod
+    def _is_valid_number(value: Optional[float]) -> bool:
+        return isinstance(value, (int, float)) and value == value
+
+    def _load_latest_rolling_12hr(self) -> None:
+        self.rolling_12hr_avg.clear()
+        self.rolling_12hr_lbhr_avg.clear()
+        if not os.path.exists(self.rolling_12hr_csv_path):
+            return
+        try:
+            with open(self.rolling_12hr_csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                latest: Dict[str, Tuple[datetime, Optional[float], Optional[float]]] = {}
+                for row in reader:
+                    tag = row.get("tag", "")
+                    if not tag:
+                        continue
+                    window_end_str = row.get("window_end", "")
+                    try:
+                        window_end = datetime.fromisoformat(window_end_str)
+                    except Exception:
+                        continue
+                    avg = self._safe_float(row.get("avg_value"))
+                    avg_lb_hr = self._safe_float(row.get("avg_lb_hr"))
+                    current = latest.get(tag)
+                    if current is None or window_end > current[0]:
+                        latest[tag] = (window_end, avg, avg_lb_hr)
+
+                for tag, (_, avg, avg_lb_hr) in latest.items():
+                    if self._is_valid_number(avg):
+                        self.rolling_12hr_avg[tag] = float(avg)
+                    if self._is_valid_number(avg_lb_hr):
+                        self.rolling_12hr_lbhr_avg[tag] = float(avg_lb_hr)
+        except Exception as e:
+            self.log_message(f"Error loading rolling 12-hour averages: {e}")
+
+    def _load_rolling_12hr_records(
+        self,
+    ) -> Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]]:
+        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]] = {}
+        if not os.path.exists(self.rolling_12hr_csv_path):
+            return records
+        try:
+            with open(self.rolling_12hr_csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    window_end = row.get("window_end", "")
+                    tag = row.get("tag", "")
+                    if not window_end or not tag:
+                        continue
+                    records[(window_end, tag)] = (
+                        row.get("window_start", ""),
+                        self._safe_float(row.get("avg_value")),
+                        self._safe_float(row.get("avg_lb_hr")),
+                        int(row.get("hours_count", "0") or 0),
+                    )
+        except Exception as e:
+            self.log_message(f"Error reading rolling 12-hour CSV: {e}")
+        return records
+
+    def _write_rolling_12hr_records(
+        self,
+        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]],
+    ) -> None:
+        try:
+            ensure_csv(
+                self.rolling_12hr_csv_path,
+                ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"],
+            )
+            with open(self.rolling_12hr_csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"]
+                )
+                for (window_end, tag), (window_start, avg, lbhr_avg, count) in sorted(records.items()):
+                    writer.writerow(
+                        [
+                            window_start,
+                            window_end,
+                            tag,
+                            "" if avg is None else avg,
+                            "" if lbhr_avg is None else lbhr_avg,
+                            count,
+                        ]
+                    )
+        except Exception as e:
+            self.log_message(f"Error writing rolling 12-hour CSV: {e}")
+
+    def _update_rolling_12hr_from_records(
+        self,
+        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]],
+        window_end: datetime,
+    ) -> None:
+        window_start = window_end - timedelta(hours=12)
+        tag_entries: Dict[str, List[Tuple[datetime, Optional[float], Optional[float]]]] = {}
+        for (hour_start_iso, tag), (_, avg, lbhr_avg, count) in records.items():
+            try:
+                hour_start = datetime.fromisoformat(hour_start_iso)
+            except Exception:
+                continue
+            if count <= 0:
+                continue
+            tag_entries.setdefault(str(tag), []).append(
+                (hour_start, self._safe_float(avg), self._safe_float(lbhr_avg))
+            )
+
+        rolling_records = self._load_rolling_12hr_records()
+        latest_avg: Dict[str, float] = {}
+        latest_lbhr: Dict[str, float] = {}
+        window_end_iso = window_end.isoformat(timespec="seconds")
+        window_start_iso = window_start.isoformat(timespec="seconds")
+
+        for tag, entries in tag_entries.items():
+            window_entries = [
+                entry
+                for entry in entries
+                if window_start <= entry[0] < window_end
+            ]
+            values = [val for _, val, _ in window_entries if self._is_valid_number(val)]
+            lb_values = [
+                val for _, _, val in window_entries if self._is_valid_number(val)
+            ]
+            hours_count = len(values)
+            avg_val = sum(values) / hours_count if hours_count > 0 else None
+            lb_avg = sum(lb_values) / len(lb_values) if lb_values else None
+            rolling_records[(window_end_iso, tag)] = (
+                window_start_iso,
+                avg_val,
+                lb_avg,
+                hours_count,
+            )
+            if self._is_valid_number(avg_val):
+                latest_avg[tag] = float(avg_val)
+            if self._is_valid_number(lb_avg):
+                latest_lbhr[tag] = float(lb_avg)
+
+        self._write_rolling_12hr_records(rolling_records)
+        self.rolling_12hr_avg = latest_avg
+        self.rolling_12hr_lbhr_avg = latest_lbhr
+
+    def _rebuild_rolling_12hr_from_records(
+        self,
+        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]],
+    ) -> None:
+        tag_entries: Dict[str, List[Tuple[datetime, Optional[float], Optional[float]]]] = {}
+        for (hour_start_iso, tag), (_, avg, lbhr_avg, count) in records.items():
+            try:
+                hour_start = datetime.fromisoformat(hour_start_iso)
+            except Exception:
+                continue
+            if count <= 0:
+                continue
+            tag_entries.setdefault(str(tag), []).append(
+                (hour_start, self._safe_float(avg), self._safe_float(lbhr_avg))
+            )
+
+        rolling_records: Dict[
+            Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]
+        ] = {}
+        latest_avg: Dict[str, float] = {}
+        latest_lbhr: Dict[str, float] = {}
+
+        for tag, entries in tag_entries.items():
+            entries.sort(key=lambda item: item[0])
+            for hour_start, _, _ in entries:
+                window_end = hour_start + timedelta(hours=1)
+                window_start = window_end - timedelta(hours=12)
+                window_entries = [
+                    entry
+                    for entry in entries
+                    if window_start <= entry[0] < window_end
+                ]
+                values = [val for _, val, _ in window_entries if self._is_valid_number(val)]
+                lb_values = [
+                    val for _, _, val in window_entries if self._is_valid_number(val)
+                ]
+                hours_count = len(values)
+                if hours_count <= 0:
+                    continue
+                avg_val = sum(values) / hours_count
+                lb_avg = sum(lb_values) / len(lb_values) if lb_values else None
+                window_end_iso = window_end.isoformat(timespec="seconds")
+                rolling_records[(window_end_iso, tag)] = (
+                    window_start.isoformat(timespec="seconds"),
+                    avg_val,
+                    lb_avg,
+                    hours_count,
+                )
+                latest_avg[tag] = avg_val
+                if self._is_valid_number(lb_avg):
+                    latest_lbhr[tag] = float(lb_avg)
+
+        self._write_rolling_12hr_records(rolling_records)
+        self.rolling_12hr_avg = latest_avg
+        self.rolling_12hr_lbhr_avg = latest_lbhr
+
     def finalize_previous_hour(self):
         """Compute averages for tags in the previous hour and write to hourly CSV."""
         if self.current_hour_start is None or not self.hour_accumulators:
@@ -2664,6 +2892,7 @@ class MainWindow(QMainWindow):
                             cnt,
                         ]
                     )
+            self._update_rolling_12hr_from_records(records, hour_end)
             self.log_message(
                 f"Hourly averages upserted for hour starting {hour_start_iso}."
             )
@@ -2802,6 +3031,7 @@ class MainWindow(QMainWindow):
                             cnt,
                         ]
                     )
+            self._rebuild_rolling_12hr_from_records(records)
             self.log_message(
                 f"Rebuilt hourly averages for {len(records)} (hour, tag) pairs."
             )
@@ -2817,7 +3047,8 @@ class MainWindow(QMainWindow):
         """
         Render table rows:
             Alias | Tag | Current Value | Last Hour Avg | Current Hour Avg (so far)
-            | Last Hour Avg (lb/hr) | Current Hour Avg (lb/hr) | QA Flag
+            | Last Hour Avg (lb/hr) | Current Hour Avg (lb/hr)
+            | Rolling 12 Hr Avg | Rolling 12 Hr Avg (lb/hr) | QA Flag
         """
         if self.tag_order:
             tags = list(self.tag_order)
@@ -2826,6 +3057,8 @@ class MainWindow(QMainWindow):
                 set(self.current_values.keys())
                 | set(self.last_hour_avg.keys())
                 | set(self.current_hour_preview.keys())
+                | set(self.rolling_12hr_avg.keys())
+                | set(self.rolling_12hr_lbhr_avg.keys())
             )
 
         ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
@@ -2841,9 +3074,11 @@ class MainWindow(QMainWindow):
 
             last_avg = self.last_hour_avg.get(tag, "")
             cur_avg = self.current_hour_preview.get(tag, "")
+            roll_avg = self.rolling_12hr_avg.get(tag, "")
             lbhr_tag = ppm_to_lbhr.get(tag)
             lbhr_last_avg = self.last_hour_avg.get(lbhr_tag, "") if lbhr_tag else ""
             lbhr_cur_avg = self.current_hour_preview.get(lbhr_tag, "") if lbhr_tag else ""
+            lbhr_roll_avg = self.rolling_12hr_lbhr_avg.get(tag, "")
 
             alias = self.alias_map.get(tag, "")
 
@@ -2875,7 +3110,17 @@ class MainWindow(QMainWindow):
                 6,
                 item(f"{lbhr_cur_avg:.4f}" if isinstance(lbhr_cur_avg, (int, float)) else ""),
             )
-            self.table.setItem(row, 7, item(qa_flag))
+            self.table.setItem(
+                row,
+                7,
+                item(f"{roll_avg:.4f}" if isinstance(roll_avg, (int, float)) else ""),
+            )
+            self.table.setItem(
+                row,
+                8,
+                item(f"{lbhr_roll_avg:.4f}" if isinstance(lbhr_roll_avg, (int, float)) else ""),
+            )
+            self.table.setItem(row, 9, item(qa_flag))
 
         self._update_gauges(tags)
 

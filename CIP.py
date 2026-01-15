@@ -2152,6 +2152,56 @@ class MainWindow(QMainWindow):
             / (1_000_000.0 * self.EPA19_MOLAR_VOLUME_SCF)
         )
 
+    def _compute_lbhr_from_avg(
+        self, tag: str, avg_lookup: Dict[str, float]
+    ) -> Optional[float]:
+        if not self.epa_enabled:
+            return None
+
+        flow_tag = self.epa_flow_tag
+        o2_tag = self.epa_o2_tag
+        if not (flow_tag and o2_tag):
+            return None
+
+        flow_avg = avg_lookup.get(flow_tag)
+        tag_avg = avg_lookup.get(tag)
+        if flow_avg is None or tag_avg is None:
+            return None
+
+        o2_avg = avg_lookup.get(o2_tag)
+        o2_pct, o2_ppmv = self._epa_o2_values(o2_avg)
+
+        if tag == self.epa_o2_tag:
+            ppmv = o2_ppmv
+            pollutant = "O2"
+        elif tag == self.epa_nox_tag:
+            pollutant = "NOx"
+            if o2_pct is None:
+                return None
+            corrected = self._correct_ppmv_for_o2(tag_avg, o2_pct)
+            if corrected is None:
+                return None
+            ppmv = corrected
+        elif tag == self.epa_co_tag:
+            pollutant = "CO"
+            if o2_pct is None:
+                return None
+            corrected = self._correct_ppmv_for_o2(tag_avg, o2_pct)
+            if corrected is None:
+                return None
+            ppmv = corrected
+        else:
+            return None
+
+        if ppmv is None:
+            return None
+
+        mw = self.EPA19_MOLECULAR_WEIGHTS.get(pollutant)
+        if mw is None:
+            return None
+
+        return self._ppmv_to_lb_hr(ppmv, flow_avg, mw)
+
     def _compute_epa_method19(self, data: Dict[str, Tuple[object, str]]) -> Dict[str, Tuple[float, str]]:
         if not self.epa_enabled:
             return {}
@@ -3212,6 +3262,10 @@ class MainWindow(QMainWindow):
         window_end_iso = window_end.isoformat(timespec="seconds")
         window_start_iso = window_start.isoformat(timespec="seconds")
 
+        avg_by_tag: Dict[str, Optional[float]] = {}
+        lb_avg_by_tag: Dict[str, Optional[float]] = {}
+        count_by_tag: Dict[str, int] = {}
+
         for tag, entries in tag_entries.items():
             window_entries = [
                 entry
@@ -3225,11 +3279,25 @@ class MainWindow(QMainWindow):
             hours_count = len(values)
             avg_val = sum(values) / hours_count if hours_count > 0 else None
             lb_avg = sum(lb_values) / len(lb_values) if lb_values else None
+            avg_by_tag[tag] = avg_val
+            lb_avg_by_tag[tag] = lb_avg
+            count_by_tag[tag] = hours_count
+
+        avg_lookup = {k: v for k, v in avg_by_tag.items() if v is not None}
+
+        for tag, avg_val in avg_by_tag.items():
+            lb_avg = lb_avg_by_tag.get(tag)
+            if lb_avg is None:
+                derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
+                if derived_lbhr is not None:
+                    lb_avg = derived_lbhr
+                    lb_avg_by_tag[tag] = lb_avg
+
             rolling_records[(window_end_iso, tag)] = (
                 window_start_iso,
                 avg_val,
                 lb_avg,
-                hours_count,
+                count_by_tag.get(tag, 0),
             )
             if self._is_valid_number(avg_val):
                 latest_avg[tag] = float(avg_val)
@@ -3239,6 +3307,24 @@ class MainWindow(QMainWindow):
         self._write_rolling_12hr_records(rolling_records)
         self.rolling_12hr_avg = latest_avg
         self.rolling_12hr_lbhr_avg = latest_lbhr
+
+    def _rolling_avg_for_tag(
+        self,
+        tag_entries: Dict[str, List[Tuple[datetime, Optional[float], Optional[float]]]],
+        tag: str,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> Optional[float]:
+        entries = tag_entries.get(tag)
+        if not entries:
+            return None
+        window_entries = [
+            entry for entry in entries if window_start <= entry[0] < window_end
+        ]
+        values = [val for _, val, _ in window_entries if self._is_valid_number(val)]
+        if not values:
+            return None
+        return sum(values) / len(values)
 
     def _rebuild_rolling_12hr_from_records(
         self,
@@ -3281,6 +3367,27 @@ class MainWindow(QMainWindow):
                     continue
                 avg_val = sum(values) / hours_count
                 lb_avg = sum(lb_values) / len(lb_values) if lb_values else None
+                if lb_avg is None:
+                    avg_lookup = {tag: avg_val}
+                    flow_avg = self._rolling_avg_for_tag(
+                        tag_entries,
+                        self.epa_flow_tag,
+                        window_start,
+                        window_end,
+                    )
+                    if flow_avg is not None:
+                        avg_lookup[self.epa_flow_tag] = flow_avg
+                    o2_avg = self._rolling_avg_for_tag(
+                        tag_entries,
+                        self.epa_o2_tag,
+                        window_start,
+                        window_end,
+                    )
+                    if o2_avg is not None:
+                        avg_lookup[self.epa_o2_tag] = o2_avg
+                    derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
+                    if derived_lbhr is not None:
+                        lb_avg = derived_lbhr
                 window_end_iso = window_end.isoformat(timespec="seconds")
                 rolling_records[(window_end_iso, tag)] = (
                     window_start.isoformat(timespec="seconds"),
@@ -3330,6 +3437,8 @@ class MainWindow(QMainWindow):
             if isinstance(acc["sum"], (int, float)):
                 lbhr_avgs[tag] = acc["sum"] / acc["count"]
 
+        avg_lookup = dict(lbhr_avgs)
+
         self.last_hour_avg.clear()
         for tag, acc in self.hour_accumulators.items():
             if acc["count"] <= 0:
@@ -3343,6 +3452,10 @@ class MainWindow(QMainWindow):
             mapped_tag = ppm_to_lbhr.get(tag)
             if mapped_tag:
                 lbhr_avg = lbhr_avgs.get(mapped_tag, existing_lb_hr)
+                if lbhr_avg is None:
+                    derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
+                    if derived_lbhr is not None:
+                        lbhr_avg = derived_lbhr
             records[key] = (hour_end_iso, avg, lbhr_avg, int(acc["count"]))
 
         try:

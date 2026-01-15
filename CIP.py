@@ -386,6 +386,7 @@ class PollThread(QThread):
         interval_sec: int = 10,
         chunk_size: int = 20,
         reconnect_delay_sec: int = 10,
+        socket_timeout_sec: Optional[int] = None,
         machine_state_tag: Optional[str] = None,
         pause_when_down: bool = False,
         heartbeat_tag: Optional[str] = None,
@@ -424,6 +425,9 @@ class PollThread(QThread):
 
         # How long to wait before reattempting a PLC connection after failure
         self.reconnect_delay_sec = max(1, int(reconnect_delay_sec))
+        if socket_timeout_sec is None:
+            socket_timeout_sec = min(10, max(2, self.interval_sec))
+        self.socket_timeout_sec = max(1, int(socket_timeout_sec))
 
         self._running = False
         self._mutex = QMutex()
@@ -557,12 +561,17 @@ class PollThread(QThread):
             try:
                 with PLC() as comm:
                     comm.IPAddress = self.ip
+                    if hasattr(comm, "SocketTimeout"):
+                        comm.SocketTimeout = self.socket_timeout_sec
+                    if hasattr(comm, "Timeout"):
+                        comm.Timeout = self.socket_timeout_sec
                     self.info.emit(
                         f"Connected to PLC at {self.ip} "
                         f"({len(self.tags_main)} main tags, chunk_size={self.chunk_size}, "
                         f"machine_state_tag={self.machine_state_tag or 'None'}, "
                         f"pause_when_down={self.pause_when_down}, "
                         f"heartbeat_tag={self.heartbeat_tag or 'None'}, "
+                        f"socket_timeout={self.socket_timeout_sec}s, "
                         f"heartbeat_enabled={self.heartbeat_enabled})"
                     )
 
@@ -821,6 +830,10 @@ class MainWindow(QMainWindow):
         self._gauge_spacer: Optional[QSpacerItem] = None
         self.writeback_interval_sec = 60
         self.units_map: Dict[str, str] = {}
+        self.required_poll_interval_sec = 15
+        self.poll_watchdog_timer: Optional[QTimer] = None
+        self._watchdog_restart_in_progress = False
+        self._watchdog_last_warning_ts: Optional[datetime] = None
 
         # stable tag ordering for the dashboard
         self.tag_order: List[str] = []
@@ -876,6 +889,7 @@ class MainWindow(QMainWindow):
             ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"],
         )
         self._load_latest_rolling_12hr()
+        self._start_poll_watchdog()
 
     def _apply_initial_size(self) -> None:
         """Scale the window to fit the available screen while remaining sizable."""
@@ -1068,12 +1082,18 @@ class MainWindow(QMainWindow):
             try:
                 last_success_dt = datetime.fromisoformat(self.last_poll_success_ts_iso)
                 age = now - last_success_dt
-                if age > timedelta(minutes=5):
+                warn_after = timedelta(seconds=self.required_poll_interval_sec * 2)
+                crit_after = timedelta(seconds=self.required_poll_interval_sec * 4)
+                if age > crit_after:
                     status = "Critical"
-                    reasons.append("Polling has been stale for over 5 minutes")
-                elif age > timedelta(minutes=2):
+                    reasons.append(
+                        f"Polling has been stale for {int(age.total_seconds())} seconds"
+                    )
+                elif age > warn_after:
                     status = "Degraded"
-                    reasons.append("Polling delayed beyond 2 minutes")
+                    reasons.append(
+                        f"Polling delayed by {int(age.total_seconds())} seconds"
+                    )
             except Exception:
                 reasons.append("Unable to parse last poll timestamp")
         else:
@@ -2256,6 +2276,59 @@ class MainWindow(QMainWindow):
             self._load_latest_rolling_12hr()
             self.log_message(f"Log directory set to: {path}")
 
+    def _start_poll_watchdog(self) -> None:
+        if self.poll_watchdog_timer:
+            return
+        timer = QTimer(self)
+        timer.setInterval(5000)
+        timer.timeout.connect(self._poll_watchdog_tick)
+        timer.start()
+        self.poll_watchdog_timer = timer
+
+    def _poll_watchdog_tick(self) -> None:
+        if not self.poll_thread or not self.poll_thread.isRunning():
+            self._watchdog_restart_in_progress = False
+            self._watchdog_last_warning_ts = None
+            return
+        if not self.last_poll_success_ts_iso:
+            return
+        try:
+            last_success = datetime.fromisoformat(self.last_poll_success_ts_iso)
+        except Exception:
+            return
+
+        now = datetime.now()
+        age = now - last_success
+        warn_after = timedelta(seconds=self.required_poll_interval_sec * 2)
+        restart_after = timedelta(seconds=self.required_poll_interval_sec * 4)
+
+        if age >= restart_after:
+            if not self._watchdog_restart_in_progress:
+                self._watchdog_restart_in_progress = True
+                self.log_message(
+                    "Polling watchdog: data collection stalled; restarting polling thread."
+                )
+                self._restart_polling_from_watchdog()
+            return
+
+        if age >= warn_after:
+            if not self._watchdog_last_warning_ts or now - self._watchdog_last_warning_ts >= warn_after:
+                self._watchdog_last_warning_ts = now
+                self.log_message(
+                    f"Polling watchdog: last data is {int(age.total_seconds())}s old."
+                )
+        else:
+            self._watchdog_restart_in_progress = False
+            self._watchdog_last_warning_ts = None
+
+    def _restart_polling_from_watchdog(self) -> None:
+        stopped = self._stop_polling_internal(allow_lock_override=True)
+        if not stopped:
+            self._watchdog_restart_in_progress = False
+            return
+        self.start_polling()
+        self._watchdog_restart_in_progress = False
+
     def start_polling(self):
         if self.lockdown_enabled and self.poll_thread and self.poll_thread.isRunning():
             return
@@ -2383,7 +2456,15 @@ class MainWindow(QMainWindow):
         self._stale_tracker.clear()
         self.update_dashboard()
 
-        interval = self.interval_spin.value()
+        requested_interval = self.interval_spin.value()
+        if requested_interval > self.required_poll_interval_sec:
+            self.log_message(
+                f"Poll interval clamped from {requested_interval}s to "
+                f"{self.required_poll_interval_sec}s for compliance."
+            )
+            requested_interval = self.required_poll_interval_sec
+            self.interval_spin.setValue(requested_interval)
+        interval = requested_interval
         chunk_size = self.chunk_spin.value()
         pause_when_down = (self.poll_mode_combo.currentIndex() == 1)
 
@@ -2398,6 +2479,7 @@ class MainWindow(QMainWindow):
             interval_sec=interval,
             chunk_size=chunk_size,
             reconnect_delay_sec=10,
+            socket_timeout_sec=min(10, max(2, interval)),
             machine_state_tag=machine_state_tag,
             pause_when_down=pause_when_down,
             heartbeat_tag=heartbeat_tag,
@@ -2423,10 +2505,10 @@ class MainWindow(QMainWindow):
             f"(mode={mode_txt}, heartbeat {hb_txt})."
         )
 
-    def stop_polling(self):
-        if self.lockdown_enabled:
+    def _stop_polling_internal(self, allow_lock_override: bool = False) -> bool:
+        if self.lockdown_enabled and not allow_lock_override:
             self.log_message("Run lock enabled — stop is blocked.")
-            return
+            return False
         if self.poll_thread:
             self.poll_thread.stop()
             self.poll_thread.wait(5000)
@@ -2440,6 +2522,10 @@ class MainWindow(QMainWindow):
         self.connection_status_label.setText("Status: Stopped")
         self.connection_status_label.setStyleSheet("color: #ef9a9a;")
         self.log_message("Stopped polling.")
+        return True
+
+    def stop_polling(self):
+        self._stop_polling_internal(allow_lock_override=False)
 
     def _start_writeback_thread(self, ip: str) -> None:
         if not self.writeback_enabled_checkbox.isChecked():

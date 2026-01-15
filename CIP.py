@@ -807,7 +807,9 @@ class MainWindow(QMainWindow):
         self.rolling_12hr_avg: Dict[str, float] = {}
         self.rolling_12hr_lbhr_avg: Dict[str, float] = {}
         self.current_hour_start: Optional[datetime] = None
+        self.current_minute_start: Optional[datetime] = None
         self.hour_accumulators: Dict[str, Dict[str, float]] = {}
+        self.minute_accumulators: Dict[str, Dict[str, float]] = {}
         self.last_success_ts: Dict[str, datetime] = {}
         self.last_poll_success_ts_iso: Optional[str] = None
         self.last_poll_error_ts_iso: Optional[str] = None
@@ -2548,7 +2550,7 @@ class MainWindow(QMainWindow):
         Called from background thread with new readings.
         - Update current values
         - Append to daily raw CSV (raw_data_YYYY-MM-DD.csv)
-        - Update hourly accumulators and roll over when hour changes
+        - Update minute/hour accumulators and roll over when hour changes
         """
         try:
             data = dict(data)
@@ -2564,7 +2566,15 @@ class MainWindow(QMainWindow):
             except Exception:
                 ts = datetime.now()
 
+            minute_start = ts.replace(second=0, microsecond=0)
             hour_start = hour_bucket(ts)
+
+            if self.current_minute_start is None:
+                self.current_minute_start = minute_start
+            elif minute_start != self.current_minute_start:
+                self.finalize_previous_minute()
+                self.current_minute_start = minute_start
+                self.minute_accumulators.clear()
 
             if self.current_hour_start is None:
                 self.current_hour_start = hour_start
@@ -2602,7 +2612,7 @@ class MainWindow(QMainWindow):
                         if qa_flag == "OK":
                             self._check_gap_event(tag, ts)
                             if isinstance(val, (int, float)):
-                                acc = self.hour_accumulators.setdefault(
+                                acc = self.minute_accumulators.setdefault(
                                     tag, {"sum": 0.0, "count": 0}
                                 )
                                 acc["sum"] += float(val)
@@ -2620,15 +2630,57 @@ class MainWindow(QMainWindow):
             self.log_message(f"Error handling poll data: {e}")
 
     def _current_hour_averages(self) -> Dict[str, float]:
-        averages: Dict[str, float] = {}
-        for tag, acc in self.hour_accumulators.items():
-            if acc.get("count", 0) > 0:
-                averages[tag] = acc["sum"] / acc["count"]
-        return averages
+        return self._hour_average_snapshot(include_partial_minute=True)
 
     @staticmethod
     def _is_valid_number(value: Optional[float]) -> bool:
         return isinstance(value, (int, float)) and value == value
+
+    def _ppm_cap_tags(self) -> set:
+        return {tag for tag in (self.epa_nox_tag, self.epa_co_tag) if tag}
+
+    def _apply_minute_cap(self, tag: str, avg: float) -> float:
+        if tag in self._ppm_cap_tags() and avg > 3000:
+            return 10000.0
+        return avg
+
+    def _minute_average(self, tag: str, acc: Dict[str, float]) -> Optional[float]:
+        if acc.get("count", 0) <= 0:
+            return None
+        avg = acc["sum"] / acc["count"]
+        return self._apply_minute_cap(tag, avg)
+
+    def _hour_average_snapshot(self, include_partial_minute: bool = False) -> Dict[str, float]:
+        totals: Dict[str, Dict[str, float]] = {}
+        for tag, acc in self.hour_accumulators.items():
+            if acc.get("count", 0) > 0:
+                totals[tag] = {"sum": acc["sum"], "count": acc["count"]}
+
+        if include_partial_minute:
+            for tag, acc in self.minute_accumulators.items():
+                minute_avg = self._minute_average(tag, acc)
+                if minute_avg is None:
+                    continue
+                total = totals.setdefault(tag, {"sum": 0.0, "count": 0})
+                total["sum"] += minute_avg
+                total["count"] += 1
+
+        averages: Dict[str, float] = {}
+        for tag, acc in totals.items():
+            if acc.get("count", 0) > 0:
+                averages[tag] = acc["sum"] / acc["count"]
+        return averages
+
+    def finalize_previous_minute(self) -> None:
+        if self.current_minute_start is None or not self.minute_accumulators:
+            return
+        for tag, acc in self.minute_accumulators.items():
+            minute_avg = self._minute_average(tag, acc)
+            if minute_avg is None:
+                continue
+            hour_acc = self.hour_accumulators.setdefault(tag, {"sum": 0.0, "count": 0})
+            hour_acc["sum"] += minute_avg
+            hour_acc["count"] += 1
 
     def _load_latest_rolling_12hr(self) -> None:
         self.rolling_12hr_avg.clear()
@@ -2901,10 +2953,7 @@ class MainWindow(QMainWindow):
 
     def compute_current_hour_preview(self):
         self.current_hour_preview.clear()
-        for tag, acc in self.hour_accumulators.items():
-            if acc["count"] <= 0:
-                continue
-            self.current_hour_preview[tag] = acc["sum"] / acc["count"]
+        self.current_hour_preview.update(self._hour_average_snapshot(include_partial_minute=True))
         self.update_dashboard()
         self.log_message("Computed current hour averages (display only).")
 
@@ -2947,7 +2996,7 @@ class MainWindow(QMainWindow):
         records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]] = {}
 
         try:
-            buckets: Dict[Tuple[datetime, str], Dict[str, float]] = {}
+            minute_buckets: Dict[Tuple[datetime, str], Dict[str, float]] = {}
             for path in sorted(raw_files):
                 open_func = gzip.open if path.endswith(".gz") else open
                 with open_func(path, "rt", encoding="utf-8") as f:
@@ -2975,13 +3024,25 @@ class MainWindow(QMainWindow):
                         if status != "success":
                             continue
 
-                        hstart = hour_bucket(ts)
-                        key = (hstart, tag)
-                        acc = buckets.setdefault(key, {"sum": 0.0, "count": 0})
+                        mstart = ts.replace(second=0, microsecond=0)
+                        key = (mstart, tag)
+                        acc = minute_buckets.setdefault(key, {"sum": 0.0, "count": 0})
                         acc["sum"] += val
                         acc["count"] += 1
 
-            for (hstart, tag), acc in buckets.items():
+            hour_buckets: Dict[Tuple[datetime, str], Dict[str, float]] = {}
+            for (mstart, tag), acc in minute_buckets.items():
+                if acc["count"] <= 0:
+                    continue
+                minute_avg = acc["sum"] / acc["count"]
+                minute_avg = self._apply_minute_cap(tag, minute_avg)
+                hstart = hour_bucket(mstart)
+                hour_key = (hstart, tag)
+                hour_acc = hour_buckets.setdefault(hour_key, {"sum": 0.0, "count": 0})
+                hour_acc["sum"] += minute_avg
+                hour_acc["count"] += 1
+
+            for (hstart, tag), acc in hour_buckets.items():
                 if acc["count"] <= 0:
                     continue
                 hstart_iso = hstart.isoformat(timespec="seconds")

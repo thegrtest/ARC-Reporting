@@ -75,6 +75,14 @@ CONFIG_CHANGE_HEADERS = [
 
 REFRESH_MS = 5000  # dashboard refresh interval (ms)
 
+EPA19_STD_O2_PCT = 20.9
+EPA19_MOLAR_VOLUME_SCF = 385.8
+EPA19_MOLECULAR_WEIGHTS = {
+    "NOx": 46.0,  # as NO2
+    "CO": 28.01,
+    "O2": 32.0,
+}
+
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
@@ -714,6 +722,106 @@ def load_epa_ppm_to_lbhr_map() -> Dict[str, str]:
     return mapping
 
 
+def load_epa_settings() -> Dict[str, object]:
+    if not os.path.exists(SETTINGS_JSON):
+        return {}
+    try:
+        with open(SETTINGS_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    return {
+        "epa_enabled": bool(data.get("epa_enabled", False)),
+        "epa_flow_tag": str(data.get("epa_flow_tag", "") or ""),
+        "epa_o2_tag": str(data.get("epa_o2_tag", "") or ""),
+        "epa_o2_units": str(data.get("epa_o2_units", "percent") or "percent"),
+        "epa_ref_o2_pct": float(data.get("epa_ref_o2_pct", 3.0) or 3.0),
+        "epa_nox_tag": str(data.get("epa_nox_tag", "") or ""),
+        "epa_co_tag": str(data.get("epa_co_tag", "") or ""),
+    }
+
+
+def _epa_o2_values(raw_o2: Optional[float], units: str) -> Tuple[Optional[float], Optional[float]]:
+    if raw_o2 is None:
+        return None, None
+    if units == "ppmv":
+        o2_ppmv = raw_o2
+        o2_pct = raw_o2 / 10000.0
+    else:
+        o2_pct = raw_o2
+        o2_ppmv = raw_o2 * 10000.0
+    return o2_pct, o2_ppmv
+
+
+def _correct_ppmv_for_o2(ppmv: float, o2_pct: float, ref_o2_pct: float) -> Optional[float]:
+    if not (0.0 <= o2_pct < EPA19_STD_O2_PCT):
+        return None
+    if not (0.0 <= ref_o2_pct < EPA19_STD_O2_PCT):
+        return None
+    return ppmv * (EPA19_STD_O2_PCT - ref_o2_pct) / (EPA19_STD_O2_PCT - o2_pct)
+
+
+def compute_rolling_lbhr_from_epa(
+    tag: str,
+    rolling_12hr_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
+    epa_settings: Dict[str, object],
+) -> Optional[float]:
+    if not epa_settings or not epa_settings.get("epa_enabled"):
+        return None
+
+    flow_tag = str(epa_settings.get("epa_flow_tag", "") or "")
+    o2_tag = str(epa_settings.get("epa_o2_tag", "") or "")
+    o2_units = str(epa_settings.get("epa_o2_units", "percent") or "percent")
+    ref_o2_pct = float(epa_settings.get("epa_ref_o2_pct", 3.0) or 3.0)
+
+    pollutant_map = {
+        str(epa_settings.get("epa_nox_tag", "") or ""): "NOx",
+        str(epa_settings.get("epa_co_tag", "") or ""): "CO",
+        str(epa_settings.get("epa_o2_tag", "") or ""): "O2",
+    }
+
+    pollutant = pollutant_map.get(tag)
+    if not pollutant:
+        return None
+
+    flow_entry = rolling_12hr_stats.get(flow_tag)
+    tag_entry = rolling_12hr_stats.get(tag)
+    if not flow_entry or not tag_entry:
+        return None
+
+    flow_avg = flow_entry[0]
+    tag_avg = tag_entry[0]
+    if flow_avg != flow_avg or tag_avg != tag_avg:
+        return None
+
+    o2_entry = rolling_12hr_stats.get(o2_tag)
+    o2_avg = o2_entry[0] if o2_entry else None
+    o2_pct, o2_ppmv = _epa_o2_values(o2_avg, o2_units)
+
+    if pollutant == "O2":
+        ppmv = o2_ppmv
+    else:
+        if o2_pct is None:
+            return None
+        corrected = _correct_ppmv_for_o2(tag_avg, o2_pct, ref_o2_pct)
+        if corrected is None:
+            return None
+        ppmv = corrected
+
+    if ppmv is None:
+        return None
+
+    mw = EPA19_MOLECULAR_WEIGHTS.get(pollutant)
+    if mw is None:
+        return None
+
+    return (ppmv * flow_avg * 60.0 * mw) / (1_000_000.0 * EPA19_MOLAR_VOLUME_SCF)
+
+
 # ----------------- helpers: classification & ranges -----------------
 
 
@@ -1181,6 +1289,7 @@ def build_tag_card(
     current_hour_avg: Dict[str, float],
     thresholds: Dict[str, Dict[str, object]],
     lb_hr_map: Dict[str, str],
+    epa_settings: Dict[str, object],
 ) -> html.Div:
     """
     Build a card with gauges for a single tag:
@@ -1205,10 +1314,21 @@ def build_tag_card(
         if fallback_entry:
             last_lb_hr_avg = fallback_entry[0]
     live_lb_hr_val = current_hour_avg.get(lb_hr_tag, float("nan")) if lb_hr_tag else float("nan")
+    derived_roll_lbhr = False
     if lb_hr_tag and rolling_lb_hr_avg != rolling_lb_hr_avg:
         rolling_entry = rolling_12hr_stats.get(lb_hr_tag)
         if rolling_entry:
             rolling_lb_hr_avg = rolling_entry[0]
+
+    if rolling_lb_hr_avg != rolling_lb_hr_avg:
+        computed_roll_lbhr = compute_rolling_lbhr_from_epa(
+            tag=tag,
+            rolling_12hr_stats=rolling_12hr_stats,
+            epa_settings=epa_settings,
+        )
+        if computed_roll_lbhr is not None:
+            rolling_lb_hr_avg = computed_roll_lbhr
+            derived_roll_lbhr = True
 
     # If we have no live "current" value but we do have a last full hour,
     # use that for the current gauge so it doesn't display "non-numeric".
@@ -1314,8 +1434,9 @@ def build_tag_card(
             f"{limit_note(rolling_avg)}"
         )
         if rolling_lb_hr_avg == rolling_lb_hr_avg:
+            suffix = " (derived)" if derived_roll_lbhr else ""
             rolling_label_text = (
-                f"{rolling_label_text} • lb/hr avg: {rolling_lb_hr_avg:.2f}"
+                f"{rolling_label_text} • lb/hr avg{suffix}: {rolling_lb_hr_avg:.2f}"
             )
     else:
         rolling_label_text = "Rolling 12-hour average: no data"
@@ -2128,6 +2249,7 @@ def update_dashboard(n):
         last_hour_stats = extract_last_full_hour(hourly_df)
         rolling_12hr_stats = extract_latest_rolling_12hr(rolling_df)
         lb_hr_map = load_epa_ppm_to_lbhr_map()
+        epa_settings = load_epa_settings()
 
         tags_raw = set(latest_by_tag.keys())
         tags_hourly = set(last_hour_stats.keys())
@@ -2179,6 +2301,7 @@ def update_dashboard(n):
                 current_hour_avg=current_hour_avg,
                 thresholds=thresholds,
                 lb_hr_map=lb_hr_map,
+                epa_settings=epa_settings,
             )
             cards.append(card)
 

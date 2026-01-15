@@ -47,7 +47,7 @@ Both applications will exit early with actionable messages if `pylogix`, `pandas
 ### Output files
 
 - **Raw samples**: `logs/raw_data_YYYY-MM-DD.csv` (one per day) with timestamp, tag, alias, value, and status.【F:CIP.py†L9-L14】
-- **Hourly aggregates**: `logs/hourly_averages.csv`, updated in-place with upsert semantics (one row per tag per hour).【F:CIP.py†L11-L14】
+- **Hourly aggregates**: `logs/hourly_averages.csv`, updated in-place with upsert semantics (one row per tag per hour, plus an optional `avg_lb_hr` column for EPA conversions).【F:CIP.py†L11-L14】
 - **System health**: `logs/system_health.json` tracks last poll times, disk space, error rate, and overall status for monitoring.【F:CIP.py†L130-L195】
 - **Other diagnostics**: threshold configuration, environment events, and QA flags are preserved alongside the log files.
 

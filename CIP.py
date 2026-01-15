@@ -3593,18 +3593,25 @@ class MainWindow(QMainWindow):
 
         ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
         if ppm_to_lbhr:
+            avg_by_hour: Dict[str, Dict[str, float]] = {}
+            for (hstart_iso, tag), (_, avg, _, _) in records.items():
+                if avg is None:
+                    continue
+                avg_by_hour.setdefault(hstart_iso, {})[tag] = avg
+
             for (hstart_iso, tag), (hend_iso, avg, lbhr_avg, count) in list(records.items()):
                 lbhr_tag = ppm_to_lbhr.get(tag)
                 if not lbhr_tag:
                     continue
                 lbhr_record = records.get((hstart_iso, lbhr_tag))
                 if lbhr_record:
-                    records[(hstart_iso, tag)] = (
-                        hend_iso,
-                        avg,
-                        lbhr_record[1],
-                        count,
-                    )
+                    lbhr_avg = lbhr_record[1]
+                elif lbhr_avg is None:
+                    avg_lookup = avg_by_hour.get(hstart_iso, {})
+                    derived = self._compute_lbhr_from_avg(tag, avg_lookup)
+                    if derived is not None:
+                        lbhr_avg = derived
+                records[(hstart_iso, tag)] = (hend_iso, avg, lbhr_avg, count)
 
         try:
             ensure_csv(

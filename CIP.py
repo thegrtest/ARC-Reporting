@@ -980,14 +980,19 @@ class MainWindow(QMainWindow):
         """Resolve alias mappings into {source_tag: plc_tag} using current alias map."""
         if not mappings:
             return {}
-        alias_to_tag = {alias: tag for tag, alias in self.alias_map.items() if alias}
+        alias_to_tag = {
+            alias.strip().casefold(): tag
+            for tag, alias in self.alias_map.items()
+            if isinstance(alias, str) and alias.strip()
+        }
+        tag_lookup = {tag.strip().casefold(): tag for tag in self.tag_order if tag}
         ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
         resolved: Dict[str, str] = {}
         for alias, target_tag in mappings.items():
-            source_tag = alias_to_tag.get(alias)
+            normalized_alias = alias.strip().casefold()
+            source_tag = alias_to_tag.get(normalized_alias)
             if not source_tag:
-                if alias in self.tag_order or alias in self.alias_map:
-                    source_tag = alias
+                source_tag = tag_lookup.get(normalized_alias)
             if not source_tag:
                 self.log_message(
                     f"Writeback mapping skipped: alias '{alias}' not found in configured tags."
@@ -1555,8 +1560,8 @@ class MainWindow(QMainWindow):
             "Enable writeback of current hour averages"
         )
         self.writeback_enabled_checkbox.setToolTip(
-            "When enabled, the app writes the current-hour average for each "
-            "mapped alias back to its PLC tag at the configured interval."
+            "When enabled, the app writes the current-hour average (lb/hr when available) "
+            "for each mapped alias back to its PLC tag at the configured interval."
         )
         cfg_layout.addRow(self.writeback_enabled_checkbox)
 
@@ -1573,7 +1578,7 @@ class MainWindow(QMainWindow):
             "Temperature | Program:MainRoutine.Temp_Avg_PLC\n"
             "Pressure | Program:MainRoutine.Pressure_Avg_PLC\n"
             "\n"
-            "Each line:  Alias  |  PLC Tag to receive current-hour average"
+            "Each line:  Alias  |  PLC Tag to receive current-hour average (lb/hr when available)"
         )
         cfg_layout.addRow(writeback_label, self.writeback_mappings_edit)
 

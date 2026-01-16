@@ -3346,7 +3346,16 @@ class MainWindow(QMainWindow):
             self.log_message(f"Error handling poll data: {e}")
 
     def _current_hour_averages(self) -> Dict[str, float]:
-        return self._hour_average_snapshot(include_partial_minute=True)
+        averages = self._hour_average_snapshot(include_partial_minute=True)
+        if self.epa_enabled:
+            ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
+            if ppm_to_lbhr:
+                avg_lookup = dict(averages)
+                for ppm_tag, lbhr_tag in ppm_to_lbhr.items():
+                    lbhr_value = self._compute_lbhr_from_avg(ppm_tag, avg_lookup)
+                    if lbhr_value is not None:
+                        averages[lbhr_tag] = lbhr_value
+        return averages
 
     @staticmethod
     def _is_valid_number(value: Optional[float]) -> bool:

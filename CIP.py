@@ -683,14 +683,14 @@ class WritebackThread(QThread):
         self,
         ip: str,
         interval_sec: int,
-        writeback_map: Dict[str, str],
+        writeback_mappings: List[Dict[str, str]],
         reconnect_delay_sec: int = 10,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self.ip = ip
         self.interval_sec = max(1, int(interval_sec))
-        self.writeback_map = dict(writeback_map)
+        self.writeback_mappings = list(writeback_mappings)
         self.reconnect_delay_sec = max(1, int(reconnect_delay_sec))
 
         self._running = False
@@ -715,22 +715,39 @@ class WritebackThread(QThread):
             return dict(self._current_averages)
 
     def _write_values(self, comm: "PLC", averages: Dict[str, float]) -> None:
-        for source_tag, target_tag in self.writeback_map.items():
+        for mapping in self.writeback_mappings:
+            source_tag = mapping.get("source_tag", "")
+            target_tag = mapping.get("target_tag", "")
+            alias = mapping.get("alias", "") or source_tag
+            if not source_tag or not target_tag:
+                continue
             if source_tag not in averages:
+                print(
+                    f"[WRITEBACK] Skipping {alias}: no current-hour average available."
+                )
                 continue
             value = averages.get(source_tag)
             if value is None:
                 continue
             try:
+                print(
+                    f"[WRITEBACK] Writing {alias} ({source_tag}) -> {target_tag} value={value}"
+                )
                 r = comm.Write(target_tag, float(value))
                 status = getattr(r, "Status", "Unknown")
+                print(
+                    f"[WRITEBACK] Result {alias} ({source_tag}) -> {target_tag}: {status}"
+                )
                 if str(status).lower() != "success":
                     self.error.emit(
-                        f"Writeback failed for '{source_tag}' -> '{target_tag}': {status}"
+                        f"Writeback failed for '{alias}' -> '{target_tag}': {status}"
                     )
             except Exception as e:
+                print(
+                    f"[WRITEBACK] Error {alias} ({source_tag}) -> {target_tag}: {e}"
+                )
                 self.error.emit(
-                    f"Writeback error for '{source_tag}' -> '{target_tag}': {e}"
+                    f"Writeback error for '{alias}' -> '{target_tag}': {e}"
                 )
 
     def run(self):
@@ -738,7 +755,7 @@ class WritebackThread(QThread):
             self.error.emit("pylogix is not installed. Run: pip install pylogix")
             return
 
-        if not self.writeback_map:
+        if not self.writeback_mappings:
             self.error.emit("Writeback is enabled but no mappings are configured.")
             return
 
@@ -751,7 +768,11 @@ class WritebackThread(QThread):
                     comm.IPAddress = self.ip
                     self.info.emit(
                         f"Connected to PLC at {self.ip} for hourly average writeback "
-                        f"({len(self.writeback_map)} mapping(s), interval={self.interval_sec}s)."
+                        f"({len(self.writeback_mappings)} mapping(s), interval={self.interval_sec}s)."
+                    )
+                    print(
+                        f"[WRITEBACK] Connected to PLC at {self.ip} "
+                        f"({len(self.writeback_mappings)} mappings)."
                     )
 
                     while self._should_run():
@@ -768,6 +789,7 @@ class WritebackThread(QThread):
                                 break
                             time.sleep(0.1)
             except Exception as e:
+                print(f"[WRITEBACK] PLC connection error: {e}")
                 self.error.emit(f"Writeback PLC connection error: {e}")
                 end_time = time.time() + self.reconnect_delay_sec
                 while time.time() < end_time:
@@ -798,6 +820,10 @@ class MainWindow(QMainWindow):
         "CO": 28.01,
         "O2": 32.0,
     }
+    WRITEBACK_VALUE_OPTIONS = [
+        ("Current Hour Avg", "current_avg"),
+        ("Current Hour Avg (lb/hr)", "current_avg_lbhr"),
+    ]
 
     def __init__(self):
         super().__init__()
@@ -951,14 +977,14 @@ class MainWindow(QMainWindow):
         return tags, alias_map
 
     @staticmethod
-    def parse_writeback_mappings(text: str) -> Dict[str, str]:
+    def parse_writeback_mappings(text: str) -> List[Dict[str, str]]:
         """
-        Parse writeback mappings into {alias: plc_tag}.
+        Parse legacy writeback mappings into rows.
         Accepts lines like:
             Alias | PLC_Tag
             Alias -> PLC_Tag
         """
-        mappings: Dict[str, str] = {}
+        mappings: List[Dict[str, str]] = []
         for line in text.splitlines():
             raw = line.strip()
             if not raw or raw.startswith("#"):
@@ -973,13 +999,19 @@ class MainWindow(QMainWindow):
             tag = tag_part.strip()
             if not alias or not tag:
                 continue
-            mappings[alias] = tag
+            mappings.append(
+                {
+                    "alias": alias,
+                    "value_type": "current_avg",
+                    "plc_tag": tag,
+                }
+            )
         return mappings
 
-    def _resolve_writeback_targets(self, mappings: Dict[str, str]) -> Dict[str, str]:
-        """Resolve alias mappings into {source_tag: plc_tag} using current alias map."""
+    def _resolve_writeback_targets(self, mappings: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Resolve alias mappings into writeback rows using current alias map."""
         if not mappings:
-            return {}
+            return []
         alias_to_tag = {
             alias.strip().casefold(): tag
             for tag, alias in self.alias_map.items()
@@ -987,9 +1019,15 @@ class MainWindow(QMainWindow):
         }
         tag_lookup = {tag.strip().casefold(): tag for tag in self.tag_order if tag}
         ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
-        resolved: Dict[str, str] = {}
-        for alias, target_tag in mappings.items():
-            normalized_alias = alias.strip().casefold()
+        epa_calc_tags = self._epa_calc_tags()
+        resolved: List[Dict[str, str]] = []
+        for entry in mappings:
+            alias = str(entry.get("alias", "") or "").strip()
+            target_tag = str(entry.get("plc_tag", "") or "").strip()
+            value_type = str(entry.get("value_type", "current_avg") or "current_avg").strip()
+            if not alias or not target_tag:
+                continue
+            normalized_alias = alias.casefold()
             source_tag = alias_to_tag.get(normalized_alias)
             if not source_tag:
                 source_tag = tag_lookup.get(normalized_alias)
@@ -998,10 +1036,85 @@ class MainWindow(QMainWindow):
                     f"Writeback mapping skipped: alias '{alias}' not found in configured tags."
                 )
                 continue
-            if source_tag in ppm_to_lbhr:
-                source_tag = ppm_to_lbhr[source_tag]
-            resolved[source_tag] = target_tag
+            if value_type == "current_avg_lbhr":
+                if source_tag in ppm_to_lbhr:
+                    source_tag = ppm_to_lbhr[source_tag]
+                elif source_tag not in epa_calc_tags:
+                    self.log_message(
+                        f"Writeback mapping skipped: lb/hr not available for alias '{alias}'."
+                    )
+                    continue
+            resolved.append(
+                {
+                    "alias": alias,
+                    "source_tag": source_tag,
+                    "target_tag": target_tag,
+                    "value_type": value_type,
+                }
+            )
         return resolved
+
+    def _writeback_value_combo(self, value_type: str) -> QComboBox:
+        combo = QComboBox()
+        for label, key in self.WRITEBACK_VALUE_OPTIONS:
+            combo.addItem(label, key)
+        index = combo.findData(value_type)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        return combo
+
+    def _add_writeback_row(
+        self, alias: str = "", value_type: str = "current_avg", plc_tag: str = ""
+    ) -> None:
+        row = self.writeback_table.rowCount()
+        self.writeback_table.insertRow(row)
+
+        alias_item = QTableWidgetItem(alias)
+        self.writeback_table.setItem(row, 0, alias_item)
+
+        combo = self._writeback_value_combo(value_type)
+        self.writeback_table.setCellWidget(row, 1, combo)
+
+        plc_item = QTableWidgetItem(plc_tag)
+        self.writeback_table.setItem(row, 2, plc_item)
+
+    def _remove_writeback_row(self) -> None:
+        rows = sorted({idx.row() for idx in self.writeback_table.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
+        for row in rows:
+            self.writeback_table.removeRow(row)
+
+    def _collect_writeback_mappings(self) -> List[Dict[str, str]]:
+        mappings: List[Dict[str, str]] = []
+        for row in range(self.writeback_table.rowCount()):
+            alias_item = self.writeback_table.item(row, 0)
+            plc_item = self.writeback_table.item(row, 2)
+            alias = alias_item.text().strip() if alias_item else ""
+            plc_tag = plc_item.text().strip() if plc_item else ""
+            combo = self.writeback_table.cellWidget(row, 1)
+            value_type = "current_avg"
+            if isinstance(combo, QComboBox):
+                value_type = str(combo.currentData() or "current_avg")
+            if not alias or not plc_tag:
+                continue
+            mappings.append(
+                {
+                    "alias": alias,
+                    "value_type": value_type,
+                    "plc_tag": plc_tag,
+                }
+            )
+        return mappings
+
+    def _populate_writeback_table(self, mappings: List[Dict[str, str]]) -> None:
+        self.writeback_table.setRowCount(0)
+        for entry in mappings:
+            alias = str(entry.get("alias", "") or "")
+            value_type = str(entry.get("value_type", "current_avg") or "current_avg")
+            plc_tag = str(entry.get("plc_tag", "") or "")
+            if not alias and not plc_tag:
+                continue
+            self._add_writeback_row(alias=alias, value_type=value_type, plc_tag=plc_tag)
 
     # -------- raw CSV path helpers (daily rotation) --------
 
@@ -1561,7 +1674,7 @@ class MainWindow(QMainWindow):
         )
         self.writeback_enabled_checkbox.setToolTip(
             "When enabled, the app writes the current-hour average (lb/hr when available) "
-            "for each mapped alias back to its PLC tag at the configured interval."
+            "for each mapped alias/value type back to its PLC tag at the configured interval."
         )
         cfg_layout.addRow(self.writeback_enabled_checkbox)
 
@@ -1580,7 +1693,29 @@ class MainWindow(QMainWindow):
             "\n"
             "Each line:  Alias  |  PLC Tag to receive current-hour average (lb/hr when available)"
         )
-        cfg_layout.addRow(writeback_label, self.writeback_mappings_edit)
+        self.writeback_table.setMinimumHeight(140)
+
+        writeback_btns = QHBoxLayout()
+        self.writeback_add_btn = QPushButton("Add Mapping")
+        self.writeback_remove_btn = QPushButton("Remove Selected")
+        self.writeback_add_btn.clicked.connect(self._add_writeback_row)
+        self.writeback_remove_btn.clicked.connect(self._remove_writeback_row)
+        writeback_btns.addWidget(self.writeback_add_btn)
+        writeback_btns.addWidget(self.writeback_remove_btn)
+        writeback_btns.addStretch(1)
+
+        writeback_help = QLabel(
+            "Select the alias and the value type (current hour avg or lb/hr) "
+            "to send back to the PLC tag."
+        )
+        writeback_help.setWordWrap(True)
+        writeback_help.setStyleSheet("color: #90a4ae; font-size: 11px;")
+
+        writeback_layout.addWidget(self.writeback_table)
+        writeback_layout.addLayout(writeback_btns)
+        writeback_layout.addWidget(writeback_help)
+
+        cfg_layout.addRow(writeback_label, writeback_container)
 
         tags_label = QLabel("Tags to Poll (one per line):")
         self.tags_edit = QTextEdit()
@@ -2404,8 +2539,12 @@ class MainWindow(QMainWindow):
         self.writeback_enabled_checkbox.setChecked(writeback_enabled)
         self.writeback_interval_sec = int(data.get("writeback_interval_sec", 60))
         self.writeback_interval_spin.setValue(self.writeback_interval_sec)
-        writeback_mappings = data.get("writeback_mappings", "")
-        self.writeback_mappings_edit.setPlainText(str(writeback_mappings))
+        writeback_mappings = data.get("writeback_mappings", [])
+        if isinstance(writeback_mappings, list):
+            self._populate_writeback_table(writeback_mappings)
+        else:
+            legacy_mappings = self.parse_writeback_mappings(str(writeback_mappings))
+            self._populate_writeback_table(legacy_mappings)
 
         self.lockdown_enabled = bool(data.get("lockdown_enabled", False))
         prev_block = self.lockdown_checkbox.blockSignals(True)
@@ -2445,7 +2584,7 @@ class MainWindow(QMainWindow):
             "heartbeat_enabled": self.heartbeat_mode_combo.currentIndex() == 1,
             "writeback_enabled": self.writeback_enabled_checkbox.isChecked(),
             "writeback_interval_sec": self.writeback_interval_spin.value(),
-            "writeback_mappings": self.writeback_mappings_edit.toPlainText(),
+            "writeback_mappings": self._collect_writeback_mappings(),
             "stale_intervals": self.stale_spin.value(),
             "gap_threshold_minutes": self.gap_spin.value(),
             "moving_tags": [t.strip() for t in self.moving_tags_edit.text().split(",") if t.strip()],
@@ -2605,7 +2744,9 @@ class MainWindow(QMainWindow):
             self.heartbeat_mode_combo,
             self.writeback_enabled_checkbox,
             self.writeback_interval_spin,
-            self.writeback_mappings_edit,
+            self.writeback_table,
+            self.writeback_add_btn,
+            self.writeback_remove_btn,
             self.tags_edit,
             self.thresholds_table,
             self.thresholds_add_btn,
@@ -2955,9 +3096,7 @@ class MainWindow(QMainWindow):
         if not self.writeback_enabled_checkbox.isChecked():
             return
 
-        mappings = self.parse_writeback_mappings(
-            self.writeback_mappings_edit.toPlainText()
-        )
+        mappings = self._collect_writeback_mappings()
         resolved = self._resolve_writeback_targets(mappings)
         if not resolved:
             self.log_message(
@@ -2969,7 +3108,7 @@ class MainWindow(QMainWindow):
         self.writeback_thread = WritebackThread(
             ip=ip,
             interval_sec=interval_sec,
-            writeback_map=resolved,
+            writeback_mappings=resolved,
             parent=self,
         )
         self.writeback_thread.info.connect(self.log_message)

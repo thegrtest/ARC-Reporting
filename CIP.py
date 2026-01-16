@@ -1683,24 +1683,15 @@ class MainWindow(QMainWindow):
         self.writeback_interval_spin.setValue(self.writeback_interval_sec)
         cfg_layout.addRow(QLabel("Writeback Interval (seconds):"), self.writeback_interval_spin)
 
-        writeback_label = QLabel("Writeback Mappings:")
-        writeback_container = QWidget()
-        writeback_layout = QVBoxLayout(writeback_container)
-        writeback_layout.setContentsMargins(0, 0, 0, 0)
-        writeback_layout.setSpacing(6)
-
-        self.writeback_table = QTableWidget(0, 3)
-        self.writeback_table.setHorizontalHeaderLabels(
-            ["Alias", "Value to Send", "PLC Tag"]
-        )
-        self.writeback_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.Stretch
-        )
-        self.writeback_table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeToContents
-        )
-        self.writeback_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.Stretch
+        writeback_label = QLabel("Writeback Mappings (Alias | PLC Tag):")
+        self.writeback_mappings_edit = QTextEdit()
+        self.writeback_mappings_edit.setMinimumHeight(110)
+        self.writeback_mappings_edit.setPlaceholderText(
+            "Examples:\n"
+            "Temperature | Program:MainRoutine.Temp_Avg_PLC\n"
+            "Pressure | Program:MainRoutine.Pressure_Avg_PLC\n"
+            "\n"
+            "Each line:  Alias  |  PLC Tag to receive current-hour average (lb/hr when available)"
         )
         self.writeback_table.setMinimumHeight(140)
 

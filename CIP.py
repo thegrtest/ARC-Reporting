@@ -1012,12 +1012,6 @@ class MainWindow(QMainWindow):
         """Resolve alias mappings into writeback rows using current alias map."""
         if not mappings:
             return []
-        alias_to_tag = {
-            alias.strip().casefold(): tag
-            for tag, alias in self.alias_map.items()
-            if isinstance(alias, str) and alias.strip()
-        }
-        tag_lookup = {tag.strip().casefold(): tag for tag in self.tag_order if tag}
         ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
         epa_calc_tags = self._epa_calc_tags()
         resolved: List[Dict[str, str]] = []
@@ -1027,10 +1021,7 @@ class MainWindow(QMainWindow):
             value_type = str(entry.get("value_type", "current_avg") or "current_avg").strip()
             if not alias or not target_tag:
                 continue
-            normalized_alias = alias.casefold()
-            source_tag = alias_to_tag.get(normalized_alias)
-            if not source_tag:
-                source_tag = tag_lookup.get(normalized_alias)
+            source_tag = self._resolve_alias_to_tag(alias)
             if not source_tag:
                 self.log_message(
                     f"Writeback mapping skipped: alias '{alias}' not found in configured tags."
@@ -1061,6 +1052,46 @@ class MainWindow(QMainWindow):
         index = combo.findData(value_type)
         combo.setCurrentIndex(index if index >= 0 else 0)
         return combo
+
+    def _resolve_alias_to_tag(self, alias: str) -> str:
+        normalized_alias = alias.strip().casefold()
+        alias_to_tag = {
+            alias.strip().casefold(): tag
+            for tag, alias in self.alias_map.items()
+            if isinstance(alias, str) and alias.strip()
+        }
+        if normalized_alias in alias_to_tag:
+            return alias_to_tag[normalized_alias]
+        for tag in self.tag_order:
+            if isinstance(tag, str) and tag.strip().casefold() == normalized_alias:
+                return tag
+        return ""
+
+    def _lbhr_available_for_alias(self, alias: str) -> bool:
+        if not self.epa_enabled:
+            return False
+        source_tag = self._resolve_alias_to_tag(alias)
+        if not source_tag:
+            return False
+        ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
+        if source_tag in ppm_to_lbhr:
+            return True
+        return source_tag in self._epa_calc_tags()
+
+    def _update_writeback_value_options(self, alias: str, combo: QComboBox) -> None:
+        current = combo.currentData() or "current_avg"
+        allow_lbhr = self._lbhr_available_for_alias(alias)
+        combo.blockSignals(True)
+        combo.clear()
+        for label, key in self.WRITEBACK_VALUE_OPTIONS:
+            if key == "current_avg_lbhr" and not allow_lbhr:
+                continue
+            combo.addItem(label, key)
+        if combo.findData(current) < 0:
+            current = "current_avg"
+        index = combo.findData(current)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
 
     def _available_writeback_aliases(self) -> List[str]:
         tags, alias_map = self.parse_tags_and_aliases(self.tags_edit.toPlainText())
@@ -1097,6 +1128,10 @@ class MainWindow(QMainWindow):
         self.writeback_table.setCellWidget(row, 0, alias_combo)
 
         combo = self._writeback_value_combo(value_type)
+        self._update_writeback_value_options(alias_combo.currentText().strip(), combo)
+        alias_combo.currentTextChanged.connect(
+            lambda text, combo=combo: self._update_writeback_value_options(text, combo)
+        )
         self.writeback_table.setCellWidget(row, 1, combo)
 
         plc_item = QTableWidgetItem(plc_tag)
@@ -1157,6 +1192,9 @@ class MainWindow(QMainWindow):
             alias_combo.addItems(options)
             alias_combo.setCurrentText(current)
             alias_combo.blockSignals(False)
+            value_combo = self.writeback_table.cellWidget(row, 1)
+            if isinstance(value_combo, QComboBox):
+                self._update_writeback_value_options(current, value_combo)
 
     # -------- raw CSV path helpers (daily rotation) --------
 

@@ -696,6 +696,47 @@ def load_configured_tags_from_settings() -> List[str]:
     return tags
 
 
+def parse_tags_and_aliases(text: str) -> Tuple[List[str], Dict[str, str]]:
+    """
+    Parse tags from settings text and return (tags, alias_map).
+    Supports optional aliases in the format "Tag|Alias".
+    """
+    if not isinstance(text, str):
+        return [], {}
+
+    tags: List[str] = []
+    alias_map: Dict[str, str] = {}
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        if "|" in raw:
+            tag_part, alias_part = raw.split("|", 1)
+            tag = tag_part.strip()
+            alias = alias_part.strip()
+        else:
+            tag = raw
+            alias = ""
+        if not tag:
+            continue
+        tags.append(tag)
+        if alias:
+            alias_map[tag] = alias
+    return tags, alias_map
+
+
+def resolve_tag_from_alias(name: str, alias_map: Dict[str, str]) -> str:
+    if not name:
+        return ""
+    if name in alias_map:
+        return name
+    normalized = name.strip().casefold()
+    for tag, alias in alias_map.items():
+        if isinstance(alias, str) and alias.strip().casefold() == normalized:
+            return tag
+    return name
+
+
 def load_epa_ppm_to_lbhr_map() -> Dict[str, str]:
     if not os.path.exists(SETTINGS_JSON):
         return {}
@@ -709,9 +750,11 @@ def load_epa_ppm_to_lbhr_map() -> Dict[str, str]:
         return {}
 
     mapping: Dict[str, str] = {}
-    nox_tag = str(data.get("epa_nox_tag", "") or "")
-    co_tag = str(data.get("epa_co_tag", "") or "")
-    o2_tag = str(data.get("epa_o2_tag", "") or "")
+    tags_text = data.get("tags", "")
+    _, alias_map = parse_tags_and_aliases(tags_text)
+    nox_tag = resolve_tag_from_alias(str(data.get("epa_nox_tag", "") or ""), alias_map)
+    co_tag = resolve_tag_from_alias(str(data.get("epa_co_tag", "") or ""), alias_map)
+    o2_tag = resolve_tag_from_alias(str(data.get("epa_o2_tag", "") or ""), alias_map)
 
     if nox_tag:
         mapping[nox_tag] = "EPA19:NOx_LBHR"
@@ -734,14 +777,24 @@ def load_epa_settings() -> Dict[str, object]:
     if not isinstance(data, dict):
         return {}
 
+    tags_text = data.get("tags", "")
+    _, alias_map = parse_tags_and_aliases(tags_text)
     return {
         "epa_enabled": bool(data.get("epa_enabled", False)),
-        "epa_flow_tag": str(data.get("epa_flow_tag", "") or ""),
-        "epa_o2_tag": str(data.get("epa_o2_tag", "") or ""),
+        "epa_flow_tag": resolve_tag_from_alias(
+            str(data.get("epa_flow_tag", "") or ""), alias_map
+        ),
+        "epa_o2_tag": resolve_tag_from_alias(
+            str(data.get("epa_o2_tag", "") or ""), alias_map
+        ),
         "epa_o2_units": str(data.get("epa_o2_units", "percent") or "percent"),
         "epa_ref_o2_pct": float(data.get("epa_ref_o2_pct", 3.0) or 3.0),
-        "epa_nox_tag": str(data.get("epa_nox_tag", "") or ""),
-        "epa_co_tag": str(data.get("epa_co_tag", "") or ""),
+        "epa_nox_tag": resolve_tag_from_alias(
+            str(data.get("epa_nox_tag", "") or ""), alias_map
+        ),
+        "epa_co_tag": resolve_tag_from_alias(
+            str(data.get("epa_co_tag", "") or ""), alias_map
+        ),
     }
 
 

@@ -2095,15 +2095,32 @@ class MainWindow(QMainWindow):
             "O2": "EPA19:O2_LBHR",
         }
 
+    def _resolve_tag_from_alias(self, name: str) -> str:
+        if not name:
+            return ""
+        if name in self.alias_map:
+            return name
+        normalized = name.strip().casefold()
+        for tag, alias in self.alias_map.items():
+            if isinstance(alias, str) and alias.strip().casefold() == normalized:
+                return tag
+        return name
+
+    def _epa_calc_tags(self) -> set:
+        return set(self._epa_calc_tag_names().values())
+
     def _epa_ppm_to_lbhr_map(self) -> Dict[str, str]:
         calc_tags = self._epa_calc_tag_names()
         mapping: Dict[str, str] = {}
-        if self.epa_nox_tag:
-            mapping[self.epa_nox_tag] = calc_tags["NOx"]
-        if self.epa_co_tag:
-            mapping[self.epa_co_tag] = calc_tags["CO"]
-        if self.epa_o2_tag:
-            mapping[self.epa_o2_tag] = calc_tags["O2"]
+        nox_tag = self._resolve_tag_from_alias(self.epa_nox_tag)
+        co_tag = self._resolve_tag_from_alias(self.epa_co_tag)
+        o2_tag = self._resolve_tag_from_alias(self.epa_o2_tag)
+        if nox_tag:
+            mapping[nox_tag] = calc_tags["NOx"]
+        if co_tag:
+            mapping[co_tag] = calc_tags["CO"]
+        if o2_tag:
+            mapping[o2_tag] = calc_tags["O2"]
         return mapping
 
     def _get_numeric_from_poll(self, data: Dict[str, Tuple[object, str]], tag: str) -> Optional[float]:
@@ -2161,8 +2178,8 @@ class MainWindow(QMainWindow):
         if not self.epa_enabled:
             return None
 
-        flow_tag = self.epa_flow_tag
-        o2_tag = self.epa_o2_tag
+        flow_tag = self._resolve_tag_from_alias(self.epa_flow_tag)
+        o2_tag = self._resolve_tag_from_alias(self.epa_o2_tag)
         if not (flow_tag and o2_tag):
             return None
 
@@ -2174,10 +2191,14 @@ class MainWindow(QMainWindow):
         o2_avg = avg_lookup.get(o2_tag)
         o2_pct, o2_ppmv = self._epa_o2_values(o2_avg)
 
-        if tag == self.epa_o2_tag:
+        nox_tag = self._resolve_tag_from_alias(self.epa_nox_tag)
+        co_tag = self._resolve_tag_from_alias(self.epa_co_tag)
+        o2_tag = self._resolve_tag_from_alias(self.epa_o2_tag)
+
+        if tag == o2_tag:
             ppmv = o2_ppmv
             pollutant = "O2"
-        elif tag == self.epa_nox_tag:
+        elif tag == nox_tag:
             pollutant = "NOx"
             if o2_pct is None:
                 return None
@@ -2185,7 +2206,7 @@ class MainWindow(QMainWindow):
             if corrected is None:
                 return None
             ppmv = corrected
-        elif tag == self.epa_co_tag:
+        elif tag == co_tag:
             pollutant = "CO"
             if o2_pct is None:
                 return None
@@ -2209,20 +2230,25 @@ class MainWindow(QMainWindow):
         if not self.epa_enabled:
             return {}
 
-        flow = self._get_numeric_from_poll(data, self.epa_flow_tag)
+        flow_tag = self._resolve_tag_from_alias(self.epa_flow_tag)
+        o2_tag = self._resolve_tag_from_alias(self.epa_o2_tag)
+        nox_tag = self._resolve_tag_from_alias(self.epa_nox_tag)
+        co_tag = self._resolve_tag_from_alias(self.epa_co_tag)
+
+        flow = self._get_numeric_from_poll(data, flow_tag)
         if flow is None:
             return {}
 
-        raw_o2 = self._get_numeric_from_poll(data, self.epa_o2_tag)
+        raw_o2 = self._get_numeric_from_poll(data, o2_tag)
         o2_pct, o2_ppmv = self._epa_o2_values(raw_o2)
         calc_tags = self._epa_calc_tag_names()
 
         results: Dict[str, Tuple[float, str]] = {}
         status_success = "success"
         pollutant_map = [
-            ("NOx", self.epa_nox_tag, True),
-            ("CO", self.epa_co_tag, True),
-            ("O2", self.epa_o2_tag, False),
+            ("NOx", nox_tag, True),
+            ("CO", co_tag, True),
+            ("O2", o2_tag, False),
         ]
 
         for pollutant, tag, needs_correction in pollutant_map:
@@ -2232,7 +2258,7 @@ class MainWindow(QMainWindow):
             if raw_val is None:
                 continue
             if pollutant == "O2":
-                ppmv = o2_ppmv if tag == self.epa_o2_tag else raw_val
+                ppmv = o2_ppmv if tag == o2_tag else raw_val
             else:
                 ppmv = raw_val
             if ppmv is None:
@@ -2749,7 +2775,12 @@ class MainWindow(QMainWindow):
         self.epa_nox_tag = self.epa_nox_tag_edit.text().strip()
         self.epa_co_tag = self.epa_co_tag_edit.text().strip()
 
-        epa_tags = [self.epa_flow_tag, self.epa_o2_tag, self.epa_nox_tag, self.epa_co_tag]
+        resolved_flow_tag = self._resolve_tag_from_alias(self.epa_flow_tag)
+        resolved_o2_tag = self._resolve_tag_from_alias(self.epa_o2_tag)
+        resolved_nox_tag = self._resolve_tag_from_alias(self.epa_nox_tag)
+        resolved_co_tag = self._resolve_tag_from_alias(self.epa_co_tag)
+
+        epa_tags = [resolved_flow_tag, resolved_o2_tag, resolved_nox_tag, resolved_co_tag]
         for epa_tag in epa_tags:
             if epa_tag and epa_tag not in tags:
                 tags.append(epa_tag)
@@ -3119,7 +3150,11 @@ class MainWindow(QMainWindow):
         return isinstance(value, (int, float)) and value == value
 
     def _ppm_cap_tags(self) -> set:
-        return {tag for tag in (self.epa_nox_tag, self.epa_co_tag) if tag}
+        tags = [
+            self._resolve_tag_from_alias(self.epa_nox_tag),
+            self._resolve_tag_from_alias(self.epa_co_tag),
+        ]
+        return {tag for tag in tags if tag}
 
     def _apply_minute_cap(self, tag: str, avg: float) -> float:
         if tag in self._ppm_cap_tags() and avg > 3000:
@@ -3379,22 +3414,24 @@ class MainWindow(QMainWindow):
                 lb_avg = sum(lb_values) / len(lb_values) if lb_values else None
                 if lb_avg is None:
                     avg_lookup = {tag: avg_val}
+                    flow_tag = self._resolve_tag_from_alias(self.epa_flow_tag)
                     flow_avg = self._rolling_avg_for_tag(
                         tag_entries,
-                        self.epa_flow_tag,
+                        flow_tag,
                         window_start,
                         window_end,
                     )
                     if flow_avg is not None:
-                        avg_lookup[self.epa_flow_tag] = flow_avg
+                        avg_lookup[flow_tag] = flow_avg
+                    o2_tag = self._resolve_tag_from_alias(self.epa_o2_tag)
                     o2_avg = self._rolling_avg_for_tag(
                         tag_entries,
-                        self.epa_o2_tag,
+                        o2_tag,
                         window_start,
                         window_end,
                     )
                     if o2_avg is not None:
-                        avg_lookup[self.epa_o2_tag] = o2_avg
+                        avg_lookup[o2_tag] = o2_avg
                     derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
                     if derived_lbhr is not None:
                         lb_avg = derived_lbhr
@@ -3449,6 +3486,7 @@ class MainWindow(QMainWindow):
 
         self.last_hour_avg.clear()
         self.last_hour_avg.update(avg_lookup)
+        epa_calc_tags = self._epa_calc_tags()
 
         for tag, acc in self.hour_accumulators.items():
             if acc["count"] <= 0:
@@ -3462,6 +3500,8 @@ class MainWindow(QMainWindow):
                 derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
                 if derived_lbhr is not None:
                     lbhr_avg = derived_lbhr
+            if tag in epa_calc_tags and lbhr_avg is None:
+                lbhr_avg = avg
             records[key] = (hour_end_iso, avg, lbhr_avg, int(acc["count"]))
 
         try:
@@ -3598,6 +3638,7 @@ class MainWindow(QMainWindow):
             return
 
         ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
+        epa_calc_tags = self._epa_calc_tags()
         if ppm_to_lbhr:
             avg_by_hour: Dict[str, Dict[str, float]] = {}
             for (hstart_iso, tag), (_, avg, _, _) in records.items():
@@ -3618,6 +3659,9 @@ class MainWindow(QMainWindow):
                     if derived is not None:
                         lbhr_avg = derived
                 records[(hstart_iso, tag)] = (hend_iso, avg, lbhr_avg, count)
+        for (hstart_iso, tag), (hend_iso, avg, lbhr_avg, count) in list(records.items()):
+            if tag in epa_calc_tags and avg is not None and lbhr_avg is None:
+                records[(hstart_iso, tag)] = (hend_iso, avg, avg, count)
 
         try:
             ensure_csv(

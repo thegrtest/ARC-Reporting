@@ -5,15 +5,15 @@
 Dash web dashboard for CIP Tag Poller
 
 Reads:
-    logs/raw_data_YYYY-MM-DD.csv   (latest day for live/current & live-hour avg)
+    logs/raw_data_YYYY-MM-DD.csv   (latest day for current-hour averages)
     logs/hourly_averages.csv       (hourly aggregates)
     logs/rolling_12hr_averages.csv (rolling 12-hour averages)
 
 Exposes a network dashboard with:
     - For EVERY tag:
-        * Gauge: Current Value
-        * Gauge: Last Full Hour Average
-        * Gauge: Live Hourly Average (current hour so far)
+        * Gauge: Current Hourly Average
+        * Gauge: Last Hour Average
+        * Gauge: Rolling 12-hour Average
     - Color-coded gauges using thresholds.json (configurable in Thresholds tab).
 
 Run:
@@ -1336,7 +1336,6 @@ GAUGE_CONTAINER_STYLE = {
 
 def build_tag_card(
     tag: str,
-    latest: Dict[str, Tuple[float, str]],
     last_hour_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
     rolling_12hr_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
     current_hour_avg: Dict[str, float],
@@ -1346,13 +1345,11 @@ def build_tag_card(
 ) -> html.Div:
     """
     Build a card with gauges for a single tag:
-        - Current Value (falls back to last full hour if no live sample)
-        - Last Full Hour
-        - Live Hourly Average (current hour so far)
+        - Current Hourly Average
+        - Last Hour Average
         - Rolling 12-hour Average (from hourly averages)
     """
     # base values
-    cur_val, cur_plc_status = latest.get(tag, (float("nan"), "No data"))
     last_avg, last_lb_hr_avg, hs, he, sample_count = last_hour_stats.get(
         tag, (float("nan"), float("nan"), None, None, 0)
     )
@@ -1383,14 +1380,6 @@ def build_tag_card(
             rolling_lb_hr_avg = computed_roll_lbhr
             derived_roll_lbhr = True
 
-    # If we have no live "current" value but we do have a last full hour,
-    # use that for the current gauge so it doesn't display "non-numeric".
-    derived_current = False
-    if cur_val != cur_val and last_avg == last_avg:  # NaN current, finite last_avg
-        cur_val = last_avg
-        cur_plc_status = "Derived from last full hour"
-        derived_current = True
-
     entry = thresholds.get(tag, {}) if isinstance(thresholds.get(tag, {}), dict) else {}
 
     alias = entry.get("alias") if isinstance(entry.get("alias"), str) else None
@@ -1402,7 +1391,7 @@ def build_tag_card(
     high_limit = entry.get("high_limit")
 
     # Derive gauge ranges using operational thresholds first, then limits, then data
-    sample_vals = [cur_val, last_avg, live_hr_val, rolling_avg]
+    sample_vals = [last_avg, live_hr_val, rolling_avg]
     low_for_range = low_oper if low_oper is not None else low_limit
     high_for_range = high_oper if high_oper is not None else high_limit
     low_eff, high_eff, gmin, gmax = compute_gauge_range(
@@ -1414,12 +1403,10 @@ def build_tag_card(
     high_for_class = high_oper if high_oper is not None else high_eff
 
     # Classification
-    cur_status_eval = classify_value(cur_val, low_for_class, high_for_class)
     last_status_eval = classify_value(last_avg, low_for_class, high_for_class)
     live_hr_status_eval = classify_value(live_hr_val, low_for_class, high_for_class)
     rolling_status_eval = classify_value(rolling_avg, low_for_class, high_for_class)
 
-    cur_color = status_color(cur_status_eval)
     last_color = status_color(last_status_eval)
     live_hr_color = status_color(live_hr_status_eval)
     rolling_color = status_color(rolling_status_eval)
@@ -1435,17 +1422,6 @@ def build_tag_card(
         return ""
 
     # Labels with 2 decimal places
-    if cur_val == cur_val:
-        prefix = "Current"
-        if derived_current:
-            prefix = "Current (from last full hour)"
-        cur_label_text = (
-            f"{prefix}: {cur_val:.2f} (PLC: {cur_plc_status}, eval: {cur_status_eval})"
-            f"{limit_note(cur_val)}"
-        )
-    else:
-        cur_label_text = f"Current: no data (PLC: {cur_plc_status})"
-
     if last_avg == last_avg and hs is not None and he is not None and sample_count > 0:
         try:
             hs_s = hs.strftime("%Y-%m-%d %H:%M")
@@ -1454,25 +1430,25 @@ def build_tag_card(
             hs_s = str(hs)
             he_s = str(he)
         last_label_text = (
-            f"Last full hour {hs_s}-{he_s}: {last_avg:.2f} "
+            f"Last hour {hs_s}-{he_s}: {last_avg:.2f} "
             f"(samples: {sample_count}, eval: {last_status_eval})"
             f"{limit_note(last_avg)}"
         )
         if last_lb_hr_avg == last_lb_hr_avg:
             last_label_text = f"{last_label_text} • lb/hr avg: {last_lb_hr_avg:.2f}"
     else:
-        last_label_text = "Last full hour: no data"
+        last_label_text = "Last hour: no data"
 
     if live_hr_val == live_hr_val:
         live_hr_label_text = (
-            f"Live hourly average: {live_hr_val:.2f} "
+            f"Current hourly average: {live_hr_val:.2f} "
             f"(current hour, eval: {live_hr_status_eval})"
             f"{limit_note(live_hr_val)}"
         )
         if live_lb_hr_val == live_lb_hr_val:
             live_hr_label_text = f"{live_hr_label_text} • lb/hr avg: {live_lb_hr_val:.2f}"
     else:
-        live_hr_label_text = "Live hourly average: no data"
+        live_hr_label_text = "Current hourly average: no data"
 
     if rolling_avg == rolling_avg and ws is not None and we is not None and rolling_count > 0:
         try:
@@ -1496,29 +1472,10 @@ def build_tag_card(
 
     gauge_size = 170
 
-    current_gauge = html.Div(
-        style=GAUGE_CONTAINER_STYLE,
-        children=[
-            html.Div("Current", style={"marginBottom": "4px", "fontWeight": "600"}),
-            daq.Gauge(
-                id={"type": "gauge", "tag": tag, "kind": "current"},
-                min=gmin,
-                max=gmax,
-                value=cur_val if cur_val == cur_val else gmin,
-                showCurrentValue=True,
-                color=cur_color,
-                label="",
-                size=gauge_size,
-                units="",
-            ),
-            html.Div(cur_label_text, style={"fontSize": "11px", "marginTop": "4px"}),
-        ],
-    )
-
     last_hour_gauge = html.Div(
         style=GAUGE_CONTAINER_STYLE,
         children=[
-            html.Div("Last Full Hour", style={"marginBottom": "4px", "fontWeight": "600"}),
+            html.Div("Last Hour Average", style={"marginBottom": "4px", "fontWeight": "600"}),
             daq.Gauge(
                 id={"type": "gauge", "tag": tag, "kind": "last_hour"},
                 min=gmin,
@@ -1538,7 +1495,7 @@ def build_tag_card(
         style=GAUGE_CONTAINER_STYLE,
         children=[
             html.Div(
-                "Live Hourly Average",
+                "Current Hourly Average",
                 style={"marginBottom": "4px", "fontWeight": "600"},
             ),
             daq.Gauge(
@@ -1624,7 +1581,7 @@ def build_tag_card(
 
     gauges_row = html.Div(
         style=GAUGE_ROW_STYLE,
-        children=[current_gauge, last_hour_gauge, live_hour_gauge, rolling_gauge],
+        children=[live_hour_gauge, last_hour_gauge, rolling_gauge],
     )
 
     return html.Div(style=CARD_STYLE, children=[header, gauges_row])
@@ -2348,7 +2305,6 @@ def update_dashboard(n):
         for tag in all_tags:
             card = build_tag_card(
                 tag=tag,
-                latest=latest_by_tag,
                 last_hour_stats=last_hour_stats,
                 rolling_12hr_stats=rolling_12hr_stats,
                 current_hour_avg=current_hour_avg,

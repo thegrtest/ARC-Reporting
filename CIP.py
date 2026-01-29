@@ -998,6 +998,20 @@ class MainWindow(QMainWindow):
         )
         self._load_latest_rolling_12hr()
         self._start_poll_watchdog()
+        QTimer.singleShot(0, self._auto_start_on_launch)
+
+    def _auto_start_on_launch(self) -> None:
+        if self.poll_thread and self.poll_thread.isRunning():
+            return
+        ip = self.ip_edit.text().strip()
+        tags_text = self.tags_edit.toPlainText().strip()
+        if not ip or not tags_text:
+            self.log_message(
+                "Auto-start skipped: IP address or tags list is empty."
+            )
+            return
+        self.log_message("Auto-starting polling on launch.")
+        self.start_polling()
 
     def _apply_initial_size(self) -> None:
         """Scale the window to fit the available screen while remaining sizable."""

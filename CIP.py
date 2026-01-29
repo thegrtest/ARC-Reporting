@@ -9,6 +9,7 @@ Features
 - Polls a list of PLC tags at a configurable interval (default 10s) using pylogix.
 - Logs all raw samples to logs/raw_data_YYYY-MM-DD.csv:
     timestamp, date, time, tag, alias, value, status
+- Aggregates data into minute averages and writes to logs/minute_averages.csv.
 - Aggregates data into hourly averages (1–2pm, 2–3pm, …) and writes to
   logs/hourly_averages.csv with UPSERT semantics:
   for each (hour_start, tag) there is at most one row (latest wins).
@@ -57,7 +58,9 @@ import time
 import hashlib
 import getpass
 import gzip
+import glob
 import shutil
+import tempfile
 import traceback
 from collections import deque
 from datetime import datetime, timedelta, date
@@ -117,6 +120,68 @@ def ensure_csv(path: str, headers: List[str]) -> None:
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(headers)
+
+
+def export_log_bundle(
+    log_dir: str,
+    export_dir: Optional[str] = None,
+    extra_paths: Optional[List[str]] = None,
+) -> str:
+    """
+    Bundle CIP logs/settings into a zip archive for safe export.
+
+    Returns the path to the zip archive.
+    """
+    log_dir = os.path.abspath(log_dir)
+    if not os.path.isdir(log_dir):
+        raise FileNotFoundError(f"Log directory not found: {log_dir}")
+
+    export_root = os.path.abspath(export_dir or log_dir)
+    ensure_dir(export_root)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bundle_dir = tempfile.mkdtemp(prefix="cip_export_")
+    logs_dir = os.path.join(bundle_dir, "logs")
+    ensure_dir(logs_dir)
+
+    patterns = [
+        "raw_data_*.csv",
+        "raw_data_*.csv.gz",
+        "minute_averages.csv",
+        "hourly_averages.csv",
+        "rolling_12hr_averages.csv",
+        "env_events.csv",
+        "thresholds.json",
+        "config_changes.csv",
+        "system_health.json",
+    ]
+    if extra_paths:
+        patterns.extend(extra_paths)
+
+    for pattern in patterns:
+        if "*" in pattern:
+            matches = glob.glob(os.path.join(log_dir, pattern))
+        else:
+            matches = [os.path.join(log_dir, pattern)]
+        for src in matches:
+            if not os.path.exists(src):
+                continue
+            dest = os.path.join(logs_dir, os.path.basename(src))
+            try:
+                shutil.copy2(src, dest)
+            except Exception:
+                continue
+
+    settings_path = os.path.abspath(MainWindow.SETTINGS_FILE)
+    if os.path.exists(settings_path):
+        try:
+            shutil.copy2(settings_path, os.path.join(bundle_dir, os.path.basename(settings_path)))
+        except Exception:
+            pass
+
+    archive_base = os.path.join(export_root, f"cip_export_{timestamp}")
+    archive_path = shutil.make_archive(archive_base, "zip", root_dir=bundle_dir)
+    shutil.rmtree(bundle_dir, ignore_errors=True)
+    return archive_path
 
 
 def _to_float(val: object) -> Optional[float]:
@@ -897,6 +962,7 @@ class MainWindow(QMainWindow):
         self.log_dir = os.path.join("logs")
         self.raw_csv_path = ""   # will be set based on current date
         self.current_log_date: date = datetime.now().date()
+        self.minute_csv_path = os.path.join(self.log_dir, "minute_averages.csv")
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
         self.rolling_12hr_csv_path = os.path.join(self.log_dir, "rolling_12hr_averages.csv")
         self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
@@ -918,6 +984,10 @@ class MainWindow(QMainWindow):
         self.raw_csv_path = self._ensure_raw_csv_for_date(self.current_log_date)
 
         # ensure hourly CSV
+        ensure_csv(
+            self.minute_csv_path,
+            ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+        )
         ensure_csv(
             self.hourly_csv_path,
             ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
@@ -2541,12 +2611,17 @@ class MainWindow(QMainWindow):
         self.log_dir = data.get("log_dir", self.log_dir)
         self.log_dir_edit.setText(self.log_dir)
 
+        self.minute_csv_path = os.path.join(self.log_dir, "minute_averages.csv")
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
         self.rolling_12hr_csv_path = os.path.join(self.log_dir, "rolling_12hr_averages.csv")
         self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
         self.system_health_path = os.path.join(self.log_dir, "system_health.json")
         self._ensure_env_events_csv()
         self.thresholds = self._load_thresholds_from_log_dir()
+        ensure_csv(
+            self.minute_csv_path,
+            ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+        )
         ensure_csv(
             self.rolling_12hr_csv_path,
             ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"],
@@ -2885,9 +2960,14 @@ class MainWindow(QMainWindow):
         if path:
             self.log_dir = path
             self.log_dir_edit.setText(path)
+            self.minute_csv_path = os.path.join(self.log_dir, "minute_averages.csv")
             self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
             self.rolling_12hr_csv_path = os.path.join(self.log_dir, "rolling_12hr_averages.csv")
             self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
+            ensure_csv(
+                self.minute_csv_path,
+                ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+            )
             ensure_csv(
                 self.hourly_csv_path,
                 ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
@@ -2973,9 +3053,14 @@ class MainWindow(QMainWindow):
 
         self.log_dir = self.log_dir_edit.text().strip()
         ensure_dir(self.log_dir)
+        self.minute_csv_path = os.path.join(self.log_dir, "minute_averages.csv")
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
         self.rolling_12hr_csv_path = os.path.join(self.log_dir, "rolling_12hr_averages.csv")
         self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
+        ensure_csv(
+            self.minute_csv_path,
+            ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+        )
         ensure_csv(
             self.hourly_csv_path,
             ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
@@ -3441,13 +3526,59 @@ class MainWindow(QMainWindow):
     def finalize_previous_minute(self) -> None:
         if self.current_minute_start is None or not self.minute_accumulators:
             return
+        minute_start = self.current_minute_start
+        minute_end = minute_start + timedelta(minutes=1)
+        minute_start_iso = minute_start.isoformat(timespec="seconds")
+        minute_end_iso = minute_end.isoformat(timespec="seconds")
+
+        avg_lookup: Dict[str, float] = {}
         for tag, acc in self.minute_accumulators.items():
             minute_avg = self._minute_average(tag, acc)
             if minute_avg is None:
                 continue
+            avg_lookup[tag] = minute_avg
             hour_acc = self.hour_accumulators.setdefault(tag, {"sum": 0.0, "count": 0})
             hour_acc["sum"] += minute_avg
             hour_acc["count"] += 1
+
+        if not avg_lookup:
+            return
+
+        ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
+        epa_calc_tags = self._epa_calc_tags()
+        rows: List[List[object]] = []
+
+        for tag, minute_avg in avg_lookup.items():
+            acc = self.minute_accumulators.get(tag, {})
+            count = int(acc.get("count", 0) or 0)
+            lbhr_avg: Optional[float] = None
+            if tag in ppm_to_lbhr:
+                derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
+                if derived_lbhr is not None:
+                    lbhr_avg = derived_lbhr
+            if tag in epa_calc_tags and lbhr_avg is None:
+                lbhr_avg = minute_avg
+            rows.append(
+                [
+                    minute_start_iso,
+                    minute_end_iso,
+                    tag,
+                    minute_avg,
+                    "" if lbhr_avg is None else lbhr_avg,
+                    count,
+                ]
+            )
+
+        try:
+            ensure_csv(
+                self.minute_csv_path,
+                ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+            )
+            with open(self.minute_csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerows(rows)
+        except Exception as e:
+            self.log_message(f"Error writing minute averages: {e}")
 
     def _load_latest_rolling_12hr(self) -> None:
         self.rolling_12hr_avg.clear()

@@ -56,6 +56,7 @@ except ModuleNotFoundError as exc:
 # ----------------- config -----------------
 
 LOG_DIR = "logs"
+MINUTE_CSV = os.path.join(LOG_DIR, "minute_averages.csv")
 HOURLY_CSV = os.path.join(LOG_DIR, "hourly_averages.csv")
 ROLLING_12HR_CSV = os.path.join(LOG_DIR, "rolling_12hr_averages.csv")
 THRESHOLDS_JSON = os.path.join(LOG_DIR, "thresholds.json")
@@ -71,6 +72,30 @@ CONFIG_CHANGE_HEADERS = [
     "old_value",
     "new_value",
     "reason",
+]
+MINUTE_AVG_HEADERS = [
+    "minute_start",
+    "minute_end",
+    "tag",
+    "avg_value",
+    "avg_lb_hr",
+    "sample_count",
+]
+HOURLY_AVG_HEADERS = [
+    "hour_start",
+    "hour_end",
+    "tag",
+    "avg_value",
+    "avg_lb_hr",
+    "sample_count",
+]
+ROLLING_AVG_HEADERS = [
+    "window_start",
+    "window_end",
+    "tag",
+    "avg_value",
+    "avg_lb_hr",
+    "hours_count",
 ]
 
 REFRESH_MS = 5000  # dashboard refresh interval (ms)
@@ -139,6 +164,22 @@ def compute_config_version_text() -> str:
         return f"Config: v{mdate} ({digest[:8]})"
     except Exception:
         return "Config: unavailable"
+
+
+def ensure_export_csv(path: str, headers: List[str]) -> None:
+    ensure_csv(path, headers)
+    if os.path.exists(path):
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+
+
+def build_export_payload(path: str, headers: List[str], filename: str):
+    ensure_export_csv(path, headers)
+    if not os.path.exists(path):
+        return None
+    return dcc.send_file(path, filename=filename)
 
 
 def get_latest_raw_path() -> Optional[str]:
@@ -1876,6 +1917,56 @@ app.layout = html.Div(
                                 "textAlign": "right",
                             },
                         ),
+                        html.Div(
+                            style={
+                                "marginTop": "6px",
+                                "display": "flex",
+                                "gap": "6px",
+                                "justifyContent": "flex-end",
+                                "flexWrap": "wrap",
+                            },
+                            children=[
+                                html.Button(
+                                    "Export Minute Avg",
+                                    id="export-minute-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "backgroundColor": "#263238",
+                                        "color": "#ecf0f1",
+                                        "border": "1px solid #37474f",
+                                        "padding": "4px 8px",
+                                        "borderRadius": "6px",
+                                        "fontSize": "10px",
+                                    },
+                                ),
+                                html.Button(
+                                    "Export Hourly Avg",
+                                    id="export-hourly-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "backgroundColor": "#263238",
+                                        "color": "#ecf0f1",
+                                        "border": "1px solid #37474f",
+                                        "padding": "4px 8px",
+                                        "borderRadius": "6px",
+                                        "fontSize": "10px",
+                                    },
+                                ),
+                                html.Button(
+                                    "Export Rolling 12 Hr Avg",
+                                    id="export-rolling-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "backgroundColor": "#263238",
+                                        "color": "#ecf0f1",
+                                        "border": "1px solid #37474f",
+                                        "padding": "4px 8px",
+                                        "borderRadius": "6px",
+                                        "fontSize": "10px",
+                                    },
+                                ),
+                            ],
+                        ),
                     ]
                 ),
             ],
@@ -1886,6 +1977,9 @@ app.layout = html.Div(
             interval=REFRESH_MS,
             n_intervals=0,
         ),
+        dcc.Download(id="export-minute-download"),
+        dcc.Download(id="export-hourly-download"),
+        dcc.Download(id="export-rolling-download"),
 
         # Tabs: Overview (gauges) & Thresholds (editor)
         dcc.Tabs(
@@ -2104,6 +2198,37 @@ def refresh_threshold_dropdown(n, current_value):
     else:
         value = tags[0] if tags else None
     return options, value
+
+
+@app.callback(
+    Output("export-minute-download", "data"),
+    Input("export-minute-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_minute_averages(_n_clicks):
+    return build_export_payload(MINUTE_CSV, MINUTE_AVG_HEADERS, "minute_averages.csv")
+
+
+@app.callback(
+    Output("export-hourly-download", "data"),
+    Input("export-hourly-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_hourly_averages(_n_clicks):
+    return build_export_payload(HOURLY_CSV, HOURLY_AVG_HEADERS, "hourly_averages.csv")
+
+
+@app.callback(
+    Output("export-rolling-download", "data"),
+    Input("export-rolling-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_rolling_averages(_n_clicks):
+    return build_export_payload(
+        ROLLING_12HR_CSV,
+        ROLLING_AVG_HEADERS,
+        "rolling_12hr_averages.csv",
+    )
 
 
 @app.callback(

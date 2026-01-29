@@ -1758,7 +1758,129 @@ def build_exceedance_table(events_df: pd.DataFrame, limit: int = 20):
     )
 
 
-def build_compliance_view(summary: Dict[str, float], events_df: pd.DataFrame) -> html.Div:
+def _format_threshold_cell(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if isinstance(value, float) and value != value:
+            return ""
+    except Exception:
+        return ""
+    return str(value)
+
+
+def build_compliance_rules_card() -> html.Div:
+    rules = html.Ul(
+        style={"margin": 0, "paddingLeft": "18px", "fontSize": "11px", "color": "#b0bec5"},
+        children=[
+            html.Li("Regulatory compliance uses low/high limits from thresholds.json."),
+            html.Li("Operational thresholds only drive gauge warnings and are not compliance limits."),
+            html.Li("Exceedances are logged when samples fall outside compliance limits."),
+            html.Li("Within-limit percentages only count samples with QA flag = OK."),
+            html.Li("Edit thresholds below to keep limits aligned with permit requirements."),
+        ],
+    )
+
+    return html.Div(
+        style=CARD_STYLE,
+        children=[
+            html.Div(
+                "Compliance Rules & Requirements",
+                style={"fontWeight": "600", "fontSize": "13px"},
+            ),
+            rules,
+        ],
+    )
+
+
+def build_compliance_thresholds_table(
+    thresholds: Dict[str, Dict[str, object]], tags: List[str]
+) -> html.Div:
+    rows = []
+    for tag in sorted(tags, key=str):
+        entry = thresholds.get(tag, {}) if isinstance(thresholds.get(tag, {}), dict) else {}
+        rows.append(
+            {
+                "tag": tag,
+                "alias": entry.get("alias", "") or "",
+                "units": entry.get("units", "") or "",
+                "low_oper": _format_threshold_cell(entry.get("low_oper")),
+                "high_oper": _format_threshold_cell(entry.get("high_oper")),
+                "low_limit": _format_threshold_cell(entry.get("low_limit")),
+                "high_limit": _format_threshold_cell(entry.get("high_limit")),
+            }
+        )
+
+    table = dash_table.DataTable(
+        id="compliance-thresholds-table",
+        data=rows,
+        columns=[
+            {"name": "Tag", "id": "tag", "presentation": "input"},
+            {"name": "Alias", "id": "alias", "presentation": "input"},
+            {"name": "Units", "id": "units", "presentation": "input"},
+            {"name": "Low Oper", "id": "low_oper", "presentation": "input"},
+            {"name": "High Oper", "id": "high_oper", "presentation": "input"},
+            {"name": "Low Limit", "id": "low_limit", "presentation": "input"},
+            {"name": "High Limit", "id": "high_limit", "presentation": "input"},
+        ],
+        editable=True,
+        style_header={"backgroundColor": "#1c2026", "color": "#b0bec5"},
+        style_cell={
+            "backgroundColor": "#202632",
+            "color": "#e0e6ed",
+            "fontSize": "11px",
+            "padding": "6px",
+            "textAlign": "left",
+        },
+        style_table={"maxHeight": "300px", "overflowY": "auto"},
+        page_size=12,
+    )
+
+    return html.Div(
+        style=CARD_STYLE,
+        children=[
+            html.Div(
+                "Compliance Thresholds (edit to match CIP settings)",
+                style={"fontWeight": "600", "fontSize": "13px"},
+            ),
+            html.Div(
+                "Updates are saved to thresholds.json and consumed by CIP.py.",
+                style={"fontSize": "11px", "color": "#90a4ae"},
+            ),
+            table,
+            html.Div(
+                style={"display": "flex", "gap": "8px", "alignItems": "center"},
+                children=[
+                    html.Button(
+                        "Save Compliance Thresholds",
+                        id="compliance-threshold-save-btn",
+                        n_clicks=0,
+                        style={
+                            "marginTop": "6px",
+                            "backgroundColor": "#3498db",
+                            "color": "white",
+                            "border": "none",
+                            "padding": "6px 10px",
+                            "borderRadius": "6px",
+                            "fontSize": "11px",
+                        },
+                    ),
+                    html.Div(
+                        id="compliance-threshold-save-status",
+                        style={"fontSize": "11px", "color": "#b0bec5"},
+                    ),
+                ],
+            ),
+        ],
+    )
+
+
+def build_compliance_view(
+    summary: Dict[str, float],
+    events_df: pd.DataFrame,
+    thresholds: Dict[str, Dict[str, object]],
+    tags: List[str],
+) -> html.Div:
     tiles = html.Div(
         style={"display": "flex", "gap": "10px", "flexWrap": "wrap"},
         children=[
@@ -1807,9 +1929,12 @@ def build_compliance_view(summary: Dict[str, float], events_df: pd.DataFrame) ->
         ]
     )
 
+    rules_card = build_compliance_rules_card()
+    thresholds_card = build_compliance_thresholds_table(thresholds, tags)
+
     return html.Div(
         style={"padding": "12px", "display": "flex", "flexDirection": "column", "gap": "12px"},
-        children=[tiles, gauges, table],
+        children=[tiles, gauges, rules_card, thresholds_card, table],
     )
 
 
@@ -2226,12 +2351,86 @@ def refresh_compliance_tab(n):
         events_df = detect_exceedance_events(raw_df, thresholds)
         save_exceedances(events_df)
         summary = compute_compliance_summary(raw_df, thresholds, events_df)
-        return build_compliance_view(summary, events_df)
+        tags = sorted(set(discover_all_tags_for_dropdown()) | set(thresholds.keys()), key=str)
+        return build_compliance_view(summary, events_df, thresholds, tags)
     except Exception as exc:
         return html.Div(
             f"Unable to compute compliance view: {exc}",
             style={"color": "#ef9a9a", "fontSize": "11px"},
         )
+
+
+@app.callback(
+    Output("compliance-threshold-save-status", "children"),
+    Input("compliance-threshold-save-btn", "n_clicks"),
+    State("compliance-thresholds-table", "data"),
+    prevent_initial_call=True,
+)
+def save_compliance_thresholds(n_clicks, rows):
+    if not rows:
+        return "No threshold rows to save."
+
+    errors = []
+    updated: Dict[str, Dict[str, object]] = {}
+
+    for idx, row in enumerate(rows, start=1):
+        tag = str(row.get("tag", "")).strip()
+        if not tag:
+            continue
+
+        entry: Dict[str, object] = {}
+
+        alias = row.get("alias")
+        if isinstance(alias, str) and alias.strip():
+            entry["alias"] = alias.strip()
+
+        units = row.get("units")
+        if isinstance(units, str) and units.strip():
+            entry["units"] = units.strip()
+
+        for key in ["low_oper", "high_oper", "low_limit", "high_limit"]:
+            raw_val = row.get(key)
+            if raw_val in ("", None):
+                value = None
+            else:
+                value = _to_float(raw_val)
+            if raw_val not in ("", None) and value is None:
+                errors.append(f"Row {idx}: {key} must be numeric.")
+                continue
+            if value is not None:
+                entry[key] = value
+
+        low_oper = _to_float(entry.get("low_oper"))
+        high_oper = _to_float(entry.get("high_oper"))
+        if low_oper is not None and high_oper is not None and high_oper < low_oper:
+            entry["low_oper"], entry["high_oper"] = high_oper, low_oper
+
+        low_limit = _to_float(entry.get("low_limit"))
+        high_limit = _to_float(entry.get("high_limit"))
+        if low_limit is not None and high_limit is not None and high_limit < low_limit:
+            entry["low_limit"], entry["high_limit"] = high_limit, low_limit
+
+        if entry:
+            updated[tag] = entry
+
+    if errors:
+        return " ".join(errors)
+
+    old_thresholds = load_thresholds()
+    all_tags = set(old_thresholds.keys()) | set(updated.keys())
+    for tag in sorted(all_tags, key=str):
+        old_entry = old_thresholds.get(tag, {}) if isinstance(old_thresholds.get(tag, {}), dict) else {}
+        new_entry = updated.get(tag, {})
+        if old_entry != new_entry:
+            log_config_change(
+                field=f"Thresholds/Limits: {tag}",
+                old_value=old_entry,
+                new_value=new_entry,
+                reason="Edited in compliance dashboard",
+            )
+
+    save_thresholds(updated)
+    return f"Saved {len(updated)} threshold entries."
 
 
 @app.callback(

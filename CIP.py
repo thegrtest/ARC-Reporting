@@ -928,6 +928,14 @@ class MainWindow(QMainWindow):
         self.poll_watchdog_timer: Optional[QTimer] = None
         self._watchdog_restart_in_progress = False
         self._watchdog_last_warning_ts: Optional[datetime] = None
+        self._pending_raw_rows: Dict[str, List[List[object]]] = {}
+        self._pending_minute_rows: List[List[object]] = []
+        self._pending_hourly_records: Dict[
+            Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]
+        ] = {}
+        self._pending_hour_end_queue: deque[datetime] = deque()
+        self._export_pause_started: Optional[float] = None
+        self._export_pause_action: Optional[str] = None
 
         # stable tag ordering for the dashboard
         self.tag_order: List[str] = []
@@ -1303,6 +1311,105 @@ class MainWindow(QMainWindow):
 
     def _export_lock_path(self) -> str:
         return os.path.join(self.log_dir, EXPORT_LOCK_FILENAME)
+
+    def _is_export_locked(self) -> bool:
+        return os.path.exists(self._export_lock_path())
+
+    def _record_export_pause(self, action: str) -> None:
+        if self._export_pause_started is None:
+            self._export_pause_started = time.monotonic()
+            self._export_pause_action = action
+            self.log_message(f"Export in progress; deferring {action} writes.")
+
+    def _flush_pending_export_writes(self) -> None:
+        if self._is_export_locked():
+            return
+        if (
+            not self._pending_raw_rows
+            and not self._pending_minute_rows
+            and not self._pending_hourly_records
+        ):
+            if self._export_pause_started is not None:
+                elapsed = time.monotonic() - self._export_pause_started
+                self.log_message(
+                    f"Export completed; resuming writes after {elapsed:.1f}s."
+                )
+                self._export_pause_started = None
+                self._export_pause_action = None
+            return
+        if self._export_pause_started is not None:
+            elapsed = time.monotonic() - self._export_pause_started
+            action = self._export_pause_action or "log"
+            self.log_message(
+                f"Export completed; flushing deferred {action} writes after {elapsed:.1f}s."
+            )
+            self._export_pause_started = None
+            self._export_pause_action = None
+
+        pending_raw = dict(self._pending_raw_rows)
+        self._pending_raw_rows.clear()
+        for path, rows in pending_raw.items():
+            if not rows:
+                continue
+            try:
+                ensure_csv(
+                    path,
+                    ["timestamp", "date", "time", "tag", "alias", "value", "status", "qa_flag"],
+                )
+                with open(path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerows(rows)
+            except Exception as e:
+                self.log_message(f"Error flushing raw CSV buffer: {e}")
+                self._pending_raw_rows.setdefault(path, []).extend(rows)
+
+        if self._pending_minute_rows:
+            rows = list(self._pending_minute_rows)
+            self._pending_minute_rows.clear()
+            try:
+                ensure_csv(
+                    self.minute_csv_path,
+                    ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+                )
+                with open(self.minute_csv_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerows(rows)
+            except Exception as e:
+                self.log_message(f"Error flushing minute averages buffer: {e}")
+                self._pending_minute_rows.extend(rows)
+
+        if self._pending_hourly_records:
+            records = dict(self._pending_hourly_records)
+            hour_ends = list(self._pending_hour_end_queue)
+            self._pending_hourly_records.clear()
+            self._pending_hour_end_queue.clear()
+            try:
+                ensure_csv(
+                    self.hourly_csv_path,
+                    ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+                )
+                with open(self.hourly_csv_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(
+                        ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"]
+                    )
+                    for (hs, tag), (he, avg, lbhr_avg, cnt) in sorted(records.items()):
+                        writer.writerow(
+                            [
+                                hs,
+                                he,
+                                tag,
+                                "" if avg is None else avg,
+                                "" if lbhr_avg is None else lbhr_avg,
+                                cnt,
+                            ]
+                        )
+                for hour_end in hour_ends:
+                    self._update_rolling_12hr_from_records(records, hour_end)
+            except Exception as e:
+                self.log_message(f"Error flushing hourly averages buffer: {e}")
+                self._pending_hourly_records = records
+                self._pending_hour_end_queue = deque(hour_ends)
 
     def _wait_for_export_unlock(self, action: str) -> None:
         lock_path = self._export_lock_path()
@@ -3456,6 +3563,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 ts = datetime.now()
 
+            self._flush_pending_export_writes()
+
             minute_start = ts.replace(second=0, microsecond=0)
             hour_start = hour_bucket(ts)
 
@@ -3499,26 +3608,30 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     self.log_message(f"EPA Method 19 compute failed: {e}")
 
-                self._wait_for_export_unlock("raw CSV")
-                with open(self.raw_csv_path, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    for tag, (val, status) in data.items():
-                        qa_flag = self._determine_qa_flag(tag, val, status)
-                        self.current_values[tag] = (val, qa_flag)
-                        alias = self.alias_map.get(tag, "")
-                        writer.writerow(
-                            [ts_iso, date_str, time_str, tag, alias, val, status, qa_flag]
-                        )
+                rows: List[List[object]] = []
+                for tag, (val, status) in data.items():
+                    qa_flag = self._determine_qa_flag(tag, val, status)
+                    self.current_values[tag] = (val, qa_flag)
+                    alias = self.alias_map.get(tag, "")
+                    rows.append([ts_iso, date_str, time_str, tag, alias, val, status, qa_flag])
 
-                        if qa_flag == "OK":
-                            self._check_gap_event(tag, ts)
-                            num_val = self._safe_float(val)
-                            if self._is_valid_number(num_val):
-                                acc = self.minute_accumulators.setdefault(
-                                    tag, {"sum": 0.0, "count": 0}
-                                )
-                                acc["sum"] += float(num_val)
-                                acc["count"] += 1
+                    if qa_flag == "OK":
+                        self._check_gap_event(tag, ts)
+                        num_val = self._safe_float(val)
+                        if self._is_valid_number(num_val):
+                            acc = self.minute_accumulators.setdefault(
+                                tag, {"sum": 0.0, "count": 0}
+                            )
+                            acc["sum"] += float(num_val)
+                            acc["count"] += 1
+
+                if self._is_export_locked():
+                    self._record_export_pause("raw CSV")
+                    self._pending_raw_rows.setdefault(self.raw_csv_path, []).extend(rows)
+                else:
+                    with open(self.raw_csv_path, "a", newline="", encoding="utf-8") as f:
+                        writer = csv.writer(f)
+                        writer.writerows(rows)
             except Exception as e:
                 self.log_message(f"Error writing raw CSV: {e}")
 
@@ -3642,10 +3755,13 @@ class MainWindow(QMainWindow):
                 self.minute_csv_path,
                 ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
             )
-            self._wait_for_export_unlock("minute average")
-            with open(self.minute_csv_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerows(rows)
+            if self._is_export_locked():
+                self._record_export_pause("minute average")
+                self._pending_minute_rows.extend(rows)
+            else:
+                with open(self.minute_csv_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerows(rows)
         except Exception as e:
             self.log_message(f"Error writing minute averages: {e}")
 
@@ -3926,6 +4042,8 @@ class MainWindow(QMainWindow):
                         )
         except Exception as e:
             self.log_message(f"Error reading hourly CSV for upsert: {e}")
+        if self._pending_hourly_records:
+            records.update(self._pending_hourly_records)
 
         ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
         avg_lookup: Dict[str, float] = {}
@@ -3960,7 +4078,13 @@ class MainWindow(QMainWindow):
                 self.hourly_csv_path,
                 ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
             )
-            self._wait_for_export_unlock("hourly average")
+            if self._is_export_locked():
+                self._record_export_pause("hourly average")
+                self._pending_hourly_records = records
+                if not self._pending_hour_end_queue or hour_end > self._pending_hour_end_queue[-1]:
+                    self._pending_hour_end_queue.append(hour_end)
+                return
+
             with open(self.hourly_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(

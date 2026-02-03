@@ -10,10 +10,9 @@ Reads:
     logs/rolling_12hr_averages.csv (rolling 12-hour averages)
 
 Exposes a network dashboard with:
-    - For EVERY tag:
+    - Simplified overview for CEMS O2/NOX/CO:
         * Gauge: Current Hourly Average
-        * Gauge: Last Hour Average
-        * Gauge: Rolling 12-hour Average
+        * Rolling 12-hour Average summary
     - Color-coded gauges using thresholds.json (configurable in Thresholds tab).
 
 Run:
@@ -28,6 +27,7 @@ import csv
 import json
 import hashlib
 import getpass
+import re
 import sys
 from datetime import datetime, timedelta
 from typing import Dict, Tuple, List, Optional
@@ -1375,121 +1375,69 @@ GAUGE_CONTAINER_STYLE = {
 }
 
 
-def build_tag_card(
-    tag: str,
-    last_hour_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
-    rolling_12hr_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
-    current_hour_avg: Dict[str, float],
+def _normalize_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _match_cems_metric(value: Optional[str], metric: str) -> bool:
+    if not value:
+        return False
+    normalized = _normalize_label(value)
+    return "cems" in normalized and metric in normalized
+
+
+def find_cems_tag(
+    metric: str,
+    tags: List[str],
     thresholds: Dict[str, Dict[str, object]],
-    lb_hr_map: Dict[str, str],
-    epa_settings: Dict[str, object],
+) -> Optional[str]:
+    for tag in tags:
+        entry = thresholds.get(tag, {}) if isinstance(thresholds.get(tag, {}), dict) else {}
+        alias = entry.get("alias") if isinstance(entry.get("alias"), str) else ""
+        if _match_cems_metric(alias, metric):
+            return tag
+    for tag in tags:
+        if _match_cems_metric(tag, metric):
+            return tag
+    return None
+
+
+def build_cems_card(
+    label: str,
+    tag: Optional[str],
+    current_hour_avg: Dict[str, float],
+    rolling_12hr_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
+    thresholds: Dict[str, Dict[str, object]],
 ) -> html.Div:
-    """
-    Build a card with gauges for a single tag:
-        - Current Hourly Average
-        - Last Hour Average
-        - Rolling 12-hour Average (from hourly averages)
-    """
-    # base values
-    last_avg, last_lb_hr_avg, hs, he, sample_count = last_hour_stats.get(
-        tag, (float("nan"), float("nan"), None, None, 0)
-    )
-    rolling_avg, rolling_lb_hr_avg, ws, we, rolling_count = rolling_12hr_stats.get(
-        tag, (float("nan"), float("nan"), None, None, 0)
-    )
-    live_hr_val = current_hour_avg.get(tag, float("nan"))
-
-    lb_hr_tag = lb_hr_map.get(tag)
-    if lb_hr_tag and last_lb_hr_avg != last_lb_hr_avg:
-        fallback_entry = last_hour_stats.get(lb_hr_tag)
-        if fallback_entry:
-            last_lb_hr_avg = fallback_entry[0]
-    live_lb_hr_val = current_hour_avg.get(lb_hr_tag, float("nan")) if lb_hr_tag else float("nan")
-    derived_roll_lbhr = False
-    if lb_hr_tag and rolling_lb_hr_avg != rolling_lb_hr_avg:
-        rolling_entry = rolling_12hr_stats.get(lb_hr_tag)
-        if rolling_entry:
-            rolling_lb_hr_avg = rolling_entry[0]
-
-    if rolling_lb_hr_avg != rolling_lb_hr_avg:
-        computed_roll_lbhr = compute_rolling_lbhr_from_epa(
-            tag=tag,
-            rolling_12hr_stats=rolling_12hr_stats,
-            epa_settings=epa_settings,
-        )
-        if computed_roll_lbhr is not None:
-            rolling_lb_hr_avg = computed_roll_lbhr
-            derived_roll_lbhr = True
-
-    entry = thresholds.get(tag, {}) if isinstance(thresholds.get(tag, {}), dict) else {}
-
-    alias = entry.get("alias") if isinstance(entry.get("alias"), str) else None
+    entry = thresholds.get(tag, {}) if tag and isinstance(thresholds.get(tag, {}), dict) else {}
     units = entry.get("units") if isinstance(entry.get("units"), str) else None
+    alias = entry.get("alias") if isinstance(entry.get("alias"), str) else None
 
     low_oper = entry.get("low_oper")
     high_oper = entry.get("high_oper")
     low_limit = entry.get("low_limit")
     high_limit = entry.get("high_limit")
 
-    # Derive gauge ranges using operational thresholds first, then limits, then data
-    sample_vals = [last_avg, live_hr_val, rolling_avg]
+    value = current_hour_avg.get(tag, float("nan")) if tag else float("nan")
+    rolling_avg, _, ws, we, rolling_count = rolling_12hr_stats.get(
+        tag, (float("nan"), float("nan"), None, None, 0)
+    )
+
     low_for_range = low_oper if low_oper is not None else low_limit
     high_for_range = high_oper if high_oper is not None else high_limit
     low_eff, high_eff, gmin, gmax = compute_gauge_range(
-        low_for_range, high_for_range, sample_vals
+        low_for_range, high_for_range, [value, rolling_avg]
     )
-
-    # When classifying, prefer operational thresholds if set; otherwise use limits/range
     low_for_class = low_oper if low_oper is not None else low_eff
     high_for_class = high_oper if high_oper is not None else high_eff
 
-    # Classification
-    last_status_eval = classify_value(last_avg, low_for_class, high_for_class)
-    live_hr_status_eval = classify_value(live_hr_val, low_for_class, high_for_class)
-    rolling_status_eval = classify_value(rolling_avg, low_for_class, high_for_class)
+    status = classify_value(value, low_for_class, high_for_class)
+    color = status_color(status)
 
-    last_color = status_color(last_status_eval)
-    live_hr_color = status_color(live_hr_status_eval)
-    rolling_color = status_color(rolling_status_eval)
-
-    # Hard-limit exceedance text (if provided)
-    def limit_note(value: float) -> str:
-        if value != value:
-            return ""
-        if low_limit is not None and value < low_limit:
-            return f" (below limit {low_limit})"
-        if high_limit is not None and value > high_limit:
-            return f" (above limit {high_limit})"
-        return ""
-
-    # Labels with 2 decimal places
-    if last_avg == last_avg and hs is not None and he is not None and sample_count > 0:
-        try:
-            hs_s = hs.strftime("%Y-%m-%d %H:%M")
-            he_s = he.strftime("%H:%M")
-        except Exception:
-            hs_s = str(hs)
-            he_s = str(he)
-        last_label_text = (
-            f"Last hour {hs_s}-{he_s}: {last_avg:.2f} "
-            f"(samples: {sample_count}, eval: {last_status_eval})"
-            f"{limit_note(last_avg)}"
-        )
-        if last_lb_hr_avg == last_lb_hr_avg:
-            last_label_text = f"{last_label_text} • lb/hr avg: {last_lb_hr_avg:.2f}"
+    if value == value:
+        value_label = f"{value:.2f}"
     else:
-        last_label_text = "Last hour: no data"
-
-    if live_hr_val == live_hr_val:
-        live_hr_label_text = (
-            f"Current hourly average: {live_hr_val:.2f} "
-            f"(current hour, eval: {live_hr_status_eval})"
-            f"{limit_note(live_hr_val)}"
-        )
-        if live_lb_hr_val == live_lb_hr_val:
-            live_hr_label_text = f"{live_hr_label_text} • lb/hr avg: {live_lb_hr_val:.2f}"
-    else:
-        live_hr_label_text = "Current hourly average: no data"
+        value_label = "—"
 
     if rolling_avg == rolling_avg and ws is not None and we is not None and rolling_count > 0:
         try:
@@ -1498,134 +1446,47 @@ def build_tag_card(
         except Exception:
             ws_s = str(ws)
             we_s = str(we)
-        rolling_label_text = (
-            f"Rolling 12h {ws_s}–{we_s}: {rolling_avg:.2f} "
-            f"(hours: {rolling_count}, eval: {rolling_status_eval})"
-            f"{limit_note(rolling_avg)}"
-        )
-        if rolling_lb_hr_avg == rolling_lb_hr_avg:
-            suffix = " (derived)" if derived_roll_lbhr else ""
-            rolling_label_text = (
-                f"{rolling_label_text} • lb/hr avg{suffix}: {rolling_lb_hr_avg:.2f}"
-            )
+        rolling_text = f"Rolling 12h {ws_s}–{we_s}: {rolling_avg:.2f} ({rolling_count} hrs)"
     else:
-        rolling_label_text = "Rolling 12-hour average: no data"
+        rolling_text = "Rolling 12h: no data"
 
-    gauge_size = 170
-
-    last_hour_gauge = html.Div(
-        style=GAUGE_CONTAINER_STYLE,
-        children=[
-            html.Div("Last Hour Average", style={"marginBottom": "4px", "fontWeight": "600"}),
-            daq.Gauge(
-                id={"type": "gauge", "tag": tag, "kind": "last_hour"},
-                min=gmin,
-                max=gmax,
-                value=last_avg if last_avg == last_avg else gmin,
-                showCurrentValue=True,
-                color=last_color,
-                label="",
-                size=gauge_size,
-                units="",
-            ),
-            html.Div(last_label_text, style={"fontSize": "11px", "marginTop": "4px"}),
-        ],
-    )
-
-    live_hour_gauge = html.Div(
-        style=GAUGE_CONTAINER_STYLE,
-        children=[
-            html.Div(
-                "Current Hourly Average",
-                style={"marginBottom": "4px", "fontWeight": "600"},
-            ),
-            daq.Gauge(
-                id={"type": "gauge", "tag": tag, "kind": "current_hour"},
-                min=gmin,
-                max=gmax,
-                value=live_hr_val if live_hr_val == live_hr_val else gmin,
-                showCurrentValue=True,
-                color=live_hr_color,
-                label="",
-                size=gauge_size,
-                units="",
-            ),
-            html.Div(live_hr_label_text, style={"fontSize": "11px", "marginTop": "4px"}),
-        ],
-    )
-
-    rolling_gauge = html.Div(
-        style=GAUGE_CONTAINER_STYLE,
-        children=[
-            html.Div(
-                "Rolling 12-Hour Avg",
-                style={"marginBottom": "4px", "fontWeight": "600"},
-            ),
-            daq.Gauge(
-                id={"type": "gauge", "tag": tag, "kind": "rolling_12hr"},
-                min=gmin,
-                max=gmax,
-                value=rolling_avg if rolling_avg == rolling_avg else gmin,
-                showCurrentValue=True,
-                color=rolling_color,
-                label="",
-                size=gauge_size,
-                units="",
-            ),
-            html.Div(rolling_label_text, style={"fontSize": "11px", "marginTop": "4px"}),
-        ],
-    )
-
-    display_name = alias or tag
+    header = alias or label
     subtitle_bits = []
-    if alias:
+    if tag:
         subtitle_bits.append(f"Tag: {tag}")
+    else:
+        subtitle_bits.append("No matching tag found yet")
     if units:
         subtitle_bits.append(f"Units: {units}")
     subtitle = " • ".join(subtitle_bits)
 
-    def format_bounds(label: str, low_val: Optional[float], high_val: Optional[float], fallback: str) -> str:
-        bounds: List[str] = []
-        if low_val is not None:
-            bounds.append(str(low_val))
-        if high_val is not None:
-            bounds.append(str(high_val))
-        if bounds:
-            return f"{label}: [{' – '.join(bounds)}]"
-        return fallback
-
-    oper_text = format_bounds("Operational", low_oper, high_oper, "Operational: auto")
-    limit_text = format_bounds(
-        "Regulatory limit", low_limit, high_limit, "Regulatory limit: none set"
+    return html.Div(
+        style=CARD_STYLE,
+        children=[
+            html.Div(
+                header,
+                style={"fontWeight": "600", "fontSize": "13px", "color": "#e0e6ed"},
+            ),
+            html.Div(subtitle, style={"fontSize": "11px", "color": "#90a4ae"}),
+            html.Div(
+                style=GAUGE_CONTAINER_STYLE,
+                children=[
+                    daq.Gauge(
+                        id={"type": "cems-gauge", "tag": tag or label},
+                        min=gmin,
+                        max=gmax,
+                        value=value if value == value else gmin,
+                        showCurrentValue=True,
+                        color=color,
+                        label=f"Current hourly avg: {value_label}",
+                        size=200,
+                        units="",
+                    ),
+                ],
+            ),
+            html.Div(rolling_text, style={"fontSize": "11px", "color": "#90a4ae"}),
+        ],
     )
-
-    header_children = [
-        html.Div(
-            display_name,
-            style={
-                "fontWeight": "600",
-                "fontSize": "13px",
-                "color": "#e0e6ed",
-            },
-        ),
-        html.Div(
-            [
-                html.Div(oper_text),
-                html.Div(limit_text),
-                html.Div(subtitle) if subtitle else None,
-            ],
-            style={"fontSize": "11px", "color": "#90a4ae", "lineHeight": "16px"},
-        ),
-    ]
-
-    header = html.Div([child for child in header_children if child is not None])
-
-    gauges_row = html.Div(
-        style=GAUGE_ROW_STYLE,
-        children=[live_hour_gauge, last_hour_gauge, rolling_gauge],
-    )
-
-    return html.Div(style=CARD_STYLE, children=[header, gauges_row])
 
 
 def build_system_health_card(health: Dict[str, object]) -> html.Div:
@@ -2052,7 +1913,7 @@ app.layout = html.Div(
                             },
                             children=[
                                 html.Button(
-                                    "Export Minute Avg",
+                                    "Export Minute Averages",
                                     id="export-minute-btn",
                                     n_clicks=0,
                                     style={
@@ -2065,7 +1926,7 @@ app.layout = html.Div(
                                     },
                                 ),
                                 html.Button(
-                                    "Export Hourly Avg",
+                                    "Export Hourly Averages",
                                     id="export-hourly-btn",
                                     n_clicks=0,
                                     style={
@@ -2078,7 +1939,7 @@ app.layout = html.Div(
                                     },
                                 ),
                                 html.Button(
-                                    "Export Rolling 12 Hr Avg",
+                                    "Export Rolling 12 Hour Averages",
                                     id="export-rolling-btn",
                                     n_clicks=0,
                                     style={
@@ -2134,27 +1995,10 @@ app.layout = html.Div(
                             id="tag-cards-container",
                             style={
                                 "padding": "12px",
-                                # one tag card per row (vertical stack)
                                 "display": "flex",
-                                "flexDirection": "column",
-                                "gap": "14px",
+                                "flexWrap": "wrap",
+                                "gap": "16px",
                             },
-                        ),
-                    ],
-                ),
-                dcc.Tab(
-                    label="Compliance",
-                    value="compliance",
-                    style={"backgroundColor": "#1c2026", "color": "#b0bec5"},
-                    selected_style={
-                        "backgroundColor": "#20242b",
-                        "color": "white",
-                        "fontWeight": "600",
-                    },
-                    children=[
-                        html.Div(
-                            id="compliance-content",
-                            style={"padding": "12px"},
                         ),
                     ],
                 ),
@@ -2466,99 +2310,6 @@ def save_thresholds_callback(
 
 
 @app.callback(
-    Output("compliance-content", "children"),
-    Input("refresh-interval", "n_intervals"),
-)
-def refresh_compliance_tab(n):
-    try:
-        thresholds = load_thresholds()
-        raw_df = load_raw_history(max_days=30)
-        events_df = detect_exceedance_events(raw_df, thresholds)
-        save_exceedances(events_df)
-        summary = compute_compliance_summary(raw_df, thresholds, events_df)
-        tags = sorted(set(discover_all_tags_for_dropdown()) | set(thresholds.keys()), key=str)
-        return build_compliance_view(summary, events_df, thresholds, tags)
-    except Exception as exc:
-        return html.Div(
-            f"Unable to compute compliance view: {exc}",
-            style={"color": "#ef9a9a", "fontSize": "11px"},
-        )
-
-
-@app.callback(
-    Output("compliance-threshold-save-status", "children"),
-    Input("compliance-threshold-save-btn", "n_clicks"),
-    State("compliance-thresholds-table", "data"),
-    prevent_initial_call=True,
-)
-def save_compliance_thresholds(n_clicks, rows):
-    if not rows:
-        return "No threshold rows to save."
-
-    errors = []
-    updated: Dict[str, Dict[str, object]] = {}
-
-    for idx, row in enumerate(rows, start=1):
-        tag = str(row.get("tag", "")).strip()
-        if not tag:
-            continue
-
-        entry: Dict[str, object] = {}
-
-        alias = row.get("alias")
-        if isinstance(alias, str) and alias.strip():
-            entry["alias"] = alias.strip()
-
-        units = row.get("units")
-        if isinstance(units, str) and units.strip():
-            entry["units"] = units.strip()
-
-        for key in ["low_oper", "high_oper", "low_limit", "high_limit"]:
-            raw_val = row.get(key)
-            if raw_val in ("", None):
-                value = None
-            else:
-                value = _to_float(raw_val)
-            if raw_val not in ("", None) and value is None:
-                errors.append(f"Row {idx}: {key} must be numeric.")
-                continue
-            if value is not None:
-                entry[key] = value
-
-        low_oper = _to_float(entry.get("low_oper"))
-        high_oper = _to_float(entry.get("high_oper"))
-        if low_oper is not None and high_oper is not None and high_oper < low_oper:
-            entry["low_oper"], entry["high_oper"] = high_oper, low_oper
-
-        low_limit = _to_float(entry.get("low_limit"))
-        high_limit = _to_float(entry.get("high_limit"))
-        if low_limit is not None and high_limit is not None and high_limit < low_limit:
-            entry["low_limit"], entry["high_limit"] = high_limit, low_limit
-
-        if entry:
-            updated[tag] = entry
-
-    if errors:
-        return " ".join(errors)
-
-    old_thresholds = load_thresholds()
-    all_tags = set(old_thresholds.keys()) | set(updated.keys())
-    for tag in sorted(all_tags, key=str):
-        old_entry = old_thresholds.get(tag, {}) if isinstance(old_thresholds.get(tag, {}), dict) else {}
-        new_entry = updated.get(tag, {})
-        if old_entry != new_entry:
-            log_config_change(
-                field=f"Thresholds/Limits: {tag}",
-                old_value=old_entry,
-                new_value=new_entry,
-                reason="Edited in compliance dashboard",
-            )
-
-    save_thresholds(updated)
-    return f"Saved {len(updated)} threshold entries."
-
-
-@app.callback(
     Output("tag-cards-container", "children"),
     Output("last-update-label", "children"),
     Output("config-version-label", "children"),
@@ -2571,72 +2322,40 @@ def update_dashboard(n):
     """
     try:
         raw_df = load_latest_raw_df()
-        hourly_df = load_hourly_stats()
         rolling_df = load_rolling_12hr_stats()
-        events_df = load_env_events()
         thresholds = load_thresholds()
         config_version = compute_config_version_text()
-        health = load_system_health()
-        health_card = build_system_health_card(health)
 
-        latest_by_tag, current_hour_avg, last_ts = extract_raw_stats(raw_df)
-        last_hour_stats = extract_last_full_hour(hourly_df)
+        _, current_hour_avg, last_ts = extract_raw_stats(raw_df)
         rolling_12hr_stats = extract_latest_rolling_12hr(rolling_df)
-        lb_hr_map = load_epa_ppm_to_lbhr_map()
-        epa_settings = load_epa_settings()
 
-        tags_raw = set(latest_by_tag.keys())
-        tags_hourly = set(last_hour_stats.keys())
-        tags_cfg = set(load_configured_tags_from_settings())
-        if not events_df.empty and "tag" in events_df.columns:
-            tags_events = set(events_df["tag"].dropna().astype(str).tolist())
-        else:
-            tags_events = set()
-        all_tags = sorted((tags_raw | tags_hourly | tags_cfg | tags_events), key=str)
+        tags = sorted(
+            set(current_hour_avg.keys())
+            | set(rolling_12hr_stats.keys())
+            | set(load_configured_tags_from_settings())
+            | set(thresholds.keys()),
+            key=str,
+        )
+        tags = [t for t in tags if not looks_numeric_tag(str(t))]
 
-        # Filter out numeric-looking tags that somehow slipped through
-        all_tags = [t for t in all_tags if not looks_numeric_tag(str(t))]
+        cems_map = {
+            "o2": "CEMS O2",
+            "nox": "CEMS NOX",
+            "co": "CEMS CO",
+        }
 
-        quality_stats = compute_quality_metrics(raw_df, events_df, all_tags)
-        quality_card = build_quality_card(quality_stats)
-
-        if not all_tags:
-            msg = "No tags found yet. Waiting for data from CIP Tag Poller..."
-            empty_card = html.Div(
-                style=CARD_STYLE,
-                children=[
-                    html.Div(
-                        "No Tag Data",
-                        style={
-                            "fontWeight": "600",
-                            "fontSize": "13px",
-                            "marginBottom": "4px",
-                        },
-                    ),
-                    html.Div(
-                        msg,
-                        style={
-                            "fontSize": "11px",
-                            "color": "#90a4ae",
-                        },
-                    ),
-                ],
+        cards = []
+        for metric, label in cems_map.items():
+            tag = find_cems_tag(metric, tags, thresholds)
+            cards.append(
+                build_cems_card(
+                    label=label,
+                    tag=tag,
+                    current_hour_avg=current_hour_avg,
+                    rolling_12hr_stats=rolling_12hr_stats,
+                    thresholds=thresholds,
+                )
             )
-            last_update = "Last update: no data"
-            return [health_card, quality_card, empty_card], last_update, config_version
-
-        cards = [health_card, quality_card]
-        for tag in all_tags:
-            card = build_tag_card(
-                tag=tag,
-                last_hour_stats=last_hour_stats,
-                rolling_12hr_stats=rolling_12hr_stats,
-                current_hour_avg=current_hour_avg,
-                thresholds=thresholds,
-                lb_hr_map=lb_hr_map,
-                epa_settings=epa_settings,
-            )
-            cards.append(card)
 
         if last_ts is not None:
             try:

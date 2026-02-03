@@ -191,6 +191,9 @@ def _to_float(val: object) -> Optional[float]:
         return None
 
 
+EXPORT_LOCK_FILENAME = ".cip_export.lock"
+
+
 def _normalize_threshold_entry(raw_entry: object) -> Dict[str, object]:
     if not isinstance(raw_entry, dict):
         return {}
@@ -971,6 +974,7 @@ class MainWindow(QMainWindow):
         self.disk_warn_gb = 2.0
         self.disk_crit_gb = 1.0
         self.compress_raw_after_days = 7
+        self.last_backup_date: Optional[date] = None
 
         # UI
         self._build_ui()
@@ -982,6 +986,7 @@ class MainWindow(QMainWindow):
         # init daily raw path
         self.current_log_date = datetime.now().date()
         self.raw_csv_path = self._ensure_raw_csv_for_date(self.current_log_date)
+        self.last_backup_date = self.current_log_date
 
         # ensure hourly CSV
         ensure_csv(
@@ -1295,6 +1300,52 @@ class MainWindow(QMainWindow):
             ["timestamp", "date", "time", "tag", "alias", "value", "status", "qa_flag"],
         )
         return path
+
+    def _export_lock_path(self) -> str:
+        return os.path.join(self.log_dir, EXPORT_LOCK_FILENAME)
+
+    def _wait_for_export_unlock(self, action: str) -> None:
+        lock_path = self._export_lock_path()
+        if not os.path.exists(lock_path):
+            return
+        warned = False
+        start_ts = time.monotonic()
+        while os.path.exists(lock_path):
+            if not warned:
+                self.log_message(f"Export in progress; pausing {action} writes.")
+                warned = True
+            time.sleep(0.2)
+            if QApplication.instance():
+                QApplication.processEvents()
+        if warned:
+            elapsed = time.monotonic() - start_ts
+            self.log_message(f"Export completed; resuming {action} writes after {elapsed:.1f}s.")
+
+    def _backup_daily_logs(self, backup_date: date) -> None:
+        if self.last_backup_date == backup_date:
+            return
+        backup_root = os.path.join(self.log_dir, "backups", backup_date.isoformat())
+        ensure_dir(backup_root)
+        sources = [
+            (self._raw_path_for_date(backup_date), f"raw_data_{backup_date.isoformat()}.csv"),
+            (self.minute_csv_path, f"minute_averages_{backup_date.isoformat()}.csv"),
+            (self.hourly_csv_path, f"hourly_averages_{backup_date.isoformat()}.csv"),
+            (self.rolling_12hr_csv_path, f"rolling_12hr_averages_{backup_date.isoformat()}.csv"),
+            (self.env_events_path, f"env_events_{backup_date.isoformat()}.csv"),
+        ]
+        copied = 0
+        for src, dest_name in sources:
+            if not src or not os.path.exists(src):
+                continue
+            dest = os.path.join(backup_root, dest_name)
+            try:
+                shutil.copy2(src, dest)
+                copied += 1
+            except Exception as e:
+                self.log_message(f"Failed to back up {os.path.basename(src)}: {e}")
+        if copied:
+            self.last_backup_date = backup_date
+            self.log_message(f"Daily backup complete for {backup_date.isoformat()} ({copied} file(s)).")
 
     def _ensure_env_events_csv(self) -> None:
         ensure_csv(
@@ -3426,6 +3477,8 @@ class MainWindow(QMainWindow):
             # Daily rotation: if date changed, switch raw CSV
             log_date = ts.date()
             if log_date != self.current_log_date or not self.raw_csv_path:
+                if self.current_log_date:
+                    self._backup_daily_logs(self.current_log_date)
                 self.current_log_date = log_date
                 self.raw_csv_path = self._ensure_raw_csv_for_date(self.current_log_date)
             else:
@@ -3446,6 +3499,7 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     self.log_message(f"EPA Method 19 compute failed: {e}")
 
+                self._wait_for_export_unlock("raw CSV")
                 with open(self.raw_csv_path, "a", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     for tag, (val, status) in data.items():
@@ -3588,6 +3642,7 @@ class MainWindow(QMainWindow):
                 self.minute_csv_path,
                 ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
             )
+            self._wait_for_export_unlock("minute average")
             with open(self.minute_csv_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerows(rows)
@@ -3659,6 +3714,7 @@ class MainWindow(QMainWindow):
                 self.rolling_12hr_csv_path,
                 ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"],
             )
+            self._wait_for_export_unlock("rolling 12-hour")
             with open(self.rolling_12hr_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(
@@ -3904,6 +3960,7 @@ class MainWindow(QMainWindow):
                 self.hourly_csv_path,
                 ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
             )
+            self._wait_for_export_unlock("hourly average")
             with open(self.hourly_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(
@@ -4063,6 +4120,7 @@ class MainWindow(QMainWindow):
                 self.hourly_csv_path,
                 ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
             )
+            self._wait_for_export_unlock("hourly average rebuild")
             with open(self.hourly_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(

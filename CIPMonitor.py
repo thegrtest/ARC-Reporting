@@ -28,6 +28,7 @@ import json
 import hashlib
 import getpass
 import re
+import shutil
 import sys
 from datetime import datetime, timedelta
 from typing import Dict, Tuple, List, Optional
@@ -65,6 +66,8 @@ ENV_EVENTS_CSV = os.path.join(LOG_DIR, "env_events.csv")
 EXCEEDANCES_CSV = os.path.join(LOG_DIR, "exceedances.csv")
 CONFIG_CHANGES_CSV = os.path.join(LOG_DIR, "config_changes.csv")
 SYSTEM_HEALTH_JSON = os.path.join(LOG_DIR, "system_health.json")
+EXPORT_LOCK_FILENAME = ".cip_export.lock"
+EXPORT_TMP_DIR = os.path.join(LOG_DIR, "exports")
 CONFIG_CHANGE_HEADERS = [
     "timestamp",
     "user",
@@ -175,11 +178,53 @@ def ensure_export_csv(path: str, headers: List[str]) -> None:
         writer.writerow(headers)
 
 
+def _export_lock_path() -> str:
+    return os.path.join(LOG_DIR, EXPORT_LOCK_FILENAME)
+
+
+def _write_export_lock() -> None:
+    ensure_dir(LOG_DIR)
+    try:
+        with open(_export_lock_path(), "w", encoding="utf-8") as f:
+            f.write(f"export_started={datetime.now().isoformat(timespec='seconds')}\n")
+            f.write(f"pid={os.getpid()}\n")
+    except Exception:
+        pass
+
+
+def _clear_export_lock() -> None:
+    try:
+        os.remove(_export_lock_path())
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def _copy_export_file(source_path: str, filename: str) -> Optional[str]:
+    ensure_dir(EXPORT_TMP_DIR)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = f"{timestamp}_{os.getpid()}_{filename}"
+    dest_path = os.path.join(EXPORT_TMP_DIR, safe_name)
+    try:
+        shutil.copy2(source_path, dest_path)
+        return dest_path
+    except Exception:
+        return None
+
+
 def build_export_payload(path: str, headers: List[str], filename: str):
     ensure_export_csv(path, headers)
     if not os.path.exists(path):
         return None
-    return dcc.send_file(path, filename=filename)
+    _write_export_lock()
+    try:
+        export_copy = _copy_export_file(path, filename)
+    finally:
+        _clear_export_lock()
+    if not export_copy or not os.path.exists(export_copy):
+        return None
+    return dcc.send_file(export_copy, filename=filename)
 
 
 def get_latest_raw_path() -> Optional[str]:

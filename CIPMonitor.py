@@ -243,6 +243,19 @@ def _format_report_dt(value: Optional[datetime]) -> str:
     return value.strftime("%Y-%m-%d %H:%M")
 
 
+def _format_duration(seconds: Optional[float]) -> str:
+    if seconds is None or seconds != seconds:
+        return "N/A"
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes = seconds / 60.0
+    if minutes < 60:
+        return f"{minutes:.1f} min"
+    hours = minutes / 60.0
+    return f"{hours:.1f} hr"
+
+
 def _filter_time_range(df: pd.DataFrame, time_col: str, start: datetime, end: datetime) -> pd.DataFrame:
     if df is None or df.empty or time_col not in df.columns:
         return pd.DataFrame(columns=df.columns if df is not None else [])
@@ -369,6 +382,14 @@ def _get_report_data_start(*frames: pd.DataFrame) -> Optional[datetime]:
                         if earliest is None or ts < earliest:
                             earliest = ts
     return earliest
+
+
+def _is_system_failure(event_type: str) -> bool:
+    normalized = str(event_type or "").strip().casefold()
+    if not normalized:
+        return False
+    failure_terms = ("fail", "error", "down", "disconnect", "timeout", "offline")
+    return any(term in normalized for term in failure_terms)
 
 
 def _compute_avg_flow(hourly_range: pd.DataFrame, flow_tag: Optional[str]) -> Optional[float]:
@@ -601,10 +622,195 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
     return report_path
 
 
+def generate_incident_report_pdf(range_key: str) -> Optional[str]:
+    raw_df = load_latest_raw_df()
+    hourly_df = load_hourly_stats()
+    rolling_df = load_rolling_12hr_stats()
+    data_start = _get_report_data_start(rolling_df, hourly_df)
+    label, start, end = _get_report_range(range_key, data_start=data_start)
+
+    exceedances_df = load_exceedances()
+    env_events_df = load_env_events()
+    system_health = load_system_health()
+
+    exceed_range = _filter_time_range(exceedances_df, "start_time", start, end)
+    system_events = _filter_time_range(env_events_df, "timestamp", start, end)
+    if not system_events.empty and "event_type" in system_events.columns:
+        system_events = system_events[
+            system_events["event_type"].astype(str).apply(_is_system_failure)
+        ]
+
+    exceed_count = int(exceed_range.shape[0]) if not exceed_range.empty else 0
+    exceed_minutes = (
+        float(exceed_range["duration_sec"].fillna(0).astype(float).sum()) / 60.0
+        if not exceed_range.empty and "duration_sec" in exceed_range.columns
+        else 0.0
+    )
+    failure_count = int(system_events.shape[0]) if not system_events.empty else 0
+    failure_minutes = (
+        float(system_events["duration_sec"].fillna(0).astype(float).sum()) / 60.0
+        if not system_events.empty and "duration_sec" in system_events.columns
+        else 0.0
+    )
+
+    threshold_summary = compute_compliance_summary(
+        raw_df, load_thresholds(), load_exceedances()
+    )
+
+    ensure_dir(EXPORT_TMP_DIR)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"cip_incident_report_{range_key}_{timestamp}.pdf"
+    report_path = os.path.join(EXPORT_TMP_DIR, filename)
+
+    with PdfPages(report_path) as pdf:
+        fig = plt.figure(figsize=(11, 8.5))
+        fig.patch.set_facecolor("white")
+        gs = fig.add_gridspec(3, 1, height_ratios=[0.2, 0.4, 0.4])
+
+        ax_title = fig.add_subplot(gs[0, 0])
+        ax_title.axis("off")
+        title_text = f"CIP Exceedances & System Failures - {label}"
+        subtitle = f"Reporting Window: {_format_report_dt(start)} to {_format_report_dt(end)}"
+        ax_title.text(
+            0.0,
+            0.75,
+            title_text,
+            fontsize=17,
+            fontweight="bold",
+            color="#263238",
+        )
+        ax_title.text(
+            0.0,
+            0.4,
+            subtitle,
+            fontsize=11,
+            color="#546e7a",
+        )
+        ax_title.text(
+            0.0,
+            0.1,
+            "Exceedances reflect regulatory limit violations; system failures summarize health and data events.",
+            fontsize=9.5,
+            color="#607d8b",
+        )
+
+        ax_summary = fig.add_subplot(gs[1, 0])
+        ax_summary.axis("off")
+        summary_rows = [
+            ["Exceedance events", str(exceed_count)],
+            ["Exceedance duration", f"{exceed_minutes:.1f} min"],
+            ["System failure events", str(failure_count)],
+            ["Failure duration", f"{failure_minutes:.1f} min"],
+            ["Within limits (last 24h)", f"{threshold_summary.get('pct_24h', 0.0):.1f}%"],
+            ["Within limits (last 30d)", f"{threshold_summary.get('pct_30d', 0.0):.1f}%"],
+            ["System health status", str(system_health.get("status", "Unknown"))],
+            ["System health detail", str(system_health.get("status_reason", ""))],
+        ]
+        summary_table = ax_summary.table(
+            cellText=summary_rows,
+            colLabels=["Metric", "Value"],
+            cellLoc="left",
+            colLoc="left",
+            loc="center",
+        )
+        summary_table.auto_set_font_size(False)
+        summary_table.set_fontsize(10)
+        summary_table.scale(1, 1.3)
+        for (row, col), cell in summary_table.get_celld().items():
+            if row == 0:
+                cell.set_text_props(weight="bold", color="#263238")
+                cell.set_facecolor("#e0f2f1")
+            else:
+                cell.set_facecolor("#fafafa")
+                cell.set_edgecolor("#cfd8dc")
+
+        ax_tables = fig.add_subplot(gs[2, 0])
+        ax_tables.axis("off")
+
+        def _prepare_exceed_rows(df: pd.DataFrame) -> List[List[str]]:
+            if df.empty:
+                return [["No exceedance events in this window.", "", "", ""]]
+            rows: List[List[str]] = []
+            for _, row in df.sort_values("start_time", ascending=False).head(8).iterrows():
+                rows.append(
+                    [
+                        str(row.get("tag", "")),
+                        _format_report_dt(pd.to_datetime(row.get("start_time"), errors="coerce")),
+                        _format_report_dt(pd.to_datetime(row.get("end_time"), errors="coerce")),
+                        _format_duration(row.get("duration_sec")),
+                    ]
+                )
+            return rows
+
+        def _prepare_failure_rows(df: pd.DataFrame) -> List[List[str]]:
+            if df.empty:
+                return [["No system failure events in this window.", "", "", ""]]
+            rows: List[List[str]] = []
+            for _, row in df.sort_values("timestamp", ascending=False).head(8).iterrows():
+                rows.append(
+                    [
+                        str(row.get("event_type", "")),
+                        str(row.get("tag", "")),
+                        _format_report_dt(pd.to_datetime(row.get("timestamp"), errors="coerce")),
+                        _format_duration(row.get("duration_sec")),
+                    ]
+                )
+            return rows
+
+        exceed_rows = _prepare_exceed_rows(exceed_range)
+        failure_rows = _prepare_failure_rows(system_events)
+
+        table_ax = ax_tables.inset_axes([0.0, 0.05, 0.48, 0.9])
+        table_ax.axis("off")
+        table_ax.set_title("Recent Exceedances", fontsize=11, color="#263238", pad=6)
+        exceed_table = table_ax.table(
+            cellText=exceed_rows,
+            colLabels=["Tag", "Start", "End", "Duration"],
+            cellLoc="left",
+            colLoc="left",
+            loc="center",
+        )
+        exceed_table.auto_set_font_size(False)
+        exceed_table.set_fontsize(9)
+        exceed_table.scale(1, 1.2)
+
+        failure_ax = ax_tables.inset_axes([0.52, 0.05, 0.48, 0.9])
+        failure_ax.axis("off")
+        failure_ax.set_title("System Failures / Errors", fontsize=11, color="#263238", pad=6)
+        failure_table = failure_ax.table(
+            cellText=failure_rows,
+            colLabels=["Type", "Tag", "Timestamp", "Duration"],
+            cellLoc="left",
+            colLoc="left",
+            loc="center",
+        )
+        failure_table.auto_set_font_size(False)
+        failure_table.set_fontsize(9)
+        failure_table.scale(1, 1.2)
+
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    return report_path
+
+
 def build_report_payload(range_key: str):
     _write_export_lock()
     try:
         report_path = generate_report_pdf(range_key)
+    finally:
+        _clear_export_lock()
+    if not report_path or not os.path.exists(report_path):
+        return None
+    filename = os.path.basename(report_path)
+    return dcc.send_file(report_path, filename=filename)
+
+
+def build_incident_report_payload(range_key: str):
+    _write_export_lock()
+    try:
+        report_path = generate_incident_report_pdf(range_key)
     finally:
         _clear_export_lock()
     if not report_path or not os.path.exists(report_path):
@@ -2693,6 +2899,88 @@ app.layout = html.Div(
                                         ),
                                     ],
                                 ),
+                                html.Div(
+                                    "Exceedances & Failures (PDF)",
+                                    style={
+                                        "fontSize": "10px",
+                                        "color": "#90a4ae",
+                                    },
+                                ),
+                                html.Div(
+                                    style={
+                                        "display": "flex",
+                                        "gap": "6px",
+                                        "justifyContent": "flex-end",
+                                        "flexWrap": "wrap",
+                                    },
+                                    children=[
+                                        html.Button(
+                                            "Today",
+                                            id="incident-report-today-btn",
+                                            n_clicks=0,
+                                            style={
+                                                "backgroundColor": "#455a64",
+                                                "color": "#ecf0f1",
+                                                "border": "1px solid #546e7a",
+                                                "padding": "4px 8px",
+                                                "borderRadius": "6px",
+                                                "fontSize": "10px",
+                                            },
+                                        ),
+                                        html.Button(
+                                            "This Week",
+                                            id="incident-report-week-btn",
+                                            n_clicks=0,
+                                            style={
+                                                "backgroundColor": "#455a64",
+                                                "color": "#ecf0f1",
+                                                "border": "1px solid #546e7a",
+                                                "padding": "4px 8px",
+                                                "borderRadius": "6px",
+                                                "fontSize": "10px",
+                                            },
+                                        ),
+                                        html.Button(
+                                            "This Month",
+                                            id="incident-report-month-btn",
+                                            n_clicks=0,
+                                            style={
+                                                "backgroundColor": "#455a64",
+                                                "color": "#ecf0f1",
+                                                "border": "1px solid #546e7a",
+                                                "padding": "4px 8px",
+                                                "borderRadius": "6px",
+                                                "fontSize": "10px",
+                                            },
+                                        ),
+                                        html.Button(
+                                            "Previous Month",
+                                            id="incident-report-prev-month-btn",
+                                            n_clicks=0,
+                                            style={
+                                                "backgroundColor": "#455a64",
+                                                "color": "#ecf0f1",
+                                                "border": "1px solid #546e7a",
+                                                "padding": "4px 8px",
+                                                "borderRadius": "6px",
+                                                "fontSize": "10px",
+                                            },
+                                        ),
+                                        html.Button(
+                                            "All Time",
+                                            id="incident-report-all-time-btn",
+                                            n_clicks=0,
+                                            style={
+                                                "backgroundColor": "#455a64",
+                                                "color": "#ecf0f1",
+                                                "border": "1px solid #546e7a",
+                                                "padding": "4px 8px",
+                                                "borderRadius": "6px",
+                                                "fontSize": "10px",
+                                            },
+                                        ),
+                                    ],
+                                ),
                             ],
                         ),
                     ]
@@ -2713,6 +3001,11 @@ app.layout = html.Div(
         dcc.Download(id="report-month-download"),
         dcc.Download(id="report-prev-month-download"),
         dcc.Download(id="report-all-time-download"),
+        dcc.Download(id="incident-report-today-download"),
+        dcc.Download(id="incident-report-week-download"),
+        dcc.Download(id="incident-report-month-download"),
+        dcc.Download(id="incident-report-prev-month-download"),
+        dcc.Download(id="incident-report-all-time-download"),
 
         # Tabs: Overview (gauges) & Thresholds (editor)
         dcc.Tabs(
@@ -2990,6 +3283,51 @@ def export_prev_month_report(_n_clicks):
 )
 def export_all_time_report(_n_clicks):
     return build_report_payload("all_time")
+
+
+@app.callback(
+    Output("incident-report-today-download", "data"),
+    Input("incident-report-today-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_incident_today_report(_n_clicks):
+    return build_incident_report_payload("today")
+
+
+@app.callback(
+    Output("incident-report-week-download", "data"),
+    Input("incident-report-week-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_incident_week_report(_n_clicks):
+    return build_incident_report_payload("week")
+
+
+@app.callback(
+    Output("incident-report-month-download", "data"),
+    Input("incident-report-month-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_incident_month_report(_n_clicks):
+    return build_incident_report_payload("month")
+
+
+@app.callback(
+    Output("incident-report-prev-month-download", "data"),
+    Input("incident-report-prev-month-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_incident_prev_month_report(_n_clicks):
+    return build_incident_report_payload("prev_month")
+
+
+@app.callback(
+    Output("incident-report-all-time-download", "data"),
+    Input("incident-report-all-time-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_incident_all_time_report(_n_clicks):
+    return build_incident_report_payload("all_time")
 
 
 @app.callback(

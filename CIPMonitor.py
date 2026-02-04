@@ -1819,13 +1819,12 @@ def find_cems_tag(
 def build_cems_card(
     label: str,
     tag: Optional[str],
-    current_hour_avg: Dict[str, float],
+    current_hour_lb_hr: Dict[str, float],
     rolling_12hr_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
     thresholds: Dict[str, Dict[str, object]],
     alias_map: Optional[Dict[str, str]] = None,
 ) -> html.Div:
     entry = thresholds.get(tag, {}) if tag and isinstance(thresholds.get(tag, {}), dict) else {}
-    units = entry.get("units") if isinstance(entry.get("units"), str) else None
     alias = entry.get("alias") if isinstance(entry.get("alias"), str) else None
     if not alias and tag and alias_map:
         alias = alias_map.get(tag)
@@ -1835,15 +1834,15 @@ def build_cems_card(
     low_limit = entry.get("low_limit")
     high_limit = entry.get("high_limit")
 
-    value = current_hour_avg.get(tag, float("nan")) if tag else float("nan")
-    rolling_avg, _, ws, we, rolling_count = rolling_12hr_stats.get(
+    value = current_hour_lb_hr.get(tag, float("nan")) if tag else float("nan")
+    _, rolling_avg_lb_hr, ws, we, rolling_count = rolling_12hr_stats.get(
         tag, (float("nan"), float("nan"), None, None, 0)
     )
 
     low_for_range = low_oper if low_oper is not None else low_limit
     high_for_range = high_oper if high_oper is not None else high_limit
     low_eff, high_eff, gmin, gmax = compute_gauge_range(
-        low_for_range, high_for_range, [value, rolling_avg]
+        low_for_range, high_for_range, [value, rolling_avg_lb_hr]
     )
     low_for_class = low_oper if low_oper is not None else low_eff
     high_for_class = high_oper if high_oper is not None else high_eff
@@ -1856,14 +1855,22 @@ def build_cems_card(
     else:
         value_label = "—"
 
-    if rolling_avg == rolling_avg and ws is not None and we is not None and rolling_count > 0:
+    if (
+        rolling_avg_lb_hr == rolling_avg_lb_hr
+        and ws is not None
+        and we is not None
+        and rolling_count > 0
+    ):
         try:
             ws_s = ws.strftime("%Y-%m-%d %H:%M")
             we_s = we.strftime("%Y-%m-%d %H:%M")
         except Exception:
             ws_s = str(ws)
             we_s = str(we)
-        rolling_text = f"Rolling 12h {ws_s}–{we_s}: {rolling_avg:.2f} ({rolling_count} hrs)"
+        rolling_text = (
+            f"Rolling 12h {ws_s}–{we_s}: {rolling_avg_lb_hr:.2f} lb/hr "
+            f"({rolling_count} hrs)"
+        )
     else:
         rolling_text = "Rolling 12h: no data"
 
@@ -1873,8 +1880,7 @@ def build_cems_card(
         subtitle_bits.append(f"Tag: {tag}")
     else:
         subtitle_bits.append("No matching tag found yet")
-    if units:
-        subtitle_bits.append(f"Units: {units}")
+    subtitle_bits.append("Units: lb/hr")
     subtitle = " • ".join(subtitle_bits)
 
     return html.Div(
@@ -1897,7 +1903,7 @@ def build_cems_card(
                         color=color,
                         label=f"Current hourly avg: {value_label}",
                         size=200,
-                        units="",
+                        units="lb/hr",
                     ),
                 ],
             ),
@@ -2847,11 +2853,16 @@ def update_dashboard(n):
             load_alias_map_from_settings(),
         )
 
-        _, current_hour_avg, last_ts = extract_raw_stats(raw_df)
+        _, _, last_ts = extract_raw_stats(raw_df)
+        last_full_hour_stats = extract_last_full_hour(hourly_df)
         rolling_12hr_stats = extract_latest_rolling_12hr(rolling_df)
 
+        current_hour_lb_hr = {
+            tag: avg_lb_hr for tag, (_, avg_lb_hr, _, _, _) in last_full_hour_stats.items()
+        }
+
         tags = sorted(
-            set(current_hour_avg.keys())
+            set(current_hour_lb_hr.keys())
             | set(rolling_12hr_stats.keys())
             | set(load_configured_tags_from_settings())
             | set(thresholds.keys()),
@@ -2872,7 +2883,7 @@ def update_dashboard(n):
                 build_cems_card(
                     label=label,
                     tag=tag,
-                    current_hour_avg=current_hour_avg,
+                    current_hour_lb_hr=current_hour_lb_hr,
                     rolling_12hr_stats=rolling_12hr_stats,
                     thresholds=thresholds,
                     alias_map=alias_map,

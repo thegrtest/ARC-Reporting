@@ -2428,7 +2428,7 @@ app.layout = html.Div(
                 html.Div(
                     children=[
                         html.Div(
-                            "CIP Tag Web Dashboard",
+                            "ARC Reporting",
                             style={
                                 "fontSize": "18px",
                                 "fontWeight": "700",

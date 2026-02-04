@@ -322,32 +322,102 @@ def _compute_running_hours(
     return total_hours, running_hours, not_running
 
 
-def _get_report_range(range_key: str) -> Tuple[str, datetime, datetime]:
+def _get_report_range(
+    range_key: str,
+    data_start: Optional[datetime] = None,
+) -> Tuple[str, datetime, datetime]:
     now = datetime.now()
     if range_key == "today":
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         label = "Today"
+        end = now
     elif range_key == "week":
         start = (now - timedelta(days=now.weekday())).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         label = "This Week"
+        end = now
+    elif range_key == "prev_month":
+        first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        last_of_prev_month = first_of_this_month - timedelta(microseconds=1)
+        start = last_of_prev_month.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        label = "Previous Month"
+        end = last_of_prev_month
+    elif range_key == "all_time":
+        start = data_start or now.replace(hour=0, minute=0, second=0, microsecond=0)
+        label = "All Time"
+        end = now
     else:
         start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         label = "This Month"
-    return label, start, now
+        end = now
+    return label, start, end
+
+
+def _get_report_data_start(*frames: pd.DataFrame) -> Optional[datetime]:
+    earliest: Optional[datetime] = None
+    for df in frames:
+        if df is None or df.empty:
+            continue
+        for col in ("window_end", "hour_end"):
+            if col in df.columns:
+                series = pd.to_datetime(df[col], errors="coerce")
+                if series.notna().any():
+                    candidate = series.min()
+                    if pd.notna(candidate):
+                        ts = candidate.to_pydatetime()
+                        if earliest is None or ts < earliest:
+                            earliest = ts
+    return earliest
+
+
+def _compute_avg_flow(hourly_range: pd.DataFrame, flow_tag: Optional[str]) -> Optional[float]:
+    if not flow_tag or hourly_range is None or hourly_range.empty:
+        return None
+    flow_series = hourly_range.loc[hourly_range["tag"] == flow_tag]
+    if flow_series.empty:
+        return None
+    values = flow_series.get("avg_value")
+    if values is None:
+        values = flow_series.get("avg_lb_hr")
+    if values is None:
+        return None
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    if values.empty:
+        return None
+    return float(values.mean())
+
+
+def _compute_total_weight(hourly_range: pd.DataFrame, tag: Optional[str]) -> Optional[float]:
+    if not tag or hourly_range is None or hourly_range.empty:
+        return None
+    tag_series = hourly_range.loc[hourly_range["tag"] == tag]
+    if tag_series.empty:
+        return None
+    values = tag_series.get("avg_lb_hr")
+    if values is None:
+        values = tag_series.get("avg_value")
+    if values is None:
+        return None
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    if values.empty:
+        return None
+    return float(values.sum())
 
 
 def generate_report_pdf(range_key: str) -> Optional[str]:
-    label, start, end = _get_report_range(range_key)
     rolling_df = load_rolling_12hr_stats()
     hourly_df = load_hourly_stats()
+    data_start = _get_report_data_start(rolling_df, hourly_df)
+    label, start, end = _get_report_range(range_key, data_start=data_start)
     alias_map = build_alias_lookup(
         pd.DataFrame(),
         hourly_df,
         rolling_df,
         load_alias_map_from_settings(),
     )
+    thresholds = load_thresholds()
+    epa_settings = load_epa_settings()
 
     rolling_range = _filter_time_range(rolling_df, "window_end", start, end)
     hourly_range = _filter_time_range(hourly_df, "hour_end", start, end)
@@ -378,6 +448,15 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
     total_hours, running_hours, not_running_hours = _compute_running_hours(
         hourly_range, [tag for tag in [co_tag, nox_tag] if tag], start, end
     )
+
+    tags = sorted(set(hourly_range.get("tag", pd.Series(dtype=str)).dropna().astype(str)))
+    flow_tag = str(epa_settings.get("epa_flow_tag", "") or "")
+    if not flow_tag:
+        flow_tag = find_flow_tag(tags, thresholds, alias_map)
+    flow_avg = _compute_avg_flow(hourly_range, flow_tag)
+    flow_label = _display_name(flow_tag, alias_map, "Flow")
+    co_weight = _compute_total_weight(hourly_range, co_tag)
+    nox_weight = _compute_total_weight(hourly_range, nox_tag)
 
     ensure_dir(EXPORT_TMP_DIR)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -479,6 +558,18 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
             ["CO Peak (lb/hr)", f"{co_peak:.2f} @ {_format_report_dt(co_peak_time)}" if co_peak is not None else "N/A"],
             ["NOx Peak (lb/hr)", f"{nox_peak:.2f} @ {_format_report_dt(nox_peak_time)}" if nox_peak is not None else "N/A"],
             ["O2 Peak (%)", f"{o2_peak:.2f} @ {_format_report_dt(o2_peak_time)}" if o2_peak is not None else "N/A"],
+            [
+                f"Average Flow Rate ({flow_label})",
+                f"{flow_avg:.2f}" if flow_avg is not None else "N/A",
+            ],
+            [
+                "CO Total Weight (lb)",
+                f"{co_weight:.2f}" if co_weight is not None else "N/A",
+            ],
+            [
+                "NOx Total Weight (lb)",
+                f"{nox_weight:.2f}" if nox_weight is not None else "N/A",
+            ],
             ["Total Hours Tracked", f"{total_hours}"],
             ["Running Hours", f"{running_hours}"],
             ["Not Running Hours", f"{not_running_hours}"],
@@ -2574,6 +2665,32 @@ app.layout = html.Div(
                                                 "fontSize": "10px",
                                             },
                                         ),
+                                        html.Button(
+                                            "Previous Month",
+                                            id="report-prev-month-btn",
+                                            n_clicks=0,
+                                            style={
+                                                "backgroundColor": "#37474f",
+                                                "color": "#ecf0f1",
+                                                "border": "1px solid #455a64",
+                                                "padding": "4px 8px",
+                                                "borderRadius": "6px",
+                                                "fontSize": "10px",
+                                            },
+                                        ),
+                                        html.Button(
+                                            "All Time",
+                                            id="report-all-time-btn",
+                                            n_clicks=0,
+                                            style={
+                                                "backgroundColor": "#37474f",
+                                                "color": "#ecf0f1",
+                                                "border": "1px solid #455a64",
+                                                "padding": "4px 8px",
+                                                "borderRadius": "6px",
+                                                "fontSize": "10px",
+                                            },
+                                        ),
                                     ],
                                 ),
                             ],
@@ -2594,6 +2711,8 @@ app.layout = html.Div(
         dcc.Download(id="report-today-download"),
         dcc.Download(id="report-week-download"),
         dcc.Download(id="report-month-download"),
+        dcc.Download(id="report-prev-month-download"),
+        dcc.Download(id="report-all-time-download"),
 
         # Tabs: Overview (gauges) & Thresholds (editor)
         dcc.Tabs(
@@ -2853,6 +2972,24 @@ def export_week_report(_n_clicks):
 )
 def export_month_report(_n_clicks):
     return build_report_payload("month")
+
+
+@app.callback(
+    Output("report-prev-month-download", "data"),
+    Input("report-prev-month-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_prev_month_report(_n_clicks):
+    return build_report_payload("prev_month")
+
+
+@app.callback(
+    Output("report-all-time-download", "data"),
+    Input("report-all-time-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_all_time_report(_n_clicks):
+    return build_report_payload("all_time")
 
 
 @app.callback(

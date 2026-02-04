@@ -1,5 +1,6 @@
 pandas
 dash
 dash-daq
+matplotlib
 PySide6
 pylogix

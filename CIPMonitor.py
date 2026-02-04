@@ -33,6 +33,13 @@ import sys
 from datetime import datetime, timedelta
 from typing import Dict, Tuple, List, Optional
 
+import matplotlib
+
+matplotlib.use("Agg")
+
+from matplotlib import pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+
 try:
     import pandas as pd
 except ModuleNotFoundError as exc:
@@ -228,6 +235,291 @@ def build_export_payload(path: str, headers: List[str], filename: str):
     if not export_copy or not os.path.exists(export_copy):
         return None
     return dcc.send_file(export_copy, filename=filename)
+
+
+def _format_report_dt(value: Optional[datetime]) -> str:
+    if not value or pd.isna(value):
+        return "N/A"
+    return value.strftime("%Y-%m-%d %H:%M")
+
+
+def _filter_time_range(df: pd.DataFrame, time_col: str, start: datetime, end: datetime) -> pd.DataFrame:
+    if df is None or df.empty or time_col not in df.columns:
+        return pd.DataFrame(columns=df.columns if df is not None else [])
+    mask = (df[time_col] >= start) & (df[time_col] <= end)
+    return df.loc[mask].copy()
+
+
+def _find_tag_by_patterns(
+    df: pd.DataFrame,
+    alias_map: Dict[str, str],
+    patterns: List[re.Pattern],
+) -> str:
+    if df is None or df.empty or "tag" not in df.columns:
+        return ""
+    for tag in df["tag"].dropna().unique():
+        tag_str = str(tag)
+        alias = alias_map.get(tag_str, "")
+        combined = f"{tag_str} {alias}".casefold()
+        if any(pattern.search(combined) for pattern in patterns):
+            return tag_str
+    return ""
+
+
+def _display_name(tag: str, alias_map: Dict[str, str], fallback: str) -> str:
+    if not tag:
+        return fallback
+    alias = alias_map.get(tag, "")
+    if alias:
+        return f"{alias} ({tag})"
+    return tag
+
+
+def _compute_peak(
+    df: pd.DataFrame, tag: str, value_col: str, time_col: str
+) -> Tuple[Optional[float], Optional[datetime]]:
+    if not tag or df is None or df.empty:
+        return None, None
+    subset = df.loc[df["tag"] == tag].dropna(subset=[value_col, time_col])
+    if subset.empty:
+        return None, None
+    try:
+        idx = subset[value_col].idxmax()
+    except Exception:
+        return None, None
+    row = subset.loc[idx]
+    return _to_float(row.get(value_col)), row.get(time_col)
+
+
+def _compute_running_hours(
+    hourly_df: pd.DataFrame,
+    tags: List[str],
+    start: datetime,
+    end: datetime,
+) -> Tuple[int, int, int]:
+    if hourly_df is None or hourly_df.empty or not tags:
+        return 0, 0, 0
+    hourly_range = _filter_time_range(hourly_df, "hour_end", start, end)
+    if hourly_range.empty:
+        return 0, 0, 0
+    hourly_range = hourly_range.loc[hourly_range["tag"].isin(tags)]
+    if hourly_range.empty:
+        return 0, 0, 0
+    total_hours = 0
+    running_hours = 0
+    for hour_end, group in hourly_range.groupby("hour_end"):
+        if pd.isna(hour_end):
+            continue
+        total_hours += 1
+        values = group.get("avg_lb_hr")
+        if values is None:
+            values = group.get("avg_value")
+        if values is None:
+            values = group["avg_value"] if "avg_value" in group else None
+        if values is not None and (pd.to_numeric(values, errors="coerce").fillna(0) > 0).any():
+            running_hours += 1
+    not_running = max(total_hours - running_hours, 0)
+    return total_hours, running_hours, not_running
+
+
+def _get_report_range(range_key: str) -> Tuple[str, datetime, datetime]:
+    now = datetime.now()
+    if range_key == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        label = "Today"
+    elif range_key == "week":
+        start = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        label = "This Week"
+    else:
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        label = "This Month"
+    return label, start, now
+
+
+def generate_report_pdf(range_key: str) -> Optional[str]:
+    label, start, end = _get_report_range(range_key)
+    rolling_df = load_rolling_12hr_stats()
+    hourly_df = load_hourly_stats()
+    alias_map = build_alias_lookup(
+        pd.DataFrame(),
+        hourly_df,
+        rolling_df,
+        load_alias_map_from_settings(),
+    )
+
+    rolling_range = _filter_time_range(rolling_df, "window_end", start, end)
+    hourly_range = _filter_time_range(hourly_df, "hour_end", start, end)
+
+    co_pattern = [re.compile(r"\bco\b|co[_\s-]", re.IGNORECASE)]
+    nox_pattern = [re.compile(r"\bnox\b|no[_\s-]?x", re.IGNORECASE)]
+    o2_pattern = [re.compile(r"\bo2\b|o2[_\s-]", re.IGNORECASE)]
+
+    co_tag = _find_tag_by_patterns(rolling_range, alias_map, co_pattern)
+    nox_tag = _find_tag_by_patterns(rolling_range, alias_map, nox_pattern)
+    o2_tag = _find_tag_by_patterns(rolling_range, alias_map, o2_pattern)
+
+    if not co_tag and not nox_tag and not o2_tag and not rolling_range.empty:
+        co_tag = _find_tag_by_patterns(rolling_df, alias_map, co_pattern)
+        nox_tag = _find_tag_by_patterns(rolling_df, alias_map, nox_pattern)
+        o2_tag = _find_tag_by_patterns(rolling_df, alias_map, o2_pattern)
+
+    co_series = rolling_range.loc[rolling_range["tag"] == co_tag] if co_tag else pd.DataFrame()
+    nox_series = rolling_range.loc[rolling_range["tag"] == nox_tag] if nox_tag else pd.DataFrame()
+    o2_series = rolling_range.loc[rolling_range["tag"] == o2_tag] if o2_tag else pd.DataFrame()
+
+    co_peak, co_peak_time = _compute_peak(rolling_range, co_tag, "avg_lb_hr", "window_end")
+    nox_peak, nox_peak_time = _compute_peak(
+        rolling_range, nox_tag, "avg_lb_hr", "window_end"
+    )
+    o2_peak, o2_peak_time = _compute_peak(rolling_range, o2_tag, "avg_value", "window_end")
+
+    total_hours, running_hours, not_running_hours = _compute_running_hours(
+        hourly_range, [tag for tag in [co_tag, nox_tag] if tag], start, end
+    )
+
+    ensure_dir(EXPORT_TMP_DIR)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"cip_report_{range_key}_{timestamp}.pdf"
+    report_path = os.path.join(EXPORT_TMP_DIR, filename)
+
+    with PdfPages(report_path) as pdf:
+        fig = plt.figure(figsize=(11, 8.5))
+        fig.patch.set_facecolor("white")
+        gs = fig.add_gridspec(3, 1, height_ratios=[0.18, 0.55, 0.27])
+
+        ax_title = fig.add_subplot(gs[0, 0])
+        ax_title.axis("off")
+        title_text = f"CIP Emissions Report - {label}"
+        subtitle = f"Reporting Window: {_format_report_dt(start)} to {_format_report_dt(end)}"
+        ax_title.text(
+            0.0,
+            0.75,
+            title_text,
+            fontsize=18,
+            fontweight="bold",
+            color="#263238",
+        )
+        ax_title.text(
+            0.0,
+            0.4,
+            subtitle,
+            fontsize=11,
+            color="#546e7a",
+        )
+        ax_title.text(
+            0.0,
+            0.1,
+            "Rolling 12-hour averages for CO/NOx (lb/hr) with %O2 trend overlay.",
+            fontsize=9.5,
+            color="#607d8b",
+        )
+
+        ax_chart = fig.add_subplot(gs[1, 0])
+        ax_chart.set_title("Rolling 12-Hour Averages", fontsize=12, color="#263238")
+        ax_chart.set_ylabel("lb/hr", color="#263238")
+        ax_chart.grid(True, linestyle="--", alpha=0.3)
+        ax_chart.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%m-%d\n%H:%M"))
+
+        lines = []
+        labels = []
+
+        if not co_series.empty:
+            line, = ax_chart.plot(
+                co_series["window_end"],
+                co_series["avg_lb_hr"],
+                color="#ef6c00",
+                linewidth=2,
+            )
+            lines.append(line)
+            labels.append(f"CO 12-hr avg ({_display_name(co_tag, alias_map, 'CO')})")
+
+        if not nox_series.empty:
+            line, = ax_chart.plot(
+                nox_series["window_end"],
+                nox_series["avg_lb_hr"],
+                color="#3949ab",
+                linewidth=2,
+            )
+            lines.append(line)
+            labels.append(f"NOx 12-hr avg ({_display_name(nox_tag, alias_map, 'NOx')})")
+
+        ax_o2 = ax_chart.twinx()
+        ax_o2.set_ylabel("%O2", color="#2e7d32")
+        if not o2_series.empty:
+            line, = ax_o2.plot(
+                o2_series["window_end"],
+                o2_series["avg_value"],
+                color="#2e7d32",
+                linestyle="--",
+                linewidth=2,
+            )
+            lines.append(line)
+            labels.append(f"O2 % ({_display_name(o2_tag, alias_map, 'O2')})")
+
+        if lines:
+            ax_chart.legend(lines, labels, loc="upper left", fontsize=8, frameon=False)
+        else:
+            ax_chart.text(
+                0.5,
+                0.5,
+                "No rolling 12-hour data available for the selected window.",
+                ha="center",
+                va="center",
+                fontsize=11,
+                color="#90a4ae",
+                transform=ax_chart.transAxes,
+            )
+
+        ax_table = fig.add_subplot(gs[2, 0])
+        ax_table.axis("off")
+
+        summary_rows = [
+            ["CO Peak (lb/hr)", f"{co_peak:.2f} @ {_format_report_dt(co_peak_time)}" if co_peak is not None else "N/A"],
+            ["NOx Peak (lb/hr)", f"{nox_peak:.2f} @ {_format_report_dt(nox_peak_time)}" if nox_peak is not None else "N/A"],
+            ["O2 Peak (%)", f"{o2_peak:.2f} @ {_format_report_dt(o2_peak_time)}" if o2_peak is not None else "N/A"],
+            ["Total Hours Tracked", f"{total_hours}"],
+            ["Running Hours", f"{running_hours}"],
+            ["Not Running Hours", f"{not_running_hours}"],
+        ]
+
+        table = ax_table.table(
+            cellText=summary_rows,
+            colLabels=["Metric", "Value"],
+            cellLoc="left",
+            colLoc="left",
+            loc="center",
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(9.5)
+        table.scale(1, 1.4)
+
+        for (row, col), cell in table.get_celld().items():
+            if row == 0:
+                cell.set_text_props(weight="bold", color="#263238")
+                cell.set_facecolor("#e0f2f1")
+            else:
+                cell.set_facecolor("#fafafa")
+                cell.set_edgecolor("#cfd8dc")
+
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    return report_path
+
+
+def build_report_payload(range_key: str):
+    _write_export_lock()
+    try:
+        report_path = generate_report_pdf(range_key)
+    finally:
+        _clear_export_lock()
+    if not report_path or not os.path.exists(report_path):
+        return None
+    filename = os.path.basename(report_path)
+    return dcc.send_file(report_path, filename=filename)
 
 
 def get_latest_raw_path() -> Optional[str]:
@@ -2078,6 +2370,73 @@ app.layout = html.Div(
                                 ),
                             ],
                         ),
+                        html.Div(
+                            style={
+                                "marginTop": "8px",
+                                "display": "flex",
+                                "flexDirection": "column",
+                                "alignItems": "flex-end",
+                                "gap": "4px",
+                            },
+                            children=[
+                                html.Div(
+                                    "Generate Report (PDF)",
+                                    style={
+                                        "fontSize": "10px",
+                                        "color": "#90a4ae",
+                                    },
+                                ),
+                                html.Div(
+                                    style={
+                                        "display": "flex",
+                                        "gap": "6px",
+                                        "justifyContent": "flex-end",
+                                        "flexWrap": "wrap",
+                                    },
+                                    children=[
+                                        html.Button(
+                                            "Today",
+                                            id="report-today-btn",
+                                            n_clicks=0,
+                                            style={
+                                                "backgroundColor": "#37474f",
+                                                "color": "#ecf0f1",
+                                                "border": "1px solid #455a64",
+                                                "padding": "4px 8px",
+                                                "borderRadius": "6px",
+                                                "fontSize": "10px",
+                                            },
+                                        ),
+                                        html.Button(
+                                            "This Week",
+                                            id="report-week-btn",
+                                            n_clicks=0,
+                                            style={
+                                                "backgroundColor": "#37474f",
+                                                "color": "#ecf0f1",
+                                                "border": "1px solid #455a64",
+                                                "padding": "4px 8px",
+                                                "borderRadius": "6px",
+                                                "fontSize": "10px",
+                                            },
+                                        ),
+                                        html.Button(
+                                            "This Month",
+                                            id="report-month-btn",
+                                            n_clicks=0,
+                                            style={
+                                                "backgroundColor": "#37474f",
+                                                "color": "#ecf0f1",
+                                                "border": "1px solid #455a64",
+                                                "padding": "4px 8px",
+                                                "borderRadius": "6px",
+                                                "fontSize": "10px",
+                                            },
+                                        ),
+                                    ],
+                                ),
+                            ],
+                        ),
                     ]
                 ),
             ],
@@ -2091,6 +2450,9 @@ app.layout = html.Div(
         dcc.Download(id="export-minute-download"),
         dcc.Download(id="export-hourly-download"),
         dcc.Download(id="export-rolling-download"),
+        dcc.Download(id="report-today-download"),
+        dcc.Download(id="report-week-download"),
+        dcc.Download(id="report-month-download"),
 
         # Tabs: Overview (gauges) & Thresholds (editor)
         dcc.Tabs(
@@ -2323,6 +2685,33 @@ def export_rolling_averages(_n_clicks):
         ROLLING_AVG_HEADERS,
         "rolling_12hr_averages.csv",
     )
+
+
+@app.callback(
+    Output("report-today-download", "data"),
+    Input("report-today-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_today_report(_n_clicks):
+    return build_report_payload("today")
+
+
+@app.callback(
+    Output("report-week-download", "data"),
+    Input("report-week-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_week_report(_n_clicks):
+    return build_report_payload("week")
+
+
+@app.callback(
+    Output("report-month-download", "data"),
+    Input("report-month-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_month_report(_n_clicks):
+    return build_report_payload("month")
 
 
 @app.callback(

@@ -1794,6 +1794,13 @@ def _match_cems_metric(value: Optional[str], metric: str) -> bool:
     return "cems" in normalized and metric in normalized
 
 
+def _match_flow_metric(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    normalized = _normalize_label(value)
+    return "flow" in normalized
+
+
 def find_cems_tag(
     metric: str,
     tags: List[str],
@@ -1812,6 +1819,27 @@ def find_cems_tag(
                 return tag
     for tag in tags:
         if _match_cems_metric(tag, metric):
+            return tag
+    return None
+
+
+def find_flow_tag(
+    tags: List[str],
+    thresholds: Dict[str, Dict[str, object]],
+    alias_map: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    for tag in tags:
+        entry = thresholds.get(tag, {}) if isinstance(thresholds.get(tag, {}), dict) else {}
+        alias = entry.get("alias") if isinstance(entry.get("alias"), str) else ""
+        if _match_flow_metric(alias):
+            return tag
+    if alias_map:
+        for tag in tags:
+            alias = alias_map.get(tag, "")
+            if _match_flow_metric(alias):
+                return tag
+    for tag in tags:
+        if _match_flow_metric(tag):
             return tag
     return None
 
@@ -1904,6 +1932,105 @@ def build_cems_card(
                         label=f"Current hourly avg: {value_label}",
                         size=200,
                         units="lb/hr",
+                    ),
+                ],
+            ),
+            html.Div(rolling_text, style={"fontSize": "11px", "color": "#90a4ae"}),
+        ],
+    )
+
+
+def build_flow_card(
+    label: str,
+    tag: Optional[str],
+    current_hour_avg: Dict[str, float],
+    rolling_12hr_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
+    thresholds: Dict[str, Dict[str, object]],
+    alias_map: Optional[Dict[str, str]] = None,
+) -> html.Div:
+    entry = thresholds.get(tag, {}) if tag and isinstance(thresholds.get(tag, {}), dict) else {}
+    alias = entry.get("alias") if isinstance(entry.get("alias"), str) else None
+    if not alias and tag and alias_map:
+        alias = alias_map.get(tag)
+
+    units = entry.get("units") if isinstance(entry.get("units"), str) else ""
+    units_label = units or "scfm"
+
+    low_oper = entry.get("low_oper")
+    high_oper = entry.get("high_oper")
+    low_limit = entry.get("low_limit")
+    high_limit = entry.get("high_limit")
+
+    value = current_hour_avg.get(tag, float("nan")) if tag else float("nan")
+    rolling_entry = rolling_12hr_stats.get(tag, (float("nan"), float("nan"), None, None, 0))
+    rolling_avg = rolling_entry[0]
+    _, _, ws, we, rolling_count = rolling_entry
+
+    low_for_range = low_oper if low_oper is not None else low_limit
+    high_for_range = high_oper if high_oper is not None else high_limit
+    low_eff, high_eff, gmin, gmax = compute_gauge_range(
+        low_for_range, high_for_range, [value, rolling_avg]
+    )
+    low_for_class = low_oper if low_oper is not None else low_eff
+    high_for_class = high_oper if high_oper is not None else high_eff
+
+    status = classify_value(value, low_for_class, high_for_class)
+    color = status_color(status)
+
+    if value == value:
+        value_label = f"{value:.2f}"
+    else:
+        value_label = "—"
+
+    if (
+        rolling_avg == rolling_avg
+        and ws is not None
+        and we is not None
+        and rolling_count > 0
+    ):
+        try:
+            ws_s = ws.strftime("%Y-%m-%d %H:%M")
+            we_s = we.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            ws_s = str(ws)
+            we_s = str(we)
+        rolling_text = (
+            f"Rolling 12h {ws_s}–{we_s}: {rolling_avg:.2f} {units_label} "
+            f"({rolling_count} hrs)"
+        )
+    else:
+        rolling_text = "Rolling 12h: no data"
+
+    header = alias or label
+    subtitle_bits = []
+    if tag:
+        subtitle_bits.append(f"Tag: {tag}")
+    else:
+        subtitle_bits.append("No matching tag found yet")
+    subtitle_bits.append(f"Units: {units_label}")
+    subtitle = " • ".join(subtitle_bits)
+
+    return html.Div(
+        style=CARD_STYLE,
+        children=[
+            html.Div(
+                header,
+                style={"fontWeight": "600", "fontSize": "13px", "color": "#e0e6ed"},
+            ),
+            html.Div(subtitle, style={"fontSize": "11px", "color": "#90a4ae"}),
+            html.Div(
+                style=GAUGE_CONTAINER_STYLE,
+                children=[
+                    daq.Gauge(
+                        id={"type": "flow-gauge", "tag": tag or label},
+                        min=gmin,
+                        max=gmax,
+                        value=value if value == value else gmin,
+                        showCurrentValue=True,
+                        color=color,
+                        label=f"Current hourly avg: {value_label}",
+                        size=200,
+                        units=units_label,
                     ),
                 ],
             ),
@@ -2857,8 +2984,12 @@ def update_dashboard(n):
         last_full_hour_stats = extract_last_full_hour(hourly_df)
         rolling_12hr_stats = extract_latest_rolling_12hr(rolling_df)
 
+        epa_settings = load_epa_settings()
         current_hour_lb_hr = {
             tag: avg_lb_hr for tag, (_, avg_lb_hr, _, _, _) in last_full_hour_stats.items()
+        }
+        current_hour_avg = {
+            tag: avg for tag, (avg, _, _, _, _) in last_full_hour_stats.items()
         }
 
         tags = sorted(
@@ -2877,6 +3008,19 @@ def update_dashboard(n):
         }
 
         cards = []
+        flow_tag = str(epa_settings.get("epa_flow_tag", "") or "")
+        if not flow_tag:
+            flow_tag = find_flow_tag(tags, thresholds, alias_map)
+        cards.append(
+            build_flow_card(
+                label="Air Flow",
+                tag=flow_tag or None,
+                current_hour_avg=current_hour_avg,
+                rolling_12hr_stats=rolling_12hr_stats,
+                thresholds=thresholds,
+                alias_map=alias_map,
+            )
+        )
         for metric, label in cems_map.items():
             tag = find_cems_tag(metric, tags, thresholds, alias_map)
             cards.append(

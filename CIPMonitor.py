@@ -2401,7 +2401,7 @@ def build_compliance_view(
 # ----------------- dash app -----------------
 
 app = Dash(__name__)
-app.title = "CIP Web Dashboard"
+app.title = "ARC Reporting"
 server = app.server
 
 app.layout = html.Div(

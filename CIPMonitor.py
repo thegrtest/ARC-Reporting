@@ -1848,9 +1848,12 @@ def build_cems_card(
     label: str,
     tag: Optional[str],
     current_hour_lb_hr: Dict[str, float],
+    current_hour_avg: Dict[str, float],
     rolling_12hr_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
     thresholds: Dict[str, Dict[str, object]],
     alias_map: Optional[Dict[str, str]] = None,
+    units_label: str = "lb/hr",
+    use_avg_value: bool = False,
 ) -> html.Div:
     entry = thresholds.get(tag, {}) if tag and isinstance(thresholds.get(tag, {}), dict) else {}
     alias = entry.get("alias") if isinstance(entry.get("alias"), str) else None
@@ -1862,15 +1865,20 @@ def build_cems_card(
     low_limit = entry.get("low_limit")
     high_limit = entry.get("high_limit")
 
-    value = current_hour_lb_hr.get(tag, float("nan")) if tag else float("nan")
-    _, rolling_avg_lb_hr, ws, we, rolling_count = rolling_12hr_stats.get(
+    if use_avg_value:
+        value = current_hour_avg.get(tag, float("nan")) if tag else float("nan")
+    else:
+        value = current_hour_lb_hr.get(tag, float("nan")) if tag else float("nan")
+    rolling_entry = rolling_12hr_stats.get(
         tag, (float("nan"), float("nan"), None, None, 0)
     )
+    rolling_avg_value, rolling_avg_lb_hr, ws, we, rolling_count = rolling_entry
+    rolling_avg = rolling_avg_value if use_avg_value else rolling_avg_lb_hr
 
     low_for_range = low_oper if low_oper is not None else low_limit
     high_for_range = high_oper if high_oper is not None else high_limit
     low_eff, high_eff, gmin, gmax = compute_gauge_range(
-        low_for_range, high_for_range, [value, rolling_avg_lb_hr]
+        low_for_range, high_for_range, [value, rolling_avg]
     )
     low_for_class = low_oper if low_oper is not None else low_eff
     high_for_class = high_oper if high_oper is not None else high_eff
@@ -1884,7 +1892,7 @@ def build_cems_card(
         value_label = "—"
 
     if (
-        rolling_avg_lb_hr == rolling_avg_lb_hr
+        rolling_avg == rolling_avg
         and ws is not None
         and we is not None
         and rolling_count > 0
@@ -1896,7 +1904,7 @@ def build_cems_card(
             ws_s = str(ws)
             we_s = str(we)
         rolling_text = (
-            f"Rolling 12h {ws_s}–{we_s}: {rolling_avg_lb_hr:.2f} lb/hr "
+            f"Rolling 12h {ws_s}–{we_s}: {rolling_avg:.2f} {units_label} "
             f"({rolling_count} hrs)"
         )
     else:
@@ -1908,7 +1916,7 @@ def build_cems_card(
         subtitle_bits.append(f"Tag: {tag}")
     else:
         subtitle_bits.append("No matching tag found yet")
-    subtitle_bits.append("Units: lb/hr")
+    subtitle_bits.append(f"Units: {units_label}")
     subtitle = " • ".join(subtitle_bits)
 
     return html.Div(
@@ -1931,7 +1939,7 @@ def build_cems_card(
                         color=color,
                         label=f"Current hourly avg: {value_label}",
                         size=200,
-                        units="lb/hr",
+                        units=units_label,
                     ),
                 ],
             ),
@@ -3023,14 +3031,19 @@ def update_dashboard(n):
         )
         for metric, label in cems_map.items():
             tag = find_cems_tag(metric, tags, thresholds, alias_map)
+            use_avg_value = metric == "o2"
+            units_label = "%" if use_avg_value else "lb/hr"
             cards.append(
                 build_cems_card(
                     label=label,
                     tag=tag,
                     current_hour_lb_hr=current_hour_lb_hr,
+                    current_hour_avg=current_hour_avg,
                     rolling_12hr_stats=rolling_12hr_stats,
                     thresholds=thresholds,
                     alias_map=alias_map,
+                    units_label=units_label,
+                    use_avg_value=use_avg_value,
                 )
             )
 

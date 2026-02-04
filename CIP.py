@@ -931,7 +931,7 @@ class MainWindow(QMainWindow):
         self._pending_raw_rows: Dict[str, List[List[object]]] = {}
         self._pending_minute_rows: List[List[object]] = []
         self._pending_hourly_records: Dict[
-            Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]
+            Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]
         ] = {}
         self._pending_hour_end_queue: deque[datetime] = deque()
         self._export_pause_started: Optional[float] = None
@@ -999,15 +999,15 @@ class MainWindow(QMainWindow):
         # ensure hourly CSV
         ensure_csv(
             self.minute_csv_path,
-            ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+            ["minute_start", "minute_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
         )
         ensure_csv(
             self.hourly_csv_path,
-            ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+            ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
         )
         ensure_csv(
             self.rolling_12hr_csv_path,
-            ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"],
+            ["window_start", "window_end", "tag", "alias", "avg_value", "avg_lb_hr", "hours_count"],
         )
         self._load_latest_rolling_12hr()
         self._start_poll_watchdog()
@@ -1369,7 +1369,7 @@ class MainWindow(QMainWindow):
             try:
                 ensure_csv(
                     self.minute_csv_path,
-                    ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+                    ["minute_start", "minute_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
                 )
                 with open(self.minute_csv_path, "a", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
@@ -1386,19 +1386,20 @@ class MainWindow(QMainWindow):
             try:
                 ensure_csv(
                     self.hourly_csv_path,
-                    ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+                    ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
                 )
                 with open(self.hourly_csv_path, "w", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     writer.writerow(
-                        ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"]
+                        ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"]
                     )
-                    for (hs, tag), (he, avg, lbhr_avg, cnt) in sorted(records.items()):
+                    for (hs, tag), (he, avg, lbhr_avg, cnt, alias) in sorted(records.items()):
                         writer.writerow(
                             [
                                 hs,
                                 he,
                                 tag,
+                                alias,
                                 "" if avg is None else avg,
                                 "" if lbhr_avg is None else lbhr_avg,
                                 cnt,
@@ -2792,11 +2793,11 @@ class MainWindow(QMainWindow):
         self.thresholds = self._load_thresholds_from_log_dir()
         ensure_csv(
             self.minute_csv_path,
-            ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+            ["minute_start", "minute_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
         )
         ensure_csv(
             self.rolling_12hr_csv_path,
-            ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"],
+            ["window_start", "window_end", "tag", "alias", "avg_value", "avg_lb_hr", "hours_count"],
         )
         self._load_latest_rolling_12hr()
 
@@ -3138,15 +3139,15 @@ class MainWindow(QMainWindow):
             self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
             ensure_csv(
                 self.minute_csv_path,
-                ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+                ["minute_start", "minute_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
             )
             ensure_csv(
                 self.hourly_csv_path,
-                ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+                ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
             )
             ensure_csv(
                 self.rolling_12hr_csv_path,
-                ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"],
+                ["window_start", "window_end", "tag", "alias", "avg_value", "avg_lb_hr", "hours_count"],
             )
             self._ensure_env_events_csv()
             self.current_log_date = datetime.now().date()
@@ -3231,15 +3232,15 @@ class MainWindow(QMainWindow):
         self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
         ensure_csv(
             self.minute_csv_path,
-            ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+            ["minute_start", "minute_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
         )
         ensure_csv(
             self.hourly_csv_path,
-            ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+            ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
         )
         ensure_csv(
             self.rolling_12hr_csv_path,
-            ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"],
+            ["window_start", "window_end", "tag", "alias", "avg_value", "avg_lb_hr", "hours_count"],
         )
         self._load_latest_rolling_12hr()
 
@@ -3739,11 +3740,13 @@ class MainWindow(QMainWindow):
                     lbhr_avg = derived_lbhr
             if tag in epa_calc_tags and lbhr_avg is None:
                 lbhr_avg = minute_avg
+            alias = self.alias_map.get(tag, "")
             rows.append(
                 [
                     minute_start_iso,
                     minute_end_iso,
                     tag,
+                    alias,
                     minute_avg,
                     "" if lbhr_avg is None else lbhr_avg,
                     count,
@@ -3753,7 +3756,7 @@ class MainWindow(QMainWindow):
         try:
             ensure_csv(
                 self.minute_csv_path,
-                ["minute_start", "minute_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+                ["minute_start", "minute_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
             )
             if self._is_export_locked():
                 self._record_export_pause("minute average")
@@ -3799,8 +3802,8 @@ class MainWindow(QMainWindow):
 
     def _load_rolling_12hr_records(
         self,
-    ) -> Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]]:
-        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]] = {}
+    ) -> Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]]:
+        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]] = {}
         if not os.path.exists(self.rolling_12hr_csv_path):
             return records
         try:
@@ -3811,11 +3814,13 @@ class MainWindow(QMainWindow):
                     tag = row.get("tag", "")
                     if not window_end or not tag:
                         continue
+                    alias = row.get("alias", "") or ""
                     records[(window_end, tag)] = (
                         row.get("window_start", ""),
                         self._safe_float(row.get("avg_value")),
                         self._safe_float(row.get("avg_lb_hr")),
                         int(row.get("hours_count", "0") or 0),
+                        alias,
                     )
         except Exception as e:
             self.log_message(f"Error reading rolling 12-hour CSV: {e}")
@@ -3823,25 +3828,26 @@ class MainWindow(QMainWindow):
 
     def _write_rolling_12hr_records(
         self,
-        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]],
+        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]],
     ) -> None:
         try:
             ensure_csv(
                 self.rolling_12hr_csv_path,
-                ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"],
+                ["window_start", "window_end", "tag", "alias", "avg_value", "avg_lb_hr", "hours_count"],
             )
             self._wait_for_export_unlock("rolling 12-hour")
             with open(self.rolling_12hr_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(
-                    ["window_start", "window_end", "tag", "avg_value", "avg_lb_hr", "hours_count"]
+                    ["window_start", "window_end", "tag", "alias", "avg_value", "avg_lb_hr", "hours_count"]
                 )
-                for (window_end, tag), (window_start, avg, lbhr_avg, count) in sorted(records.items()):
+                for (window_end, tag), (window_start, avg, lbhr_avg, count, alias) in sorted(records.items()):
                     writer.writerow(
                         [
                             window_start,
                             window_end,
                             tag,
+                            alias,
                             "" if avg is None else avg,
                             "" if lbhr_avg is None else lbhr_avg,
                             count,
@@ -3852,12 +3858,12 @@ class MainWindow(QMainWindow):
 
     def _update_rolling_12hr_from_records(
         self,
-        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]],
+        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]],
         window_end: datetime,
     ) -> None:
         window_start = window_end - timedelta(hours=12)
         tag_entries: Dict[str, List[Tuple[datetime, Optional[float], Optional[float]]]] = {}
-        for (hour_start_iso, tag), (_, avg, lbhr_avg, count) in records.items():
+        for (hour_start_iso, tag), (_, avg, lbhr_avg, count, _) in records.items():
             try:
                 hour_start = datetime.fromisoformat(hour_start_iso)
             except Exception:
@@ -3873,6 +3879,7 @@ class MainWindow(QMainWindow):
         latest_lbhr: Dict[str, float] = {}
         window_end_iso = window_end.isoformat(timespec="seconds")
         window_start_iso = window_start.isoformat(timespec="seconds")
+        alias_lookup = {tag: alias for (_, tag), (_, _, _, _, alias) in records.items() if alias}
 
         avg_by_tag: Dict[str, Optional[float]] = {}
         lb_avg_by_tag: Dict[str, Optional[float]] = {}
@@ -3905,11 +3912,13 @@ class MainWindow(QMainWindow):
                     lb_avg = derived_lbhr
                     lb_avg_by_tag[tag] = lb_avg
 
+            alias = alias_lookup.get(tag, "") or self.alias_map.get(tag, "")
             rolling_records[(window_end_iso, tag)] = (
                 window_start_iso,
                 avg_val,
                 lb_avg,
                 count_by_tag.get(tag, 0),
+                alias,
             )
             if self._is_valid_number(avg_val):
                 latest_avg[tag] = float(avg_val)
@@ -3940,10 +3949,10 @@ class MainWindow(QMainWindow):
 
     def _rebuild_rolling_12hr_from_records(
         self,
-        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]],
+        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]],
     ) -> None:
         tag_entries: Dict[str, List[Tuple[datetime, Optional[float], Optional[float]]]] = {}
-        for (hour_start_iso, tag), (_, avg, lbhr_avg, count) in records.items():
+        for (hour_start_iso, tag), (_, avg, lbhr_avg, count, _) in records.items():
             try:
                 hour_start = datetime.fromisoformat(hour_start_iso)
             except Exception:
@@ -3955,10 +3964,11 @@ class MainWindow(QMainWindow):
             )
 
         rolling_records: Dict[
-            Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]
+            Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]
         ] = {}
         latest_avg: Dict[str, float] = {}
         latest_lbhr: Dict[str, float] = {}
+        alias_lookup = {tag: alias for (_, tag), (_, _, _, _, alias) in records.items() if alias}
 
         for tag, entries in tag_entries.items():
             entries.sort(key=lambda item: item[0])
@@ -4003,11 +4013,13 @@ class MainWindow(QMainWindow):
                     if derived_lbhr is not None:
                         lb_avg = derived_lbhr
                 window_end_iso = window_end.isoformat(timespec="seconds")
+                alias = alias_lookup.get(tag, "") or self.alias_map.get(tag, "")
                 rolling_records[(window_end_iso, tag)] = (
                     window_start.isoformat(timespec="seconds"),
                     avg_val,
                     lb_avg,
                     hours_count,
+                    alias,
                 )
                 latest_avg[tag] = avg_val
                 if self._is_valid_number(lb_avg):
@@ -4027,7 +4039,9 @@ class MainWindow(QMainWindow):
         hour_start_iso = hour_start.isoformat(timespec="seconds")
         hour_end_iso = hour_end.isoformat(timespec="seconds")
 
-        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]] = {}
+        records: Dict[
+            Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]
+        ] = {}
         try:
             if os.path.exists(self.hourly_csv_path):
                 with open(self.hourly_csv_path, "r", encoding="utf-8") as f:
@@ -4039,6 +4053,7 @@ class MainWindow(QMainWindow):
                             self._safe_float(row.get("avg_value")),
                             self._safe_float(row.get("avg_lb_hr")),
                             int(row.get("sample_count", "0") or 0),
+                            row.get("alias", "") or "",
                         )
         except Exception as e:
             self.log_message(f"Error reading hourly CSV for upsert: {e}")
@@ -4071,12 +4086,14 @@ class MainWindow(QMainWindow):
                     lbhr_avg = derived_lbhr
             if tag in epa_calc_tags and lbhr_avg is None:
                 lbhr_avg = avg
-            records[key] = (hour_end_iso, avg, lbhr_avg, int(acc["count"]))
+            existing_alias = existing[4] if existing else ""
+            alias = existing_alias or self.alias_map.get(tag, "")
+            records[key] = (hour_end_iso, avg, lbhr_avg, int(acc["count"]), alias)
 
         try:
             ensure_csv(
                 self.hourly_csv_path,
-                ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+                ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
             )
             if self._is_export_locked():
                 self._record_export_pause("hourly average")
@@ -4088,14 +4105,15 @@ class MainWindow(QMainWindow):
             with open(self.hourly_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(
-                    ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"]
+                    ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"]
                 )
-                for (hs, tag), (he, avg, lbhr_avg, cnt) in sorted(records.items()):
+                for (hs, tag), (he, avg, lbhr_avg, cnt, alias) in sorted(records.items()):
                     writer.writerow(
                         [
                             hs,
                             he,
                             tag,
+                            alias,
                             "" if avg is None else avg,
                             "" if lbhr_avg is None else lbhr_avg,
                             cnt,
@@ -4150,10 +4168,13 @@ class MainWindow(QMainWindow):
         self.log_message(
             f"Rebuilding hourly averages from {len(raw_files)} raw data file(s)..."
         )
-        records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int]] = {}
+        records: Dict[
+            Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]
+        ] = {}
 
         try:
             minute_buckets: Dict[Tuple[datetime, str], Dict[str, float]] = {}
+            alias_by_tag: Dict[str, str] = {}
             for path in sorted(raw_files):
                 open_func = gzip.open if path.endswith(".gz") else open
                 with open_func(path, "rt", encoding="utf-8") as f:
@@ -4170,6 +4191,9 @@ class MainWindow(QMainWindow):
                         tag = row.get("tag", "")
                         if not tag:
                             continue
+                        alias = str(row.get("alias", "") or "").strip()
+                        if alias:
+                            alias_by_tag[tag] = alias
                         status = str(row.get("status", "")).lower()
                         qa_flag = str(row.get("qa_flag", "")).upper()
                         try:
@@ -4205,7 +4229,8 @@ class MainWindow(QMainWindow):
                 hstart_iso = hstart.isoformat(timespec="seconds")
                 hend_iso = (hstart + timedelta(hours=1)).isoformat(timespec="seconds")
                 avg = acc["sum"] / acc["count"]
-                records[(hstart_iso, tag)] = (hend_iso, avg, None, int(acc["count"]))
+                alias = alias_by_tag.get(tag, "") or self.alias_map.get(tag, "")
+                records[(hstart_iso, tag)] = (hend_iso, avg, None, int(acc["count"]), alias)
         except Exception as e:
             self.log_message(f"Error rebuilding hourly from raw: {e}")
             QMessageBox.critical(
@@ -4217,12 +4242,12 @@ class MainWindow(QMainWindow):
         epa_calc_tags = self._epa_calc_tags()
         if ppm_to_lbhr:
             avg_by_hour: Dict[str, Dict[str, float]] = {}
-            for (hstart_iso, tag), (_, avg, _, _) in records.items():
+            for (hstart_iso, tag), (_, avg, _, _, _) in records.items():
                 if avg is None:
                     continue
                 avg_by_hour.setdefault(hstart_iso, {})[tag] = avg
 
-            for (hstart_iso, tag), (hend_iso, avg, lbhr_avg, count) in list(records.items()):
+            for (hstart_iso, tag), (hend_iso, avg, lbhr_avg, count, alias) in list(records.items()):
                 lbhr_tag = ppm_to_lbhr.get(tag)
                 if not lbhr_tag:
                     continue
@@ -4234,28 +4259,29 @@ class MainWindow(QMainWindow):
                     derived = self._compute_lbhr_from_avg(tag, avg_lookup)
                     if derived is not None:
                         lbhr_avg = derived
-                records[(hstart_iso, tag)] = (hend_iso, avg, lbhr_avg, count)
-        for (hstart_iso, tag), (hend_iso, avg, lbhr_avg, count) in list(records.items()):
+                records[(hstart_iso, tag)] = (hend_iso, avg, lbhr_avg, count, alias)
+        for (hstart_iso, tag), (hend_iso, avg, lbhr_avg, count, alias) in list(records.items()):
             if tag in epa_calc_tags and avg is not None and lbhr_avg is None:
-                records[(hstart_iso, tag)] = (hend_iso, avg, avg, count)
+                records[(hstart_iso, tag)] = (hend_iso, avg, avg, count, alias)
 
         try:
             ensure_csv(
                 self.hourly_csv_path,
-                ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"],
+                ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
             )
             self._wait_for_export_unlock("hourly average rebuild")
             with open(self.hourly_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(
-                    ["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"]
+                    ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"]
                 )
-                for (hs, tag), (he, avg, lbhr_avg, cnt) in sorted(records.items()):
+                for (hs, tag), (he, avg, lbhr_avg, cnt, alias) in sorted(records.items()):
                     writer.writerow(
                         [
                             hs,
                             he,
                             tag,
+                            alias,
                             "" if avg is None else avg,
                             "" if lbhr_avg is None else lbhr_avg,
                             cnt,

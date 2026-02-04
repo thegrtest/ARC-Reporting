@@ -80,6 +80,7 @@ MINUTE_AVG_HEADERS = [
     "minute_start",
     "minute_end",
     "tag",
+    "alias",
     "avg_value",
     "avg_lb_hr",
     "sample_count",
@@ -88,6 +89,7 @@ HOURLY_AVG_HEADERS = [
     "hour_start",
     "hour_end",
     "tag",
+    "alias",
     "avg_value",
     "avg_lb_hr",
     "sample_count",
@@ -96,6 +98,7 @@ ROLLING_AVG_HEADERS = [
     "window_start",
     "window_end",
     "tag",
+    "alias",
     "avg_value",
     "avg_lb_hr",
     "hours_count",
@@ -246,7 +249,7 @@ def get_latest_raw_path() -> Optional[str]:
 def load_latest_raw_df() -> pd.DataFrame:
     """
     Load the latest daily raw CSV as DataFrame:
-        timestamp,date,time,tag,value,status
+        timestamp,date,time,tag,alias,value,status
     Returns empty DataFrame on any error.
     """
     path = get_latest_raw_path()
@@ -351,20 +354,38 @@ def load_raw_history(max_days: int = 30) -> pd.DataFrame:
 def load_hourly_stats() -> pd.DataFrame:
     """
     Load hourly averages as DataFrame with columns:
-        hour_start, hour_end, tag, avg_value, avg_lb_hr, sample_count
+        hour_start, hour_end, tag, alias, avg_value, avg_lb_hr, sample_count
     Returns empty DataFrame on any error.
     """
     if not os.path.exists(HOURLY_CSV):
         return pd.DataFrame(
-            columns=["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"]
+            columns=[
+                "hour_start",
+                "hour_end",
+                "tag",
+                "alias",
+                "avg_value",
+                "avg_lb_hr",
+                "sample_count",
+            ]
         )
     try:
         df = pd.read_csv(HOURLY_CSV)
     except Exception:
         return pd.DataFrame(
-            columns=["hour_start", "hour_end", "tag", "avg_value", "avg_lb_hr", "sample_count"]
+            columns=[
+                "hour_start",
+                "hour_end",
+                "tag",
+                "alias",
+                "avg_value",
+                "avg_lb_hr",
+                "sample_count",
+            ]
         )
 
+    if "alias" not in df.columns:
+        df["alias"] = None
     for c in ["hour_start", "hour_end"]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
@@ -377,7 +398,7 @@ def load_hourly_stats() -> pd.DataFrame:
 def load_rolling_12hr_stats() -> pd.DataFrame:
     """
     Load rolling 12-hour averages as DataFrame with columns:
-        window_start, window_end, tag, avg_value, avg_lb_hr, hours_count
+        window_start, window_end, tag, alias, avg_value, avg_lb_hr, hours_count
     Returns empty DataFrame on any error.
     """
     if not os.path.exists(ROLLING_12HR_CSV):
@@ -386,6 +407,7 @@ def load_rolling_12hr_stats() -> pd.DataFrame:
                 "window_start",
                 "window_end",
                 "tag",
+                "alias",
                 "avg_value",
                 "avg_lb_hr",
                 "hours_count",
@@ -399,12 +421,15 @@ def load_rolling_12hr_stats() -> pd.DataFrame:
                 "window_start",
                 "window_end",
                 "tag",
+                "alias",
                 "avg_value",
                 "avg_lb_hr",
                 "hours_count",
             ]
         )
 
+    if "alias" not in df.columns:
+        df["alias"] = None
     for c in ["window_start", "window_end"]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
@@ -780,6 +805,52 @@ def load_configured_tags_from_settings() -> List[str]:
 
     tags = [line.strip() for line in tags_text.splitlines() if line.strip()]
     return tags
+
+
+def load_alias_map_from_settings() -> Dict[str, str]:
+    """
+    Return {tag: alias} from settings.json (if available).
+    """
+    if not os.path.exists(SETTINGS_JSON):
+        return {}
+    try:
+        with open(SETTINGS_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+
+    tags_text = data.get("tags", "")
+    _, alias_map = parse_tags_and_aliases(tags_text)
+    return alias_map
+
+
+def _merge_alias_from_df(df: pd.DataFrame, alias_map: Dict[str, str]) -> None:
+    if df is None or df.empty:
+        return
+    if "tag" not in df.columns or "alias" not in df.columns:
+        return
+    try:
+        pairs = df[["tag", "alias"]].dropna()
+    except Exception:
+        return
+    for tag, alias in pairs.itertuples(index=False):
+        tag_str = str(tag).strip()
+        alias_str = str(alias).strip()
+        if tag_str and alias_str:
+            alias_map.setdefault(tag_str, alias_str)
+
+
+def build_alias_lookup(
+    raw_df: pd.DataFrame,
+    hourly_df: pd.DataFrame,
+    rolling_df: pd.DataFrame,
+    settings_alias_map: Dict[str, str],
+) -> Dict[str, str]:
+    alias_map = dict(settings_alias_map)
+    _merge_alias_from_df(raw_df, alias_map)
+    _merge_alias_from_df(hourly_df, alias_map)
+    _merge_alias_from_df(rolling_df, alias_map)
+    return alias_map
 
 
 def parse_tags_and_aliases(text: str) -> Tuple[List[str], Dict[str, str]]:
@@ -1435,12 +1506,18 @@ def find_cems_tag(
     metric: str,
     tags: List[str],
     thresholds: Dict[str, Dict[str, object]],
+    alias_map: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     for tag in tags:
         entry = thresholds.get(tag, {}) if isinstance(thresholds.get(tag, {}), dict) else {}
         alias = entry.get("alias") if isinstance(entry.get("alias"), str) else ""
         if _match_cems_metric(alias, metric):
             return tag
+    if alias_map:
+        for tag in tags:
+            alias = alias_map.get(tag, "")
+            if _match_cems_metric(alias, metric):
+                return tag
     for tag in tags:
         if _match_cems_metric(tag, metric):
             return tag
@@ -1453,10 +1530,13 @@ def build_cems_card(
     current_hour_avg: Dict[str, float],
     rolling_12hr_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
     thresholds: Dict[str, Dict[str, object]],
+    alias_map: Optional[Dict[str, str]] = None,
 ) -> html.Div:
     entry = thresholds.get(tag, {}) if tag and isinstance(thresholds.get(tag, {}), dict) else {}
     units = entry.get("units") if isinstance(entry.get("units"), str) else None
     alias = entry.get("alias") if isinstance(entry.get("alias"), str) else None
+    if not alias and tag and alias_map:
+        alias = alias_map.get(tag)
 
     low_oper = entry.get("low_oper")
     high_oper = entry.get("high_oper")
@@ -2367,9 +2447,16 @@ def update_dashboard(n):
     """
     try:
         raw_df = load_latest_raw_df()
+        hourly_df = load_hourly_stats()
         rolling_df = load_rolling_12hr_stats()
         thresholds = load_thresholds()
         config_version = compute_config_version_text()
+        alias_map = build_alias_lookup(
+            raw_df,
+            hourly_df,
+            rolling_df,
+            load_alias_map_from_settings(),
+        )
 
         _, current_hour_avg, last_ts = extract_raw_stats(raw_df)
         rolling_12hr_stats = extract_latest_rolling_12hr(rolling_df)
@@ -2391,7 +2478,7 @@ def update_dashboard(n):
 
         cards = []
         for metric, label in cems_map.items():
-            tag = find_cems_tag(metric, tags, thresholds)
+            tag = find_cems_tag(metric, tags, thresholds, alias_map)
             cards.append(
                 build_cems_card(
                     label=label,
@@ -2399,6 +2486,7 @@ def update_dashboard(n):
                     current_hour_avg=current_hour_avg,
                     rolling_12hr_stats=rolling_12hr_stats,
                     thresholds=thresholds,
+                    alias_map=alias_map,
                 )
             )
 

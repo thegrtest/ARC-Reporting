@@ -543,17 +543,19 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
     co_weight = _compute_total_weight(hourly_range, co_tag)
     nox_weight = _compute_total_weight(hourly_range, nox_tag)
 
-    report_text_primary = "#111111"
-    report_text_muted = "#444444"
-    report_text_subtle = "#666666"
-    report_grid = "#dddddd"
-    report_table_header = "#e6e6e6"
-    report_table_alt = "#f7f7f7"
-    report_border = "#b3b3b3"
-    report_line_primary = "#111111"
-    report_line_secondary = "#444444"
-    report_line_tertiary = "#666666"
-    report_limit_line = "#222222"
+    report_text_primary = "#1b1f2a"
+    report_text_muted = "#3b4a5f"
+    report_text_subtle = "#5a6b82"
+    report_bg = "#f4f7fb"
+    report_panel = "#ffffff"
+    report_grid = "#d6e0ef"
+    report_table_header = "#dbe9f6"
+    report_table_alt = "#f1f6fc"
+    report_border = "#b7c7dd"
+    report_line_primary = "#1f77b4"
+    report_line_secondary = "#ff7f0e"
+    report_line_tertiary = "#2ca02c"
+    report_limit_line = "#6c6c6c"
 
     ensure_dir(EXPORT_TMP_DIR)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -562,8 +564,9 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
 
     with PdfPages(report_path) as pdf:
         fig = plt.figure(figsize=(11, 8.5))
-        fig.patch.set_facecolor("white")
+        fig.patch.set_facecolor(report_bg)
         gs = fig.add_gridspec(3, 1, height_ratios=[0.18, 0.55, 0.27])
+        fig.subplots_adjust(right=0.78)
 
         ax_title = fig.add_subplot(gs[0, 0])
         ax_title.axis("off")
@@ -595,6 +598,7 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
         ax_chart = fig.add_subplot(gs[1, 0])
         ax_chart.set_title("Rolling 12-Hour Averages", fontsize=12, color=report_text_primary)
         ax_chart.set_ylabel("lb/hr", color=report_text_primary)
+        ax_chart.set_facecolor(report_panel)
         ax_chart.grid(True, linestyle="--", color=report_grid, alpha=0.6)
         ax_chart.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%m-%d\n%H:%M"))
 
@@ -625,6 +629,7 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
 
         ax_o2 = ax_chart.twinx()
         ax_o2.set_ylabel("%O2", color=report_text_primary)
+        ax_o2.set_facecolor("none")
         if not o2_series.empty:
             line, = ax_o2.plot(
                 o2_series["window_end"],
@@ -675,7 +680,15 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
             )
 
         if lines:
-            ax_chart.legend(lines, labels, loc="upper left", fontsize=8, frameon=False)
+            ax_chart.legend(
+                lines,
+                labels,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                fontsize=8,
+                frameon=False,
+                borderaxespad=0.0,
+            )
         else:
             ax_chart.text(
                 0.5,
@@ -773,12 +786,13 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
         raw_df, load_thresholds(), load_exceedances()
     )
 
-    report_text_primary = "#111111"
-    report_text_muted = "#444444"
-    report_text_subtle = "#666666"
-    report_table_header = "#e6e6e6"
-    report_table_alt = "#f7f7f7"
-    report_border = "#b3b3b3"
+    report_text_primary = "#1b1f2a"
+    report_text_muted = "#3b4a5f"
+    report_text_subtle = "#5a6b82"
+    report_bg = "#f4f7fb"
+    report_table_header = "#dbe9f6"
+    report_table_alt = "#f1f6fc"
+    report_border = "#b7c7dd"
 
     ensure_dir(EXPORT_TMP_DIR)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -787,7 +801,7 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
 
     with PdfPages(report_path) as pdf:
         fig = plt.figure(figsize=(11, 8.5))
-        fig.patch.set_facecolor("white")
+        fig.patch.set_facecolor(report_bg)
         gs = fig.add_gridspec(3, 1, height_ratios=[0.2, 0.4, 0.4])
 
         ax_title = fig.add_subplot(gs[0, 0])

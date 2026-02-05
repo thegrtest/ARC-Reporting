@@ -554,26 +554,26 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
             title_text,
             fontsize=18,
             fontweight="bold",
-            color="#263238",
+            color=COLOR_TEXT_PRIMARY,
         )
         ax_title.text(
             0.0,
             0.4,
             subtitle,
             fontsize=11,
-            color="#546e7a",
+            color=COLOR_TEXT_MUTED,
         )
         ax_title.text(
             0.0,
             0.1,
             "Rolling 12-hour averages for CO/NOx (lb/hr) with %O2 trend overlay.",
             fontsize=9.5,
-            color="#607d8b",
+            color=COLOR_TEXT_SUBTLE,
         )
 
         ax_chart = fig.add_subplot(gs[1, 0])
-        ax_chart.set_title("Rolling 12-Hour Averages", fontsize=12, color="#263238")
-        ax_chart.set_ylabel("lb/hr", color="#263238")
+        ax_chart.set_title("Rolling 12-Hour Averages", fontsize=12, color=COLOR_TEXT_PRIMARY)
+        ax_chart.set_ylabel("lb/hr", color=COLOR_TEXT_PRIMARY)
         ax_chart.grid(True, linestyle="--", alpha=0.3)
         ax_chart.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%m-%d\n%H:%M"))
 
@@ -658,7 +658,7 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
                 ha="center",
                 va="center",
                 fontsize=11,
-                color="#90a4ae",
+                color=COLOR_TEXT_MUTED,
                 transform=ax_chart.transAxes,
             )
 
@@ -699,11 +699,11 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
 
         for (row, col), cell in table.get_celld().items():
             if row == 0:
-                cell.set_text_props(weight="bold", color="#263238")
-                cell.set_facecolor("#e0f2f1")
+                cell.set_text_props(weight="bold", color=COLOR_TEXT_PRIMARY)
+                cell.set_facecolor(COLOR_TABLE_HEADER)
             else:
-                cell.set_facecolor("#fafafa")
-                cell.set_edgecolor("#cfd8dc")
+                cell.set_facecolor(COLOR_TABLE_CELL_ALT)
+                cell.set_edgecolor(COLOR_BORDER)
 
         fig.tight_layout()
         pdf.savefig(fig)
@@ -767,21 +767,21 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
             title_text,
             fontsize=17,
             fontweight="bold",
-            color="#263238",
+            color=COLOR_TEXT_PRIMARY,
         )
         ax_title.text(
             0.0,
             0.4,
             subtitle,
             fontsize=11,
-            color="#546e7a",
+            color=COLOR_TEXT_MUTED,
         )
         ax_title.text(
             0.0,
             0.1,
             "Exceedances reflect regulatory limit violations; system failures summarize health and data events.",
             fontsize=9.5,
-            color="#607d8b",
+            color=COLOR_TEXT_SUBTLE,
         )
 
         ax_summary = fig.add_subplot(gs[1, 0])
@@ -808,11 +808,11 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
         summary_table.scale(1, 1.3)
         for (row, col), cell in summary_table.get_celld().items():
             if row == 0:
-                cell.set_text_props(weight="bold", color="#263238")
-                cell.set_facecolor("#e0f2f1")
+                cell.set_text_props(weight="bold", color=COLOR_TEXT_PRIMARY)
+                cell.set_facecolor(COLOR_TABLE_HEADER)
             else:
-                cell.set_facecolor("#fafafa")
-                cell.set_edgecolor("#cfd8dc")
+                cell.set_facecolor(COLOR_TABLE_CELL_ALT)
+                cell.set_edgecolor(COLOR_BORDER)
 
         ax_tables = fig.add_subplot(gs[2, 0])
         ax_tables.axis("off")
@@ -852,7 +852,7 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
 
         table_ax = ax_tables.inset_axes([0.0, 0.05, 0.48, 0.9])
         table_ax.axis("off")
-        table_ax.set_title("Recent Exceedances", fontsize=11, color="#263238", pad=6)
+        table_ax.set_title("Recent Exceedances", fontsize=11, color=COLOR_TEXT_PRIMARY, pad=6)
         exceed_table = table_ax.table(
             cellText=exceed_rows,
             colLabels=["Tag", "Start", "End", "Duration"],
@@ -866,7 +866,12 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
 
         failure_ax = ax_tables.inset_axes([0.52, 0.05, 0.48, 0.9])
         failure_ax.axis("off")
-        failure_ax.set_title("System Failures / Errors", fontsize=11, color="#263238", pad=6)
+        failure_ax.set_title(
+            "System Failures / Errors",
+            fontsize=11,
+            color=COLOR_TEXT_PRIMARY,
+            pad=6,
+        )
         failure_table = failure_ax.table(
             cellText=failure_rows,
             colLabels=["Type", "Tag", "Timestamp", "Duration"],
@@ -1743,7 +1748,7 @@ def status_color(status: str) -> str:
         return "#fdd835"  # yellow
     if status == "bad":
         return "#ef5350"  # red
-    return "#78909c"      # gray
+    return COLOR_TEXT_SUBTLE
 
 
 def compute_gauge_range(
@@ -2148,10 +2153,27 @@ def discover_all_tags_for_dropdown() -> List[str]:
 
 # ----------------- styling helpers -----------------
 
+COLOR_BG = "#141821"
+COLOR_SURFACE = "#1f2630"
+COLOR_SURFACE_ALT = "#262f3b"
+COLOR_BORDER = "#313a46"
+COLOR_TEXT_PRIMARY = "#e6ecf2"
+COLOR_TEXT_MUTED = "#9aa5b1"
+COLOR_TEXT_SUBTLE = "#b5bfca"
+COLOR_ACCENT = "#4aa3ff"
+COLOR_ACCENT_BORDER = "#3c8fe6"
+COLOR_BUTTON_SECONDARY = "#5c6f85"
+COLOR_BUTTON_SECONDARY_BORDER = "#4a5d73"
+COLOR_BUTTON_TERTIARY = "#6a7d90"
+COLOR_BUTTON_TERTIARY_BORDER = "#5a6c80"
+COLOR_TABLE_HEADER = "#2b3542"
+COLOR_TABLE_CELL = "#1f2630"
+COLOR_TABLE_CELL_ALT = "#26313f"
+
 CARD_STYLE = {
-    "backgroundColor": "#1c2026",
+    "backgroundColor": COLOR_SURFACE,
     "borderRadius": "10px",
-    "border": "1px solid #2b323c",
+    "border": f"1px solid {COLOR_BORDER}",
     "padding": "12px 16px",
     "display": "flex",
     "flexDirection": "column",
@@ -2172,12 +2194,12 @@ GAUGE_CONTAINER_STYLE = {
 EXPORT_SECTION_TITLE_STYLE = {
     "fontSize": "13px",
     "fontWeight": "600",
-    "color": "#e0e6ed",
+    "color": COLOR_TEXT_PRIMARY,
 }
 
 EXPORT_SECTION_HELP_STYLE = {
     "fontSize": "11px",
-    "color": "#90a4ae",
+    "color": COLOR_TEXT_MUTED,
 }
 
 EXPORT_BUTTON_ROW_STYLE = {
@@ -2187,9 +2209,9 @@ EXPORT_BUTTON_ROW_STYLE = {
 }
 
 EXPORT_BUTTON_STYLE = {
-    "backgroundColor": "#2c3e50",
-    "color": "#ecf0f1",
-    "border": "1px solid #34495e",
+    "backgroundColor": COLOR_ACCENT,
+    "color": "white",
+    "border": f"1px solid {COLOR_ACCENT_BORDER}",
     "padding": "8px 12px",
     "borderRadius": "8px",
     "fontSize": "12px",
@@ -2197,9 +2219,9 @@ EXPORT_BUTTON_STYLE = {
 }
 
 REPORT_BUTTON_STYLE = {
-    "backgroundColor": "#37474f",
-    "color": "#ecf0f1",
-    "border": "1px solid #455a64",
+    "backgroundColor": COLOR_BUTTON_SECONDARY,
+    "color": "white",
+    "border": f"1px solid {COLOR_BUTTON_SECONDARY_BORDER}",
     "padding": "8px 12px",
     "borderRadius": "8px",
     "fontSize": "12px",
@@ -2207,9 +2229,9 @@ REPORT_BUTTON_STYLE = {
 }
 
 INCIDENT_BUTTON_STYLE = {
-    "backgroundColor": "#455a64",
-    "color": "#ecf0f1",
-    "border": "1px solid #546e7a",
+    "backgroundColor": COLOR_BUTTON_TERTIARY,
+    "color": "white",
+    "border": f"1px solid {COLOR_BUTTON_TERTIARY_BORDER}",
     "padding": "8px 12px",
     "borderRadius": "8px",
     "fontSize": "12px",
@@ -2358,9 +2380,9 @@ def build_cems_card(
         children=[
             html.Div(
                 header,
-                style={"fontWeight": "600", "fontSize": "13px", "color": "#e0e6ed"},
+                style={"fontWeight": "600", "fontSize": "13px", "color": COLOR_TEXT_PRIMARY},
             ),
-            html.Div(subtitle, style={"fontSize": "11px", "color": "#90a4ae"}),
+            html.Div(subtitle, style={"fontSize": "11px", "color": COLOR_TEXT_MUTED}),
             html.Div(
                 style=GAUGE_CONTAINER_STYLE,
                 children=[
@@ -2377,7 +2399,7 @@ def build_cems_card(
                     ),
                 ],
             ),
-            html.Div(rolling_text, style={"fontSize": "11px", "color": "#90a4ae"}),
+            html.Div(rolling_text, style={"fontSize": "11px", "color": COLOR_TEXT_MUTED}),
         ],
     )
 
@@ -2457,9 +2479,9 @@ def build_flow_card(
         children=[
             html.Div(
                 header,
-                style={"fontWeight": "600", "fontSize": "13px", "color": "#e0e6ed"},
+                style={"fontWeight": "600", "fontSize": "13px", "color": COLOR_TEXT_PRIMARY},
             ),
-            html.Div(subtitle, style={"fontSize": "11px", "color": "#90a4ae"}),
+            html.Div(subtitle, style={"fontSize": "11px", "color": COLOR_TEXT_MUTED}),
             html.Div(
                 style=GAUGE_CONTAINER_STYLE,
                 children=[
@@ -2476,7 +2498,7 @@ def build_flow_card(
                     ),
                 ],
             ),
-            html.Div(rolling_text, style={"fontSize": "11px", "color": "#90a4ae"}),
+            html.Div(rolling_text, style={"fontSize": "11px", "color": COLOR_TEXT_MUTED}),
         ],
     )
 
@@ -2492,7 +2514,7 @@ def build_system_health_card(health: Dict[str, object]) -> html.Div:
     elif "healthy" in status_upper:
         color = "#a5d6a7"
     else:
-        color = "#b0bec5"
+        color = COLOR_TEXT_SUBTLE
 
     details = []
     for label, key in [
@@ -2506,7 +2528,7 @@ def build_system_health_card(health: Dict[str, object]) -> html.Div:
         details.append(
             html.Div(
                 [
-                    html.Span(f"{label}: ", style={"color": "#90a4ae"}),
+                    html.Span(f"{label}: ", style={"color": COLOR_TEXT_MUTED}),
                     html.Span("—" if val is None else str(val)),
                 ],
                 style={"fontSize": "11px"},
@@ -2521,7 +2543,10 @@ def build_system_health_card(health: Dict[str, object]) -> html.Div:
                 style={"fontWeight": "600", "fontSize": "13px", "marginBottom": "6px"},
             ),
             html.Div(status, style={"color": color, "fontSize": "20px", "fontWeight": "700"}),
-            html.Div(status_reason, style={"fontSize": "11px", "color": "#90a4ae", "marginBottom": "6px"}),
+            html.Div(
+                status_reason,
+                style={"fontSize": "11px", "color": COLOR_TEXT_MUTED, "marginBottom": "6px"},
+            ),
             html.Div(details, style={"display": "flex", "flexDirection": "column", "gap": "2px"}),
         ],
     )
@@ -2582,7 +2607,7 @@ def build_quality_card(stats: Dict[str, Dict[str, float]]) -> html.Div:
             ),
             html.Div(
                 "QA flags drive valid %; DATA_GAP events summarize missing runs.",
-                style={"fontSize": "11px", "color": "#90a4ae"},
+                style={"fontSize": "11px", "color": COLOR_TEXT_MUTED},
             ),
             table,
         ],
@@ -2592,16 +2617,19 @@ def build_quality_card(stats: Dict[str, Dict[str, float]]) -> html.Div:
 def build_stat_tile(title: str, value: str, subtitle: str = "") -> html.Div:
     return html.Div(
         style={
-            "backgroundColor": "#1e252c",
+            "backgroundColor": COLOR_SURFACE_ALT,
             "padding": "10px",
             "borderRadius": "8px",
             "minWidth": "200px",
-            "color": "#e0e6ed",
+            "color": COLOR_TEXT_PRIMARY,
         },
         children=[
-            html.Div(title, style={"fontSize": "12px", "color": "#90a4ae"}),
+            html.Div(title, style={"fontSize": "12px", "color": COLOR_TEXT_MUTED}),
             html.Div(value, style={"fontSize": "18px", "fontWeight": "700", "marginTop": "4px"}),
-            html.Div(subtitle, style={"fontSize": "11px", "color": "#b0bec5", "marginTop": "2px"}),
+            html.Div(
+                subtitle,
+                style={"fontSize": "11px", "color": COLOR_TEXT_SUBTLE, "marginTop": "2px"},
+            ),
         ],
     )
 
@@ -2610,7 +2638,7 @@ def build_exceedance_table(events_df: pd.DataFrame, limit: int = 20):
     if events_df.empty:
         return html.Div(
             "No exceedance events found in the current window.",
-            style={"color": "#90a4ae", "fontSize": "11px"},
+            style={"color": COLOR_TEXT_MUTED, "fontSize": "11px"},
         )
 
     table_df = events_df.copy()
@@ -2640,10 +2668,10 @@ def build_exceedance_table(events_df: pd.DataFrame, limit: int = 20):
             {"name": "Avg", "id": "avg_value_over_event"},
             {"name": "Limit", "id": "limit_value"},
         ],
-        style_header={"backgroundColor": "#1c2026", "color": "#b0bec5"},
+        style_header={"backgroundColor": COLOR_TABLE_HEADER, "color": COLOR_TEXT_PRIMARY},
         style_cell={
-            "backgroundColor": "#202632",
-            "color": "#e0e6ed",
+            "backgroundColor": COLOR_TABLE_CELL,
+            "color": COLOR_TEXT_PRIMARY,
             "fontSize": "11px",
             "padding": "6px",
             "textAlign": "left",
@@ -2665,7 +2693,12 @@ def _format_threshold_cell(value: object) -> str:
 
 def build_compliance_rules_card() -> html.Div:
     rules = html.Ul(
-        style={"margin": 0, "paddingLeft": "18px", "fontSize": "11px", "color": "#b0bec5"},
+        style={
+            "margin": 0,
+            "paddingLeft": "18px",
+            "fontSize": "11px",
+            "color": COLOR_TEXT_SUBTLE,
+        },
         children=[
             html.Li("Regulatory compliance uses low/high limits from thresholds.json."),
             html.Li("Operational thresholds only drive gauge warnings and are not compliance limits."),
@@ -2718,10 +2751,10 @@ def build_compliance_thresholds_table(
             {"name": "High Limit", "id": "high_limit", "presentation": "input"},
         ],
         editable=True,
-        style_header={"backgroundColor": "#1c2026", "color": "#b0bec5"},
+        style_header={"backgroundColor": COLOR_TABLE_HEADER, "color": COLOR_TEXT_PRIMARY},
         style_cell={
-            "backgroundColor": "#202632",
-            "color": "#e0e6ed",
+            "backgroundColor": COLOR_TABLE_CELL,
+            "color": COLOR_TEXT_PRIMARY,
             "fontSize": "11px",
             "padding": "6px",
             "textAlign": "left",
@@ -2739,7 +2772,7 @@ def build_compliance_thresholds_table(
             ),
             html.Div(
                 "Updates are saved to thresholds.json and consumed by CIP.py.",
-                style={"fontSize": "11px", "color": "#90a4ae"},
+                style={"fontSize": "11px", "color": COLOR_TEXT_MUTED},
             ),
             table,
             html.Div(
@@ -2751,7 +2784,7 @@ def build_compliance_thresholds_table(
                         n_clicks=0,
                         style={
                             "marginTop": "6px",
-                            "backgroundColor": "#3498db",
+                            "backgroundColor": COLOR_ACCENT,
                             "color": "white",
                             "border": "none",
                             "padding": "6px 10px",
@@ -2761,7 +2794,7 @@ def build_compliance_thresholds_table(
                     ),
                     html.Div(
                         id="compliance-threshold-save-status",
-                        style={"fontSize": "11px", "color": "#b0bec5"},
+                        style={"fontSize": "11px", "color": COLOR_TEXT_SUBTLE},
                     ),
                 ],
             ),
@@ -2840,8 +2873,8 @@ server = app.server
 
 app.layout = html.Div(
     style={
-        "backgroundColor": "#16191f",
-        "color": "#ecf0f1",
+        "backgroundColor": COLOR_BG,
+        "color": COLOR_TEXT_PRIMARY,
         "fontFamily": "Segoe UI, sans-serif",
         "padding": "16px",
         "minHeight": "100vh",
@@ -2850,7 +2883,7 @@ app.layout = html.Div(
         # Header
         html.Div(
             style={
-                "backgroundColor": "#20242b",
+                "backgroundColor": COLOR_SURFACE,
                 "borderRadius": "8px",
                 "padding": "12px 16px",
                 "display": "flex",
@@ -2872,7 +2905,7 @@ app.layout = html.Div(
                             "Live view of PLC tags and hourly aggregates",
                             style={
                                 "fontSize": "11px",
-                                "color": "#90a4ae",
+                                "color": COLOR_TEXT_MUTED,
                             },
                         ),
                     ]
@@ -2883,7 +2916,7 @@ app.layout = html.Div(
                             id="config-version-label",
                             style={
                                 "fontSize": "11px",
-                                "color": "#b0bec5",
+                                "color": COLOR_TEXT_SUBTLE,
                                 "textAlign": "right",
                             },
                         ),
@@ -2891,7 +2924,7 @@ app.layout = html.Div(
                             id="last-update-label",
                             style={
                                 "fontSize": "11px",
-                                "color": "#b0bec5",
+                                "color": COLOR_TEXT_SUBTLE,
                                 "textAlign": "right",
                             },
                         ),
@@ -2924,9 +2957,9 @@ app.layout = html.Div(
             id="main-tabs",
             value="overview",
             colors={
-                "border": "#2b323c",
-                "primary": "#3498db",
-                "background": "#1c2026",
+                "border": COLOR_BORDER,
+                "primary": COLOR_ACCENT,
+                "background": COLOR_SURFACE_ALT,
             },
             style={
                 "borderRadius": "8px",
@@ -2936,10 +2969,10 @@ app.layout = html.Div(
                 dcc.Tab(
                     label="Overview",
                     value="overview",
-                    style={"backgroundColor": "#1c2026", "color": "#b0bec5"},
+                    style={"backgroundColor": COLOR_SURFACE_ALT, "color": COLOR_TEXT_MUTED},
                     selected_style={
-                        "backgroundColor": "#20242b",
-                        "color": "white",
+                        "backgroundColor": COLOR_SURFACE,
+                        "color": COLOR_TEXT_PRIMARY,
                         "fontWeight": "600",
                     },
                     children=[
@@ -2957,10 +2990,10 @@ app.layout = html.Div(
                 dcc.Tab(
                     label="Thresholds",
                     value="thresholds",
-                    style={"backgroundColor": "#1c2026", "color": "#b0bec5"},
+                    style={"backgroundColor": COLOR_SURFACE_ALT, "color": COLOR_TEXT_MUTED},
                     selected_style={
-                        "backgroundColor": "#20242b",
-                        "color": "white",
+                        "backgroundColor": COLOR_SURFACE,
+                        "color": COLOR_TEXT_PRIMARY,
                         "fontWeight": "600",
                     },
                     children=[
@@ -2983,7 +3016,7 @@ app.layout = html.Div(
                                 html.Div(
                                     "Separate operator warning bands from regulatory/permit limits. "
                                     "Operational thresholds drive gauge coloring; limits track strict compliance.",
-                                    style={"fontSize": "11px", "color": "#90a4ae"},
+                                    style={"fontSize": "11px", "color": COLOR_TEXT_MUTED},
                                 ),
                                 html.Label(
                                     "Tag:",
@@ -3064,7 +3097,7 @@ app.layout = html.Div(
                                     n_clicks=0,
                                     style={
                                         "marginTop": "6px",
-                                        "backgroundColor": "#3498db",
+                                        "backgroundColor": COLOR_ACCENT,
                                         "color": "white",
                                         "border": "none",
                                         "padding": "6px 10px",
@@ -3074,14 +3107,14 @@ app.layout = html.Div(
                                 ),
                                 html.Div(
                                     id="threshold-save-status",
-                                    style={"fontSize": "11px", "color": "#b0bec5"},
+                                    style={"fontSize": "11px", "color": COLOR_TEXT_SUBTLE},
                                 ),
                                 html.Div(
                                     f"File: {THRESHOLDS_JSON}",
                                     style={
                                         "marginTop": "8px",
                                         "fontSize": "9px",
-                                        "color": "#78909c",
+                                        "color": COLOR_TEXT_SUBTLE,
                                     },
                                 ),
                             ],
@@ -3091,10 +3124,10 @@ app.layout = html.Div(
                 dcc.Tab(
                     label="Exports",
                     value="exports",
-                    style={"backgroundColor": "#1c2026", "color": "#b0bec5"},
+                    style={"backgroundColor": COLOR_SURFACE_ALT, "color": COLOR_TEXT_MUTED},
                     selected_style={
-                        "backgroundColor": "#20242b",
-                        "color": "white",
+                        "backgroundColor": COLOR_SURFACE,
+                        "color": COLOR_TEXT_PRIMARY,
                         "fontWeight": "600",
                     },
                     children=[

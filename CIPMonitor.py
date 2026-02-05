@@ -243,6 +243,50 @@ def _format_report_dt(value: Optional[datetime]) -> str:
     return value.strftime("%Y-%m-%d %H:%M")
 
 
+def _add_limit_bands(ax: plt.Axes, limit_value: Optional[float]) -> None:
+    if limit_value is None:
+        return
+    y_min, y_max = ax.get_ylim()
+    if limit_value > y_max:
+        y_max = limit_value * 1.1
+    ax.set_ylim(y_min, y_max)
+
+    green_end = min(limit_value * 0.8, y_max)
+    yellow_end = min(limit_value, y_max)
+
+    ax.axhspan(y_min, green_end, facecolor="#c8e6c9", alpha=0.25, zorder=0)
+    ax.axhspan(green_end, yellow_end, facecolor="#fff9c4", alpha=0.3, zorder=0)
+    if yellow_end < y_max:
+        ax.axhspan(yellow_end, y_max, facecolor="#ffcdd2", alpha=0.25, zorder=0)
+
+
+def _append_limit_lines(
+    ax: plt.Axes,
+    label_prefix: str,
+    high_oper: Optional[float],
+    high_limit: Optional[float],
+    lines: List[matplotlib.lines.Line2D],
+    labels: List[str],
+) -> None:
+    if high_oper is not None:
+        line = ax.axhline(
+            high_oper,
+            color="#8b0000",
+            linewidth=1.2,
+            linestyle="--",
+        )
+        lines.append(line)
+        labels.append(f"{label_prefix} high oper")
+    if high_limit is not None:
+        line = ax.axhline(
+            high_limit,
+            color="#8b0000",
+            linewidth=1.6,
+        )
+        lines.append(line)
+        labels.append(f"{label_prefix} high limit")
+
+
 def _format_duration(seconds: Optional[float]) -> str:
     if seconds is None or seconds != seconds:
         return "N/A"
@@ -460,6 +504,17 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
     nox_series = rolling_range.loc[rolling_range["tag"] == nox_tag] if nox_tag else pd.DataFrame()
     o2_series = rolling_range.loc[rolling_range["tag"] == o2_tag] if o2_tag else pd.DataFrame()
 
+    co_entry = thresholds.get(co_tag, {}) if co_tag and isinstance(thresholds.get(co_tag, {}), dict) else {}
+    nox_entry = thresholds.get(nox_tag, {}) if nox_tag and isinstance(thresholds.get(nox_tag, {}), dict) else {}
+    o2_entry = thresholds.get(o2_tag, {}) if o2_tag and isinstance(thresholds.get(o2_tag, {}), dict) else {}
+
+    co_high_oper = _to_float(co_entry.get("high_oper"))
+    co_high_limit = _to_float(co_entry.get("high_limit"))
+    nox_high_oper = _to_float(nox_entry.get("high_oper"))
+    nox_high_limit = _to_float(nox_entry.get("high_limit"))
+    o2_high_oper = _to_float(o2_entry.get("high_oper"))
+    o2_high_limit = _to_float(o2_entry.get("high_limit"))
+
     co_peak, co_peak_time = _compute_peak(rolling_range, co_tag, "avg_lb_hr", "window_end")
     nox_peak, nox_peak_time = _compute_peak(
         rolling_range, nox_tag, "avg_lb_hr", "window_end"
@@ -557,6 +612,41 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
             )
             lines.append(line)
             labels.append(f"O2 % ({_display_name(o2_tag, alias_map, 'O2')})")
+
+        co_limit_value = co_high_limit if co_high_limit is not None else co_high_oper
+        nox_limit_value = nox_high_limit if nox_high_limit is not None else nox_high_oper
+        o2_limit_value = o2_high_limit if o2_high_limit is not None else o2_high_oper
+
+        if co_limit_value is not None:
+            _add_limit_bands(ax_chart, co_limit_value)
+            _append_limit_lines(
+                ax_chart,
+                "CO",
+                co_high_oper,
+                co_high_limit,
+                lines,
+                labels,
+            )
+        if nox_limit_value is not None:
+            _add_limit_bands(ax_chart, nox_limit_value)
+            _append_limit_lines(
+                ax_chart,
+                "NOx",
+                nox_high_oper,
+                nox_high_limit,
+                lines,
+                labels,
+            )
+        if o2_limit_value is not None:
+            _add_limit_bands(ax_o2, o2_limit_value)
+            _append_limit_lines(
+                ax_o2,
+                "O2",
+                o2_high_oper,
+                o2_high_limit,
+                lines,
+                labels,
+            )
 
         if lines:
             ax_chart.legend(lines, labels, loc="upper left", fontsize=8, frameon=False)

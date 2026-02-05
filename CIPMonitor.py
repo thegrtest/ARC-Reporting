@@ -2169,6 +2169,53 @@ GAUGE_CONTAINER_STYLE = {
     "textAlign": "center",
 }
 
+EXPORT_SECTION_TITLE_STYLE = {
+    "fontSize": "13px",
+    "fontWeight": "600",
+    "color": "#e0e6ed",
+}
+
+EXPORT_SECTION_HELP_STYLE = {
+    "fontSize": "11px",
+    "color": "#90a4ae",
+}
+
+EXPORT_BUTTON_ROW_STYLE = {
+    "display": "flex",
+    "gap": "10px",
+    "flexWrap": "wrap",
+}
+
+EXPORT_BUTTON_STYLE = {
+    "backgroundColor": "#2c3e50",
+    "color": "#ecf0f1",
+    "border": "1px solid #34495e",
+    "padding": "8px 12px",
+    "borderRadius": "8px",
+    "fontSize": "12px",
+    "fontWeight": "600",
+}
+
+REPORT_BUTTON_STYLE = {
+    "backgroundColor": "#37474f",
+    "color": "#ecf0f1",
+    "border": "1px solid #455a64",
+    "padding": "8px 12px",
+    "borderRadius": "8px",
+    "fontSize": "12px",
+    "fontWeight": "600",
+}
+
+INCIDENT_BUTTON_STYLE = {
+    "backgroundColor": "#455a64",
+    "color": "#ecf0f1",
+    "border": "1px solid #546e7a",
+    "padding": "8px 12px",
+    "borderRadius": "8px",
+    "fontSize": "12px",
+    "fontWeight": "600",
+}
+
 
 def _normalize_label(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
@@ -2848,231 +2895,6 @@ app.layout = html.Div(
                                 "textAlign": "right",
                             },
                         ),
-                        html.Div(
-                            style={
-                                "marginTop": "6px",
-                                "display": "flex",
-                                "gap": "6px",
-                                "justifyContent": "flex-end",
-                                "flexWrap": "wrap",
-                            },
-                            children=[
-                                html.Button(
-                                    "Export Minute Averages",
-                                    id="export-minute-btn",
-                                    n_clicks=0,
-                                    style={
-                                        "backgroundColor": "#263238",
-                                        "color": "#ecf0f1",
-                                        "border": "1px solid #37474f",
-                                        "padding": "4px 8px",
-                                        "borderRadius": "6px",
-                                        "fontSize": "10px",
-                                    },
-                                ),
-                                html.Button(
-                                    "Export Hourly Averages",
-                                    id="export-hourly-btn",
-                                    n_clicks=0,
-                                    style={
-                                        "backgroundColor": "#263238",
-                                        "color": "#ecf0f1",
-                                        "border": "1px solid #37474f",
-                                        "padding": "4px 8px",
-                                        "borderRadius": "6px",
-                                        "fontSize": "10px",
-                                    },
-                                ),
-                                html.Button(
-                                    "Export Rolling 12 Hour Averages",
-                                    id="export-rolling-btn",
-                                    n_clicks=0,
-                                    style={
-                                        "backgroundColor": "#263238",
-                                        "color": "#ecf0f1",
-                                        "border": "1px solid #37474f",
-                                        "padding": "4px 8px",
-                                        "borderRadius": "6px",
-                                        "fontSize": "10px",
-                                    },
-                                ),
-                            ],
-                        ),
-                        html.Div(
-                            style={
-                                "marginTop": "8px",
-                                "display": "flex",
-                                "flexDirection": "column",
-                                "alignItems": "flex-end",
-                                "gap": "4px",
-                            },
-                            children=[
-                                html.Div(
-                                    "Generate Report (PDF)",
-                                    style={
-                                        "fontSize": "10px",
-                                        "color": "#90a4ae",
-                                    },
-                                ),
-                                html.Div(
-                                    style={
-                                        "display": "flex",
-                                        "gap": "6px",
-                                        "justifyContent": "flex-end",
-                                        "flexWrap": "wrap",
-                                    },
-                                    children=[
-                                        html.Button(
-                                            "Today",
-                                            id="report-today-btn",
-                                            n_clicks=0,
-                                            style={
-                                                "backgroundColor": "#37474f",
-                                                "color": "#ecf0f1",
-                                                "border": "1px solid #455a64",
-                                                "padding": "4px 8px",
-                                                "borderRadius": "6px",
-                                                "fontSize": "10px",
-                                            },
-                                        ),
-                                        html.Button(
-                                            "This Week",
-                                            id="report-week-btn",
-                                            n_clicks=0,
-                                            style={
-                                                "backgroundColor": "#37474f",
-                                                "color": "#ecf0f1",
-                                                "border": "1px solid #455a64",
-                                                "padding": "4px 8px",
-                                                "borderRadius": "6px",
-                                                "fontSize": "10px",
-                                            },
-                                        ),
-                                        html.Button(
-                                            "This Month",
-                                            id="report-month-btn",
-                                            n_clicks=0,
-                                            style={
-                                                "backgroundColor": "#37474f",
-                                                "color": "#ecf0f1",
-                                                "border": "1px solid #455a64",
-                                                "padding": "4px 8px",
-                                                "borderRadius": "6px",
-                                                "fontSize": "10px",
-                                            },
-                                        ),
-                                        html.Button(
-                                            "Previous Month",
-                                            id="report-prev-month-btn",
-                                            n_clicks=0,
-                                            style={
-                                                "backgroundColor": "#37474f",
-                                                "color": "#ecf0f1",
-                                                "border": "1px solid #455a64",
-                                                "padding": "4px 8px",
-                                                "borderRadius": "6px",
-                                                "fontSize": "10px",
-                                            },
-                                        ),
-                                        html.Button(
-                                            "All Time",
-                                            id="report-all-time-btn",
-                                            n_clicks=0,
-                                            style={
-                                                "backgroundColor": "#37474f",
-                                                "color": "#ecf0f1",
-                                                "border": "1px solid #455a64",
-                                                "padding": "4px 8px",
-                                                "borderRadius": "6px",
-                                                "fontSize": "10px",
-                                            },
-                                        ),
-                                    ],
-                                ),
-                                html.Div(
-                                    "Exceedances & Failures (PDF)",
-                                    style={
-                                        "fontSize": "10px",
-                                        "color": "#90a4ae",
-                                    },
-                                ),
-                                html.Div(
-                                    style={
-                                        "display": "flex",
-                                        "gap": "6px",
-                                        "justifyContent": "flex-end",
-                                        "flexWrap": "wrap",
-                                    },
-                                    children=[
-                                        html.Button(
-                                            "Today",
-                                            id="incident-report-today-btn",
-                                            n_clicks=0,
-                                            style={
-                                                "backgroundColor": "#455a64",
-                                                "color": "#ecf0f1",
-                                                "border": "1px solid #546e7a",
-                                                "padding": "4px 8px",
-                                                "borderRadius": "6px",
-                                                "fontSize": "10px",
-                                            },
-                                        ),
-                                        html.Button(
-                                            "This Week",
-                                            id="incident-report-week-btn",
-                                            n_clicks=0,
-                                            style={
-                                                "backgroundColor": "#455a64",
-                                                "color": "#ecf0f1",
-                                                "border": "1px solid #546e7a",
-                                                "padding": "4px 8px",
-                                                "borderRadius": "6px",
-                                                "fontSize": "10px",
-                                            },
-                                        ),
-                                        html.Button(
-                                            "This Month",
-                                            id="incident-report-month-btn",
-                                            n_clicks=0,
-                                            style={
-                                                "backgroundColor": "#455a64",
-                                                "color": "#ecf0f1",
-                                                "border": "1px solid #546e7a",
-                                                "padding": "4px 8px",
-                                                "borderRadius": "6px",
-                                                "fontSize": "10px",
-                                            },
-                                        ),
-                                        html.Button(
-                                            "Previous Month",
-                                            id="incident-report-prev-month-btn",
-                                            n_clicks=0,
-                                            style={
-                                                "backgroundColor": "#455a64",
-                                                "color": "#ecf0f1",
-                                                "border": "1px solid #546e7a",
-                                                "padding": "4px 8px",
-                                                "borderRadius": "6px",
-                                                "fontSize": "10px",
-                                            },
-                                        ),
-                                        html.Button(
-                                            "All Time",
-                                            id="incident-report-all-time-btn",
-                                            n_clicks=0,
-                                            style={
-                                                "backgroundColor": "#455a64",
-                                                "color": "#ecf0f1",
-                                                "border": "1px solid #546e7a",
-                                                "padding": "4px 8px",
-                                                "borderRadius": "6px",
-                                                "fontSize": "10px",
-                                            },
-                                        ),
-                                    ],
-                                ),
-                            ],
-                        ),
                     ]
                 ),
             ],
@@ -3261,6 +3083,155 @@ app.layout = html.Div(
                                         "fontSize": "9px",
                                         "color": "#78909c",
                                     },
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                dcc.Tab(
+                    label="Exports",
+                    value="exports",
+                    style={"backgroundColor": "#1c2026", "color": "#b0bec5"},
+                    selected_style={
+                        "backgroundColor": "#20242b",
+                        "color": "white",
+                        "fontWeight": "600",
+                    },
+                    children=[
+                        html.Div(
+                            style={
+                                "padding": "12px 16px",
+                                "display": "flex",
+                                "flexDirection": "column",
+                                "gap": "12px",
+                                "maxWidth": "760px",
+                            },
+                            children=[
+                                html.Div(
+                                    style=CARD_STYLE,
+                                    children=[
+                                        html.Div("Data Exports (CSV)", style=EXPORT_SECTION_TITLE_STYLE),
+                                        html.Div(
+                                            "Download raw exports for minute, hourly, and rolling averages.",
+                                            style=EXPORT_SECTION_HELP_STYLE,
+                                        ),
+                                        html.Div(
+                                            style=EXPORT_BUTTON_ROW_STYLE,
+                                            children=[
+                                                html.Button(
+                                                    "Minute Averages",
+                                                    id="export-minute-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "Hourly Averages",
+                                                    id="export-hourly-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "Rolling 12 Hour Averages",
+                                                    id="export-rolling-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                            ],
+                                        ),
+                                    ],
+                                ),
+                                html.Div(
+                                    style=CARD_STYLE,
+                                    children=[
+                                        html.Div("Compliance Reports (PDF)", style=EXPORT_SECTION_TITLE_STYLE),
+                                        html.Div(
+                                            "Generate PDF summaries for reporting windows.",
+                                            style=EXPORT_SECTION_HELP_STYLE,
+                                        ),
+                                        html.Div(
+                                            style=EXPORT_BUTTON_ROW_STYLE,
+                                            children=[
+                                                html.Button(
+                                                    "Today",
+                                                    id="report-today-btn",
+                                                    n_clicks=0,
+                                                    style=REPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "This Week",
+                                                    id="report-week-btn",
+                                                    n_clicks=0,
+                                                    style=REPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "This Month",
+                                                    id="report-month-btn",
+                                                    n_clicks=0,
+                                                    style=REPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "Previous Month",
+                                                    id="report-prev-month-btn",
+                                                    n_clicks=0,
+                                                    style=REPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "All Time",
+                                                    id="report-all-time-btn",
+                                                    n_clicks=0,
+                                                    style=REPORT_BUTTON_STYLE,
+                                                ),
+                                            ],
+                                        ),
+                                    ],
+                                ),
+                                html.Div(
+                                    style=CARD_STYLE,
+                                    children=[
+                                        html.Div(
+                                            "Exceedances & Failures (PDF)",
+                                            style=EXPORT_SECTION_TITLE_STYLE,
+                                        ),
+                                        html.Div(
+                                            "Export incident-focused reports for each time window.",
+                                            style=EXPORT_SECTION_HELP_STYLE,
+                                        ),
+                                        html.Div(
+                                            style=EXPORT_BUTTON_ROW_STYLE,
+                                            children=[
+                                                html.Button(
+                                                    "Today",
+                                                    id="incident-report-today-btn",
+                                                    n_clicks=0,
+                                                    style=INCIDENT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "This Week",
+                                                    id="incident-report-week-btn",
+                                                    n_clicks=0,
+                                                    style=INCIDENT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "This Month",
+                                                    id="incident-report-month-btn",
+                                                    n_clicks=0,
+                                                    style=INCIDENT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "Previous Month",
+                                                    id="incident-report-prev-month-btn",
+                                                    n_clicks=0,
+                                                    style=INCIDENT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "All Time",
+                                                    id="incident-report-all-time-btn",
+                                                    n_clicks=0,
+                                                    style=INCIDENT_BUTTON_STYLE,
+                                                ),
+                                            ],
+                                        ),
+                                    ],
                                 ),
                             ],
                         ),

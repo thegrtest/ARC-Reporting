@@ -260,6 +260,14 @@ def _add_limit_bands(ax: plt.Axes, limit_value: Optional[float]) -> None:
         ax.axhspan(yellow_end, y_max, facecolor="#ffcdd2", alpha=0.25, zorder=0)
 
 
+def _ensure_limit_visible(ax: plt.Axes, limit_value: Optional[float]) -> None:
+    if limit_value is None:
+        return
+    y_min, y_max = ax.get_ylim()
+    if limit_value > y_max:
+        ax.set_ylim(y_min, limit_value * 1.1)
+
+
 def _append_limit_lines(
     ax: plt.Axes,
     label_prefix: str,
@@ -267,11 +275,12 @@ def _append_limit_lines(
     high_limit: Optional[float],
     lines: List[matplotlib.lines.Line2D],
     labels: List[str],
+    color: str = "#8b0000",
 ) -> None:
     if high_oper is not None:
         line = ax.axhline(
             high_oper,
-            color="#8b0000",
+            color=color,
             linewidth=1.2,
             linestyle="--",
         )
@@ -280,7 +289,7 @@ def _append_limit_lines(
     if high_limit is not None:
         line = ax.axhline(
             high_limit,
-            color="#8b0000",
+            color=color,
             linewidth=1.6,
         )
         lines.append(line)
@@ -534,6 +543,18 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
     co_weight = _compute_total_weight(hourly_range, co_tag)
     nox_weight = _compute_total_weight(hourly_range, nox_tag)
 
+    report_text_primary = "#111111"
+    report_text_muted = "#444444"
+    report_text_subtle = "#666666"
+    report_grid = "#dddddd"
+    report_table_header = "#e6e6e6"
+    report_table_alt = "#f7f7f7"
+    report_border = "#b3b3b3"
+    report_line_primary = "#111111"
+    report_line_secondary = "#444444"
+    report_line_tertiary = "#666666"
+    report_limit_line = "#222222"
+
     ensure_dir(EXPORT_TMP_DIR)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"cip_report_{range_key}_{timestamp}.pdf"
@@ -554,27 +575,27 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
             title_text,
             fontsize=18,
             fontweight="bold",
-            color=COLOR_TEXT_PRIMARY,
+            color=report_text_primary,
         )
         ax_title.text(
             0.0,
             0.4,
             subtitle,
             fontsize=11,
-            color=COLOR_TEXT_MUTED,
+            color=report_text_muted,
         )
         ax_title.text(
             0.0,
             0.1,
             "Rolling 12-hour averages for CO/NOx (lb/hr) with %O2 trend overlay.",
             fontsize=9.5,
-            color=COLOR_TEXT_SUBTLE,
+            color=report_text_subtle,
         )
 
         ax_chart = fig.add_subplot(gs[1, 0])
-        ax_chart.set_title("Rolling 12-Hour Averages", fontsize=12, color=COLOR_TEXT_PRIMARY)
-        ax_chart.set_ylabel("lb/hr", color=COLOR_TEXT_PRIMARY)
-        ax_chart.grid(True, linestyle="--", alpha=0.3)
+        ax_chart.set_title("Rolling 12-Hour Averages", fontsize=12, color=report_text_primary)
+        ax_chart.set_ylabel("lb/hr", color=report_text_primary)
+        ax_chart.grid(True, linestyle="--", color=report_grid, alpha=0.6)
         ax_chart.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%m-%d\n%H:%M"))
 
         lines = []
@@ -584,8 +605,9 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
             line, = ax_chart.plot(
                 co_series["window_end"],
                 co_series["avg_lb_hr"],
-                color="#ef6c00",
+                color=report_line_primary,
                 linewidth=2,
+                linestyle="-",
             )
             lines.append(line)
             labels.append(f"CO 12-hr avg ({_display_name(co_tag, alias_map, 'CO')})")
@@ -594,20 +616,21 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
             line, = ax_chart.plot(
                 nox_series["window_end"],
                 nox_series["avg_lb_hr"],
-                color="#3949ab",
+                color=report_line_secondary,
                 linewidth=2,
+                linestyle="--",
             )
             lines.append(line)
             labels.append(f"NOx 12-hr avg ({_display_name(nox_tag, alias_map, 'NOx')})")
 
         ax_o2 = ax_chart.twinx()
-        ax_o2.set_ylabel("%O2", color="#2e7d32")
+        ax_o2.set_ylabel("%O2", color=report_text_primary)
         if not o2_series.empty:
             line, = ax_o2.plot(
                 o2_series["window_end"],
                 o2_series["avg_value"],
-                color="#2e7d32",
-                linestyle="--",
+                color=report_line_tertiary,
+                linestyle=":",
                 linewidth=2,
             )
             lines.append(line)
@@ -618,7 +641,7 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
         o2_limit_value = o2_high_limit if o2_high_limit is not None else o2_high_oper
 
         if co_limit_value is not None:
-            _add_limit_bands(ax_chart, co_limit_value)
+            _ensure_limit_visible(ax_chart, co_limit_value)
             _append_limit_lines(
                 ax_chart,
                 "CO",
@@ -626,9 +649,10 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
                 co_high_limit,
                 lines,
                 labels,
+                color=report_limit_line,
             )
         if nox_limit_value is not None:
-            _add_limit_bands(ax_chart, nox_limit_value)
+            _ensure_limit_visible(ax_chart, nox_limit_value)
             _append_limit_lines(
                 ax_chart,
                 "NOx",
@@ -636,9 +660,10 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
                 nox_high_limit,
                 lines,
                 labels,
+                color=report_limit_line,
             )
         if o2_limit_value is not None:
-            _add_limit_bands(ax_o2, o2_limit_value)
+            _ensure_limit_visible(ax_o2, o2_limit_value)
             _append_limit_lines(
                 ax_o2,
                 "O2",
@@ -646,6 +671,7 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
                 o2_high_limit,
                 lines,
                 labels,
+                color=report_limit_line,
             )
 
         if lines:
@@ -658,7 +684,7 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
                 ha="center",
                 va="center",
                 fontsize=11,
-                color=COLOR_TEXT_MUTED,
+                color=report_text_muted,
                 transform=ax_chart.transAxes,
             )
 
@@ -699,11 +725,11 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
 
         for (row, col), cell in table.get_celld().items():
             if row == 0:
-                cell.set_text_props(weight="bold", color=COLOR_TEXT_PRIMARY)
-                cell.set_facecolor(COLOR_TABLE_HEADER)
+                cell.set_text_props(weight="bold", color=report_text_primary)
+                cell.set_facecolor(report_table_header)
             else:
-                cell.set_facecolor(COLOR_TABLE_CELL_ALT)
-                cell.set_edgecolor(COLOR_BORDER)
+                cell.set_facecolor(report_table_alt)
+                cell.set_edgecolor(report_border)
 
         fig.tight_layout()
         pdf.savefig(fig)
@@ -747,6 +773,13 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
         raw_df, load_thresholds(), load_exceedances()
     )
 
+    report_text_primary = "#111111"
+    report_text_muted = "#444444"
+    report_text_subtle = "#666666"
+    report_table_header = "#e6e6e6"
+    report_table_alt = "#f7f7f7"
+    report_border = "#b3b3b3"
+
     ensure_dir(EXPORT_TMP_DIR)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"cip_incident_report_{range_key}_{timestamp}.pdf"
@@ -767,21 +800,21 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
             title_text,
             fontsize=17,
             fontweight="bold",
-            color=COLOR_TEXT_PRIMARY,
+            color=report_text_primary,
         )
         ax_title.text(
             0.0,
             0.4,
             subtitle,
             fontsize=11,
-            color=COLOR_TEXT_MUTED,
+            color=report_text_muted,
         )
         ax_title.text(
             0.0,
             0.1,
             "Exceedances reflect regulatory limit violations; system failures summarize health and data events.",
             fontsize=9.5,
-            color=COLOR_TEXT_SUBTLE,
+            color=report_text_subtle,
         )
 
         ax_summary = fig.add_subplot(gs[1, 0])
@@ -808,11 +841,11 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
         summary_table.scale(1, 1.3)
         for (row, col), cell in summary_table.get_celld().items():
             if row == 0:
-                cell.set_text_props(weight="bold", color=COLOR_TEXT_PRIMARY)
-                cell.set_facecolor(COLOR_TABLE_HEADER)
+                cell.set_text_props(weight="bold", color=report_text_primary)
+                cell.set_facecolor(report_table_header)
             else:
-                cell.set_facecolor(COLOR_TABLE_CELL_ALT)
-                cell.set_edgecolor(COLOR_BORDER)
+                cell.set_facecolor(report_table_alt)
+                cell.set_edgecolor(report_border)
 
         ax_tables = fig.add_subplot(gs[2, 0])
         ax_tables.axis("off")
@@ -852,7 +885,7 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
 
         table_ax = ax_tables.inset_axes([0.0, 0.05, 0.48, 0.9])
         table_ax.axis("off")
-        table_ax.set_title("Recent Exceedances", fontsize=11, color=COLOR_TEXT_PRIMARY, pad=6)
+        table_ax.set_title("Recent Exceedances", fontsize=11, color=report_text_primary, pad=6)
         exceed_table = table_ax.table(
             cellText=exceed_rows,
             colLabels=["Tag", "Start", "End", "Duration"],
@@ -869,7 +902,7 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
         failure_ax.set_title(
             "System Failures / Errors",
             fontsize=11,
-            color=COLOR_TEXT_PRIMARY,
+            color=report_text_primary,
             pad=6,
         )
         failure_table = failure_ax.table(
@@ -882,6 +915,15 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
         failure_table.auto_set_font_size(False)
         failure_table.set_fontsize(9)
         failure_table.scale(1, 1.2)
+
+        for table in (exceed_table, failure_table):
+            for (row, col), cell in table.get_celld().items():
+                if row == 0:
+                    cell.set_text_props(weight="bold", color=report_text_primary)
+                    cell.set_facecolor(report_table_header)
+                else:
+                    cell.set_facecolor(report_table_alt)
+                    cell.set_edgecolor(report_border)
 
         fig.tight_layout()
         pdf.savefig(fig)

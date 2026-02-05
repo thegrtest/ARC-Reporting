@@ -48,7 +48,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 try:
-    from dash import Dash, dcc, html, Input, Output, State, dash_table
+    from dash import Dash, dcc, html, Input, Output, State, dash_table, no_update, ctx
 except ModuleNotFoundError as exc:
     raise SystemExit(
         "Dash is required for CIPMonitor. Install via 'pip install dash'."
@@ -3138,6 +3138,16 @@ app.layout = html.Div(
                                                 ),
                                             ],
                                         ),
+                                        dcc.Loading(
+                                            children=html.Div(
+                                                id="export-data-status",
+                                                style={
+                                                    "marginTop": "8px",
+                                                    "fontSize": "11px",
+                                                    "color": "#b0bec5",
+                                                },
+                                            ),
+                                        ),
                                     ],
                                 ),
                                 html.Div(
@@ -3182,6 +3192,16 @@ app.layout = html.Div(
                                                     style=REPORT_BUTTON_STYLE,
                                                 ),
                                             ],
+                                        ),
+                                        dcc.Loading(
+                                            children=html.Div(
+                                                id="export-report-status",
+                                                style={
+                                                    "marginTop": "8px",
+                                                    "fontSize": "11px",
+                                                    "color": "#b0bec5",
+                                                },
+                                            ),
                                         ),
                                     ],
                                 ),
@@ -3231,6 +3251,16 @@ app.layout = html.Div(
                                                 ),
                                             ],
                                         ),
+                                        dcc.Loading(
+                                            children=html.Div(
+                                                id="export-incident-status",
+                                                style={
+                                                    "marginTop": "8px",
+                                                    "fontSize": "11px",
+                                                    "color": "#b0bec5",
+                                                },
+                                            ),
+                                        ),
                                     ],
                                 ),
                             ],
@@ -3272,123 +3302,174 @@ def refresh_threshold_dropdown(n, current_value):
 
 @app.callback(
     Output("export-minute-download", "data"),
-    Input("export-minute-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def export_minute_averages(_n_clicks):
-    return build_export_payload(MINUTE_CSV, MINUTE_AVG_HEADERS, "minute_averages.csv")
-
-
-@app.callback(
     Output("export-hourly-download", "data"),
-    Input("export-hourly-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def export_hourly_averages(_n_clicks):
-    return build_export_payload(HOURLY_CSV, HOURLY_AVG_HEADERS, "hourly_averages.csv")
-
-
-@app.callback(
     Output("export-rolling-download", "data"),
+    Output("export-data-status", "children"),
+    Input("export-minute-btn", "n_clicks"),
+    Input("export-hourly-btn", "n_clicks"),
     Input("export-rolling-btn", "n_clicks"),
     prevent_initial_call=True,
 )
-def export_rolling_averages(_n_clicks):
-    return build_export_payload(
-        ROLLING_12HR_CSV,
-        ROLLING_AVG_HEADERS,
-        "rolling_12hr_averages.csv",
-    )
+def export_data_exports(_minute_clicks, _hourly_clicks, _rolling_clicks):
+    trigger = ctx.triggered_id
+    if trigger == "export-minute-btn":
+        return (
+            build_export_payload(MINUTE_CSV, MINUTE_AVG_HEADERS, "minute_averages.csv"),
+            no_update,
+            no_update,
+            "Minute Averages export requested. Preparing your download now.",
+        )
+    if trigger == "export-hourly-btn":
+        return (
+            no_update,
+            build_export_payload(HOURLY_CSV, HOURLY_AVG_HEADERS, "hourly_averages.csv"),
+            no_update,
+            "Hourly Averages export requested. Preparing your download now.",
+        )
+    if trigger == "export-rolling-btn":
+        return (
+            no_update,
+            no_update,
+            build_export_payload(
+                ROLLING_12HR_CSV,
+                ROLLING_AVG_HEADERS,
+                "rolling_12hr_averages.csv",
+            ),
+            "Rolling 12 Hour export requested. Preparing your download now.",
+        )
+    return no_update, no_update, no_update, no_update
 
 
 @app.callback(
     Output("report-today-download", "data"),
-    Input("report-today-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def export_today_report(_n_clicks):
-    return build_report_payload("today")
-
-
-@app.callback(
     Output("report-week-download", "data"),
-    Input("report-week-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def export_week_report(_n_clicks):
-    return build_report_payload("week")
-
-
-@app.callback(
     Output("report-month-download", "data"),
-    Input("report-month-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def export_month_report(_n_clicks):
-    return build_report_payload("month")
-
-
-@app.callback(
     Output("report-prev-month-download", "data"),
-    Input("report-prev-month-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def export_prev_month_report(_n_clicks):
-    return build_report_payload("prev_month")
-
-
-@app.callback(
     Output("report-all-time-download", "data"),
+    Output("export-report-status", "children"),
+    Input("report-today-btn", "n_clicks"),
+    Input("report-week-btn", "n_clicks"),
+    Input("report-month-btn", "n_clicks"),
+    Input("report-prev-month-btn", "n_clicks"),
     Input("report-all-time-btn", "n_clicks"),
     prevent_initial_call=True,
 )
-def export_all_time_report(_n_clicks):
-    return build_report_payload("all_time")
+def export_compliance_reports(
+    _today_clicks, _week_clicks, _month_clicks, _prev_month_clicks, _all_time_clicks
+):
+    trigger = ctx.triggered_id
+    if trigger == "report-today-btn":
+        return (
+            build_report_payload("today"),
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            "Today's compliance report requested. Generating your PDF now.",
+        )
+    if trigger == "report-week-btn":
+        return (
+            no_update,
+            build_report_payload("week"),
+            no_update,
+            no_update,
+            no_update,
+            "This Week compliance report requested. Generating your PDF now.",
+        )
+    if trigger == "report-month-btn":
+        return (
+            no_update,
+            no_update,
+            build_report_payload("month"),
+            no_update,
+            no_update,
+            "This Month compliance report requested. Generating your PDF now.",
+        )
+    if trigger == "report-prev-month-btn":
+        return (
+            no_update,
+            no_update,
+            no_update,
+            build_report_payload("prev_month"),
+            no_update,
+            "Previous Month compliance report requested. Generating your PDF now.",
+        )
+    if trigger == "report-all-time-btn":
+        return (
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            build_report_payload("all_time"),
+            "All Time compliance report requested. Generating your PDF now.",
+        )
+    return no_update, no_update, no_update, no_update, no_update, no_update
 
 
 @app.callback(
     Output("incident-report-today-download", "data"),
-    Input("incident-report-today-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def export_incident_today_report(_n_clicks):
-    return build_incident_report_payload("today")
-
-
-@app.callback(
     Output("incident-report-week-download", "data"),
-    Input("incident-report-week-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def export_incident_week_report(_n_clicks):
-    return build_incident_report_payload("week")
-
-
-@app.callback(
     Output("incident-report-month-download", "data"),
-    Input("incident-report-month-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def export_incident_month_report(_n_clicks):
-    return build_incident_report_payload("month")
-
-
-@app.callback(
     Output("incident-report-prev-month-download", "data"),
-    Input("incident-report-prev-month-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def export_incident_prev_month_report(_n_clicks):
-    return build_incident_report_payload("prev_month")
-
-
-@app.callback(
     Output("incident-report-all-time-download", "data"),
+    Output("export-incident-status", "children"),
+    Input("incident-report-today-btn", "n_clicks"),
+    Input("incident-report-week-btn", "n_clicks"),
+    Input("incident-report-month-btn", "n_clicks"),
+    Input("incident-report-prev-month-btn", "n_clicks"),
     Input("incident-report-all-time-btn", "n_clicks"),
     prevent_initial_call=True,
 )
-def export_incident_all_time_report(_n_clicks):
-    return build_incident_report_payload("all_time")
+def export_incident_reports(
+    _today_clicks, _week_clicks, _month_clicks, _prev_month_clicks, _all_time_clicks
+):
+    trigger = ctx.triggered_id
+    if trigger == "incident-report-today-btn":
+        return (
+            build_incident_report_payload("today"),
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            "Today's incident report requested. Generating your PDF now.",
+        )
+    if trigger == "incident-report-week-btn":
+        return (
+            no_update,
+            build_incident_report_payload("week"),
+            no_update,
+            no_update,
+            no_update,
+            "This Week incident report requested. Generating your PDF now.",
+        )
+    if trigger == "incident-report-month-btn":
+        return (
+            no_update,
+            no_update,
+            build_incident_report_payload("month"),
+            no_update,
+            no_update,
+            "This Month incident report requested. Generating your PDF now.",
+        )
+    if trigger == "incident-report-prev-month-btn":
+        return (
+            no_update,
+            no_update,
+            no_update,
+            build_incident_report_payload("prev_month"),
+            no_update,
+            "Previous Month incident report requested. Generating your PDF now.",
+        )
+    if trigger == "incident-report-all-time-btn":
+        return (
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            build_incident_report_payload("all_time"),
+            "All Time incident report requested. Generating your PDF now.",
+        )
+    return no_update, no_update, no_update, no_update, no_update, no_update
 
 
 @app.callback(

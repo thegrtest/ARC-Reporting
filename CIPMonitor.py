@@ -641,9 +641,9 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
             lines.append(line)
             labels.append(f"O2 % ({_display_name(o2_tag, alias_map, 'O2')})")
 
-        co_limit_value = co_high_limit if co_high_limit is not None else co_high_oper
-        nox_limit_value = nox_high_limit if nox_high_limit is not None else nox_high_oper
-        o2_limit_value = o2_high_limit if o2_high_limit is not None else o2_high_oper
+        co_limit_value = co_high_oper
+        nox_limit_value = nox_high_oper
+        o2_limit_value = None
 
         if co_limit_value is not None:
             _ensure_limit_visible(ax_chart, co_limit_value)
@@ -651,7 +651,7 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
                 ax_chart,
                 "CO",
                 co_high_oper,
-                co_high_limit,
+                None,
                 lines,
                 labels,
                 color=report_limit_line,
@@ -662,18 +662,7 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
                 ax_chart,
                 "NOx",
                 nox_high_oper,
-                nox_high_limit,
-                lines,
-                labels,
-                color=report_limit_line,
-            )
-        if o2_limit_value is not None:
-            _ensure_limit_visible(ax_o2, o2_limit_value)
-            _append_limit_lines(
-                ax_o2,
-                "O2",
-                o2_high_oper,
-                o2_high_limit,
+                None,
                 lines,
                 labels,
                 color=report_limit_line,

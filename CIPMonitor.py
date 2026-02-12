@@ -357,6 +357,30 @@ def _compute_peak(
     return _to_float(row.get(value_col)), row.get(time_col)
 
 
+def _compute_peak_pair(
+    df: pd.DataFrame,
+    tag: str,
+    base_value_col: str,
+    paired_value_col: str,
+    time_col: str,
+) -> Tuple[Optional[float], Optional[float], Optional[datetime]]:
+    if not tag or df is None or df.empty:
+        return None, None, None
+    subset = df.loc[df["tag"] == tag].dropna(subset=[base_value_col, time_col])
+    if subset.empty:
+        return None, None, None
+    try:
+        idx = subset[base_value_col].idxmax()
+    except Exception:
+        return None, None, None
+    row = subset.loc[idx]
+    return (
+        _to_float(row.get(base_value_col)),
+        _to_float(row.get(paired_value_col)),
+        row.get(time_col),
+    )
+
+
 def _compute_running_hours(
     hourly_df: pd.DataFrame,
     tags: List[str],
@@ -479,6 +503,11 @@ def _compute_total_weight(hourly_range: pd.DataFrame, tag: Optional[str]) -> Opt
     return float(values.sum())
 
 
+def _format_lb_hr_ppm(lb_hr: Optional[float], ppm: Optional[float]) -> str:
+    lb_hr_text = f"{lb_hr:.2f} LB/HR" if lb_hr is not None else "N/A LB/HR"
+    ppm_text = f"{ppm:.2f} ppm" if ppm is not None else "N/A ppm"
+    return f"{lb_hr_text} - {ppm_text}"
+
 def generate_report_pdf(range_key: str) -> Optional[str]:
     rolling_df = load_rolling_12hr_stats()
     hourly_df = load_hourly_stats()
@@ -524,9 +553,11 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
     o2_high_oper = _to_float(o2_entry.get("high_oper"))
     o2_high_limit = _to_float(o2_entry.get("high_limit"))
 
-    co_peak, co_peak_time = _compute_peak(rolling_range, co_tag, "avg_lb_hr", "window_end")
-    nox_peak, nox_peak_time = _compute_peak(
-        rolling_range, nox_tag, "avg_lb_hr", "window_end"
+    co_peak_lb_hr, co_peak_ppm, co_peak_time = _compute_peak_pair(
+        rolling_range, co_tag, "avg_lb_hr", "avg_value", "window_end"
+    )
+    nox_peak_lb_hr, nox_peak_ppm, nox_peak_time = _compute_peak_pair(
+        rolling_range, nox_tag, "avg_lb_hr", "avg_value", "window_end"
     )
     o2_peak, o2_peak_time = _compute_peak(rolling_range, o2_tag, "avg_value", "window_end")
 
@@ -694,8 +725,22 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
         ax_table.axis("off")
 
         summary_rows = [
-            ["CO Peak (lb/hr)", f"{co_peak:.2f} @ {_format_report_dt(co_peak_time)}" if co_peak is not None else "N/A"],
-            ["NOx Peak (lb/hr)", f"{nox_peak:.2f} @ {_format_report_dt(nox_peak_time)}" if nox_peak is not None else "N/A"],
+            [
+                "CO Peak (LB/HR - ppm)",
+                (
+                    f"{_format_lb_hr_ppm(co_peak_lb_hr, co_peak_ppm)} @ {_format_report_dt(co_peak_time)}"
+                    if co_peak_lb_hr is not None
+                    else "N/A"
+                ),
+            ],
+            [
+                "NOx Peak (LB/HR - ppm)",
+                (
+                    f"{_format_lb_hr_ppm(nox_peak_lb_hr, nox_peak_ppm)} @ {_format_report_dt(nox_peak_time)}"
+                    if nox_peak_lb_hr is not None
+                    else "N/A"
+                ),
+            ],
             ["O2 Peak (%)", f"{o2_peak:.2f} @ {_format_report_dt(o2_peak_time)}" if o2_peak is not None else "N/A"],
             [
                 f"Average Flow Rate ({flow_label})",
@@ -2366,10 +2411,12 @@ def build_cems_card(
     low_limit = entry.get("low_limit")
     high_limit = entry.get("high_limit")
 
+    current_lb_hr = current_hour_lb_hr.get(tag, float("nan")) if tag else float("nan")
+    current_ppm = current_hour_avg.get(tag, float("nan")) if tag else float("nan")
     if use_avg_value:
-        value = current_hour_avg.get(tag, float("nan")) if tag else float("nan")
+        value = current_ppm
     else:
-        value = current_hour_lb_hr.get(tag, float("nan")) if tag else float("nan")
+        value = current_lb_hr
     rolling_entry = rolling_12hr_stats.get(
         tag, (float("nan"), float("nan"), None, None, 0)
     )
@@ -2387,10 +2434,12 @@ def build_cems_card(
     status = classify_value(value, low_for_class, high_for_class)
     color = status_color(status)
 
-    if value == value:
-        value_label = f"{value:.2f}"
+    if use_avg_value:
+        value_label = f"{value:.2f}" if value == value else "—"
     else:
-        value_label = "—"
+        lb_hr_label = f"{current_lb_hr:.2f}LB/HR" if current_lb_hr == current_lb_hr else "—LB/HR"
+        ppm_label = f"{current_ppm:.2f}ppm" if current_ppm == current_ppm else "—ppm"
+        value_label = f"{lb_hr_label} - {ppm_label}"
 
     if (
         rolling_avg == rolling_avg
@@ -2404,10 +2453,21 @@ def build_cems_card(
         except Exception:
             ws_s = str(ws)
             we_s = str(we)
-        rolling_text = (
-            f"Rolling 12h {ws_s}–{we_s}: {rolling_avg:.2f} {units_label} "
-            f"({rolling_count} hrs)"
-        )
+        if use_avg_value:
+            rolling_value_text = f"{rolling_avg_value:.2f} {units_label}"
+        else:
+            rolling_lb_hr_text = (
+                f"{rolling_avg_lb_hr:.2f} LB/HR"
+                if rolling_avg_lb_hr == rolling_avg_lb_hr
+                else "— LB/HR"
+            )
+            rolling_ppm_text = (
+                f"{rolling_avg_value:.2f} ppm"
+                if rolling_avg_value == rolling_avg_value
+                else "— ppm"
+            )
+            rolling_value_text = f"{rolling_lb_hr_text} - {rolling_ppm_text}"
+        rolling_text = f"Rolling 12h {ws_s}–{we_s}: {rolling_value_text} ({rolling_count} hrs)"
     else:
         rolling_text = "Rolling 12h: no data"
 
@@ -2417,7 +2477,7 @@ def build_cems_card(
         subtitle_bits.append(f"Tag: {tag}")
     else:
         subtitle_bits.append("No matching tag found yet")
-    subtitle_bits.append(f"Units: {units_label}")
+    subtitle_bits.append(f"Units: {'LB/HR + ppm' if not use_avg_value else units_label}")
     subtitle = " • ".join(subtitle_bits)
 
     return html.Div(

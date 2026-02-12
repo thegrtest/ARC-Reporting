@@ -67,6 +67,7 @@ LOG_DIR = "logs"
 MINUTE_CSV = os.path.join(LOG_DIR, "minute_averages.csv")
 HOURLY_CSV = os.path.join(LOG_DIR, "hourly_averages.csv")
 ROLLING_12HR_CSV = os.path.join(LOG_DIR, "rolling_12hr_averages.csv")
+RAW_CSV_PREFIX = "raw_data_"
 THRESHOLDS_JSON = os.path.join(LOG_DIR, "thresholds.json")
 SETTINGS_JSON = "settings.json"  # optional: to discover tags before any data
 ENV_EVENTS_CSV = os.path.join(LOG_DIR, "env_events.csv")
@@ -91,6 +92,16 @@ MINUTE_AVG_HEADERS = [
     "avg_value",
     "avg_lb_hr",
     "sample_count",
+]
+RAW_DATA_HEADERS = [
+    "timestamp",
+    "date",
+    "time",
+    "tag",
+    "alias",
+    "value",
+    "status",
+    "qa_flag",
 ]
 HOURLY_AVG_HEADERS = [
     "hour_start",
@@ -221,6 +232,132 @@ def _copy_export_file(source_path: str, filename: str) -> Optional[str]:
         return dest_path
     except Exception:
         return None
+
+
+def _copy_exports_for_sources(source_paths: List[str], filename_stub: str) -> List[str]:
+    copied_paths: List[str] = []
+    for source_path in source_paths:
+        copied = _copy_export_file(source_path, f"{filename_stub}_{os.path.basename(source_path)}")
+        if copied and os.path.exists(copied):
+            copied_paths.append(copied)
+    return copied_paths
+
+
+def _filter_exported_csv_by_range(
+    source_path: str,
+    filename: str,
+    headers: List[str],
+    time_col: str,
+    start: datetime,
+    end: datetime,
+) -> Optional[str]:
+    copied_path = _copy_export_file(source_path, filename)
+    if not copied_path or not os.path.exists(copied_path):
+        return None
+
+    try:
+        df = pd.read_csv(copied_path)
+    except Exception:
+        return copied_path
+
+    for col in headers:
+        if col not in df.columns:
+            df[col] = None
+
+    try:
+        df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+        filtered_df = _filter_time_range(df, time_col, start, end)
+        export_df = filtered_df.reindex(columns=headers)
+        export_df.to_csv(copied_path, index=False)
+    except Exception:
+        return copied_path
+    return copied_path
+
+
+def _get_raw_daily_paths_for_range(start: datetime, end: datetime) -> List[str]:
+    if not os.path.isdir(LOG_DIR):
+        return []
+    start_date = start.date()
+    end_date = end.date()
+    paths: List[Tuple[datetime, str]] = []
+    for name in os.listdir(LOG_DIR):
+        if not (name.startswith(RAW_CSV_PREFIX) and name.endswith(".csv")):
+            continue
+        try:
+            date_part = name.replace(RAW_CSV_PREFIX, "").replace(".csv", "")
+            file_date = datetime.strptime(date_part, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if file_date < start_date or file_date > end_date:
+            continue
+        paths.append((datetime.combine(file_date, datetime.min.time()), os.path.join(LOG_DIR, name)))
+    paths.sort(key=lambda item: item[0])
+    return [path for _, path in paths]
+
+
+def build_time_range_export_payload(
+    source_path: str,
+    headers: List[str],
+    filename: str,
+    time_col: str,
+    range_key: str,
+):
+    ensure_export_csv(source_path, headers)
+    if not os.path.exists(source_path):
+        return None
+    _, start, end = _get_report_range(range_key)
+    _write_export_lock()
+    try:
+        export_copy = _filter_exported_csv_by_range(
+            source_path,
+            f"{range_key}_{filename}",
+            headers,
+            time_col,
+            start,
+            end,
+        )
+    finally:
+        _clear_export_lock()
+    if not export_copy or not os.path.exists(export_copy):
+        return None
+    return dcc.send_file(export_copy, filename=f"{range_key}_{filename}")
+
+
+def build_raw_time_range_export_payload(range_key: str):
+    _, start, end = _get_report_range(range_key)
+    source_paths = _get_raw_daily_paths_for_range(start, end)
+    if not source_paths:
+        return None
+    _write_export_lock()
+    try:
+        copied_sources = _copy_exports_for_sources(source_paths, f"{range_key}_raw")
+        if not copied_sources:
+            return None
+        frames: List[pd.DataFrame] = []
+        for path in copied_sources:
+            try:
+                df = pd.read_csv(path)
+                for col in RAW_DATA_HEADERS:
+                    if col not in df.columns:
+                        df[col] = None
+                frames.append(df.reindex(columns=RAW_DATA_HEADERS))
+            except Exception:
+                continue
+        if not frames:
+            return None
+        export_df = pd.concat(frames, ignore_index=True)
+        export_df["timestamp"] = pd.to_datetime(export_df["timestamp"], errors="coerce")
+        export_df = _filter_time_range(export_df, "timestamp", start, end)
+        output_path = os.path.join(
+            EXPORT_TMP_DIR,
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}_{range_key}_raw_data.csv",
+        )
+        export_df.reindex(columns=RAW_DATA_HEADERS).to_csv(output_path, index=False)
+    finally:
+        _clear_export_lock()
+    if not os.path.exists(output_path):
+        return None
+    return dcc.send_file(output_path, filename=f"{range_key}_raw_data.csv")
 
 
 def build_export_payload(path: str, headers: List[str], filename: str):
@@ -3046,6 +3183,10 @@ app.layout = html.Div(
         dcc.Download(id="export-minute-download"),
         dcc.Download(id="export-hourly-download"),
         dcc.Download(id="export-rolling-download"),
+        dcc.Download(id="export-range-raw-download"),
+        dcc.Download(id="export-range-minute-download"),
+        dcc.Download(id="export-range-hourly-download"),
+        dcc.Download(id="export-range-rolling-download"),
         dcc.Download(id="report-today-download"),
         dcc.Download(id="report-week-download"),
         dcc.Download(id="report-month-download"),
@@ -3291,6 +3432,68 @@ app.layout = html.Div(
                                 html.Div(
                                     style=CARD_STYLE,
                                     children=[
+                                        html.Div("Time-Range Data Exports (CSV)", style=EXPORT_SECTION_TITLE_STYLE),
+                                        html.Div(
+                                            "Export raw, minute, hourly, and rolling files for a selected period. Files are copied to logs/exports before range filtering.",
+                                            style=EXPORT_SECTION_HELP_STYLE,
+                                        ),
+                                        dcc.Dropdown(
+                                            id="export-range-dropdown",
+                                            options=[
+                                                {"label": "Today", "value": "today"},
+                                                {"label": "This Week", "value": "week"},
+                                                {"label": "This Month", "value": "month"},
+                                                {"label": "Previous Month", "value": "prev_month"},
+                                                {"label": "All Time", "value": "all_time"},
+                                            ],
+                                            value="month",
+                                            clearable=False,
+                                            style={"marginTop": "8px", "fontSize": "11px"},
+                                        ),
+                                        html.Div(
+                                            style=EXPORT_BUTTON_ROW_STYLE,
+                                            children=[
+                                                html.Button(
+                                                    "Raw Data",
+                                                    id="export-range-raw-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "Minute Averages",
+                                                    id="export-range-minute-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "Hourly Averages",
+                                                    id="export-range-hourly-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "Rolling 12 Hour Averages",
+                                                    id="export-range-rolling-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                            ],
+                                        ),
+                                        dcc.Loading(
+                                            children=html.Div(
+                                                id="export-range-status",
+                                                style={
+                                                    "marginTop": "8px",
+                                                    "fontSize": "11px",
+                                                    "color": "#b0bec5",
+                                                },
+                                            ),
+                                        ),
+                                    ],
+                                ),
+                                html.Div(
+                                    style=CARD_STYLE,
+                                    children=[
                                         html.Div("Compliance Reports (PDF)", style=EXPORT_SECTION_TITLE_STYLE),
                                         html.Div(
                                             "Generate PDF summaries for reporting windows.",
@@ -3476,6 +3679,77 @@ def export_data_exports(_minute_clicks, _hourly_clicks, _rolling_clicks):
             "Rolling 12 Hour export requested. Preparing your download now.",
         )
     return no_update, no_update, no_update, no_update
+
+
+@app.callback(
+    Output("export-range-raw-download", "data"),
+    Output("export-range-minute-download", "data"),
+    Output("export-range-hourly-download", "data"),
+    Output("export-range-rolling-download", "data"),
+    Output("export-range-status", "children"),
+    Input("export-range-raw-btn", "n_clicks"),
+    Input("export-range-minute-btn", "n_clicks"),
+    Input("export-range-hourly-btn", "n_clicks"),
+    Input("export-range-rolling-btn", "n_clicks"),
+    State("export-range-dropdown", "value"),
+    prevent_initial_call=True,
+)
+def export_time_range_data_exports(
+    _raw_clicks, _minute_clicks, _hourly_clicks, _rolling_clicks, range_key
+):
+    selected_range = range_key or "month"
+    trigger = ctx.triggered_id
+    if trigger == "export-range-raw-btn":
+        return (
+            build_raw_time_range_export_payload(selected_range),
+            no_update,
+            no_update,
+            no_update,
+            f"Raw data export requested for {selected_range}. Preparing your download now.",
+        )
+    if trigger == "export-range-minute-btn":
+        return (
+            no_update,
+            build_time_range_export_payload(
+                MINUTE_CSV,
+                MINUTE_AVG_HEADERS,
+                "minute_averages.csv",
+                "minute_end",
+                selected_range,
+            ),
+            no_update,
+            no_update,
+            f"Minute averages export requested for {selected_range}. Preparing your download now.",
+        )
+    if trigger == "export-range-hourly-btn":
+        return (
+            no_update,
+            no_update,
+            build_time_range_export_payload(
+                HOURLY_CSV,
+                HOURLY_AVG_HEADERS,
+                "hourly_averages.csv",
+                "hour_end",
+                selected_range,
+            ),
+            no_update,
+            f"Hourly averages export requested for {selected_range}. Preparing your download now.",
+        )
+    if trigger == "export-range-rolling-btn":
+        return (
+            no_update,
+            no_update,
+            no_update,
+            build_time_range_export_payload(
+                ROLLING_12HR_CSV,
+                ROLLING_AVG_HEADERS,
+                "rolling_12hr_averages.csv",
+                "window_end",
+                selected_range,
+            ),
+            f"Rolling 12 hour export requested for {selected_range}. Preparing your download now.",
+        )
+    return no_update, no_update, no_update, no_update, no_update
 
 
 @app.callback(

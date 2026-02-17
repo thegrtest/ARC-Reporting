@@ -2750,6 +2750,25 @@ class MainWindow(QMainWindow):
 
         return results
 
+    def _inject_epa_placeholder_results(
+        self,
+        data: Dict[str, Tuple[object, str]],
+        derived: Dict[str, Tuple[float, str]],
+    ) -> None:
+        """
+        Ensure EPA lb/hr tags never retain stale values in the live table.
+
+        If a given cycle cannot compute a derived lb/hr value, we explicitly
+        publish a placeholder with non-success status so the display clears
+        instead of appearing frozen at the prior value.
+        """
+        calc_tags = self._epa_calc_tag_names().values()
+        for calc_tag in calc_tags:
+            if calc_tag in derived:
+                data[calc_tag] = derived[calc_tag]
+            elif calc_tag in self.alias_map:
+                data[calc_tag] = (None, "no_data")
+
     # ---------------- settings ----------------
 
     def _load_settings(self):
@@ -3604,8 +3623,7 @@ class MainWindow(QMainWindow):
                 # --- inject EPA Method 19 derived lb/hr tags into the same datapath ---
                 try:
                     derived = self._compute_epa_method19(data)
-                    if derived:
-                        data.update(derived)
+                    self._inject_epa_placeholder_results(data, derived)
                 except Exception as e:
                     self.log_message(f"EPA Method 19 compute failed: {e}")
 
@@ -3664,7 +3682,11 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _is_valid_number(value: Optional[float]) -> bool:
-        return isinstance(value, (int, float)) and value == value
+        return (
+            isinstance(value, (int, float))
+            and value == value
+            and value not in (float("inf"), float("-inf"))
+        )
 
     def _ppm_cap_tags(self) -> set:
         tags = [

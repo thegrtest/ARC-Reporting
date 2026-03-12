@@ -4067,7 +4067,6 @@ def update_dashboard(n):
             "nox": "CEMS NOX",
             "co": "CEMS CO",
         }
-        ppm_to_lbhr = load_epa_ppm_to_lbhr_map()
 
         def _has_lbhr_data(tag_name: Optional[str]) -> bool:
             if not tag_name:
@@ -4093,43 +4092,27 @@ def update_dashboard(n):
         for metric, label in cems_map.items():
             ppm_tag = find_cems_tag(metric, tags, thresholds, alias_map)
             if ppm_tag:
+                primary_units = "%" if metric == "o2" else "ppm"
                 cards.append(
                     build_cems_card(
-                        label=f"{label} (ppm)",
+                        label=f"{label} ({primary_units})",
                         tag=ppm_tag,
                         current_hour_lb_hr=current_hour_lb_hr,
                         current_hour_avg=current_hour_avg,
                         rolling_12hr_stats=rolling_12hr_stats,
                         thresholds=thresholds,
                         alias_map=alias_map,
-                        units_label="ppm" if metric != "o2" else "%",
+                        units_label=primary_units,
                         value_source="avg_value",
                     )
                 )
 
-            lbhr_tag = ppm_to_lbhr.get(ppm_tag) if ppm_tag else None
-            if lbhr_tag and (
-                lbhr_tag in current_hour_lb_hr
-                or lbhr_tag in rolling_12hr_stats
-                or lbhr_tag in thresholds
-                or lbhr_tag in tags
-            ):
-                cards.append(
-                    build_cems_card(
-                        label=f"{label} (lb/hr)",
-                        tag=lbhr_tag,
-                        current_hour_lb_hr=current_hour_lb_hr,
-                        current_hour_avg=current_hour_avg,
-                        rolling_12hr_stats=rolling_12hr_stats,
-                        thresholds=thresholds,
-                        alias_map=alias_map,
-                        units_label="lb/hr",
-                        value_source="avg_lb_hr",
-                    )
-                )
+            # O2 is displayed as a single percent gauge only.
+            if metric == "o2":
                 continue
 
-            if ppm_tag and ppm_tag in ppm_to_lbhr and _has_lbhr_data(ppm_tag):
+            # CO/NOx lb/hr is taken from the same pollutant tag's calculated avg_lb_hr.
+            if ppm_tag and _has_lbhr_data(ppm_tag):
                 cards.append(
                     build_cems_card(
                         label=f"{label} (lb/hr)",

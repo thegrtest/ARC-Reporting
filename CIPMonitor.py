@@ -2579,8 +2579,8 @@ def build_cems_card(
     rolling_12hr_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
     thresholds: Dict[str, Dict[str, object]],
     alias_map: Optional[Dict[str, str]] = None,
-    units_label: str = "lb/hr",
-    use_avg_value: bool = False,
+    units_label: str = "ppm",
+    value_source: str = "avg_value",
 ) -> html.Div:
     entry = thresholds.get(tag, {}) if tag and isinstance(thresholds.get(tag, {}), dict) else {}
     alias = entry.get("alias") if isinstance(entry.get("alias"), str) else None
@@ -2592,17 +2592,15 @@ def build_cems_card(
     low_limit = entry.get("low_limit")
     high_limit = entry.get("high_limit")
 
-    current_lb_hr = current_hour_lb_hr.get(tag, float("nan")) if tag else float("nan")
-    current_ppm = current_hour_avg.get(tag, float("nan")) if tag else float("nan")
-    if use_avg_value:
-        value = current_ppm
+    if value_source == "avg_lb_hr":
+        value = current_hour_lb_hr.get(tag, float("nan")) if tag else float("nan")
     else:
-        value = current_lb_hr
+        value = current_hour_avg.get(tag, float("nan")) if tag else float("nan")
     rolling_entry = rolling_12hr_stats.get(
         tag, (float("nan"), float("nan"), None, None, 0)
     )
     rolling_avg_value, rolling_avg_lb_hr, ws, we, rolling_count = rolling_entry
-    rolling_avg = rolling_avg_value if use_avg_value else rolling_avg_lb_hr
+    rolling_avg = rolling_avg_lb_hr if value_source == "avg_lb_hr" else rolling_avg_value
 
     low_for_range = low_oper if low_oper is not None else low_limit
     high_for_range = high_oper if high_oper is not None else high_limit
@@ -2615,12 +2613,7 @@ def build_cems_card(
     status = classify_value(value, low_for_class, high_for_class)
     color = status_color(status)
 
-    if use_avg_value:
-        value_label = f"{value:.2f}" if value == value else "—"
-    else:
-        lb_hr_label = f"{current_lb_hr:.2f}LB/HR" if current_lb_hr == current_lb_hr else "—LB/HR"
-        ppm_label = f"{current_ppm:.2f}ppm" if current_ppm == current_ppm else "—ppm"
-        value_label = f"{lb_hr_label} - {ppm_label}"
+    value_label = f"{value:.2f}" if value == value else "—"
 
     if (
         rolling_avg == rolling_avg
@@ -2634,20 +2627,7 @@ def build_cems_card(
         except Exception:
             ws_s = str(ws)
             we_s = str(we)
-        if use_avg_value:
-            rolling_value_text = f"{rolling_avg_value:.2f} {units_label}"
-        else:
-            rolling_lb_hr_text = (
-                f"{rolling_avg_lb_hr:.2f} LB/HR"
-                if rolling_avg_lb_hr == rolling_avg_lb_hr
-                else "— LB/HR"
-            )
-            rolling_ppm_text = (
-                f"{rolling_avg_value:.2f} ppm"
-                if rolling_avg_value == rolling_avg_value
-                else "— ppm"
-            )
-            rolling_value_text = f"{rolling_lb_hr_text} - {rolling_ppm_text}"
+        rolling_value_text = f"{rolling_avg:.2f} {units_label}"
         rolling_text = f"Rolling 12h {ws_s}–{we_s}: {rolling_value_text} ({rolling_count} hrs)"
     else:
         rolling_text = "Rolling 12h: no data"
@@ -2658,7 +2638,7 @@ def build_cems_card(
         subtitle_bits.append(f"Tag: {tag}")
     else:
         subtitle_bits.append("No matching tag found yet")
-    subtitle_bits.append(f"Units: {'LB/HR + ppm' if not use_avg_value else units_label}")
+    subtitle_bits.append(f"Units: {units_label}")
     subtitle = " • ".join(subtitle_bits)
 
     return html.Div(
@@ -4087,6 +4067,14 @@ def update_dashboard(n):
             "nox": "CEMS NOX",
             "co": "CEMS CO",
         }
+        ppm_to_lbhr = load_epa_ppm_to_lbhr_map()
+
+        def _has_lbhr_data(tag_name: Optional[str]) -> bool:
+            if not tag_name:
+                return False
+            current_val = current_hour_lb_hr.get(tag_name, float("nan"))
+            rolling_val = rolling_12hr_stats.get(tag_name, (float("nan"), float("nan"), None, None, 0))[1]
+            return (current_val == current_val) or (rolling_val == rolling_val)
 
         cards = []
         flow_tag = str(epa_settings.get("epa_flow_tag", "") or "")
@@ -4103,22 +4091,58 @@ def update_dashboard(n):
             )
         )
         for metric, label in cems_map.items():
-            tag = find_cems_tag(metric, tags, thresholds, alias_map)
-            use_avg_value = metric == "o2"
-            units_label = "%" if use_avg_value else "lb/hr"
-            cards.append(
-                build_cems_card(
-                    label=label,
-                    tag=tag,
-                    current_hour_lb_hr=current_hour_lb_hr,
-                    current_hour_avg=current_hour_avg,
-                    rolling_12hr_stats=rolling_12hr_stats,
-                    thresholds=thresholds,
-                    alias_map=alias_map,
-                    units_label=units_label,
-                    use_avg_value=use_avg_value,
+            ppm_tag = find_cems_tag(metric, tags, thresholds, alias_map)
+            if ppm_tag:
+                cards.append(
+                    build_cems_card(
+                        label=f"{label} (ppm)",
+                        tag=ppm_tag,
+                        current_hour_lb_hr=current_hour_lb_hr,
+                        current_hour_avg=current_hour_avg,
+                        rolling_12hr_stats=rolling_12hr_stats,
+                        thresholds=thresholds,
+                        alias_map=alias_map,
+                        units_label="ppm" if metric != "o2" else "%",
+                        value_source="avg_value",
+                    )
                 )
-            )
+
+            lbhr_tag = ppm_to_lbhr.get(ppm_tag) if ppm_tag else None
+            if lbhr_tag and (
+                lbhr_tag in current_hour_lb_hr
+                or lbhr_tag in rolling_12hr_stats
+                or lbhr_tag in thresholds
+                or lbhr_tag in tags
+            ):
+                cards.append(
+                    build_cems_card(
+                        label=f"{label} (lb/hr)",
+                        tag=lbhr_tag,
+                        current_hour_lb_hr=current_hour_lb_hr,
+                        current_hour_avg=current_hour_avg,
+                        rolling_12hr_stats=rolling_12hr_stats,
+                        thresholds=thresholds,
+                        alias_map=alias_map,
+                        units_label="lb/hr",
+                        value_source="avg_lb_hr",
+                    )
+                )
+                continue
+
+            if ppm_tag and ppm_tag in ppm_to_lbhr and _has_lbhr_data(ppm_tag):
+                cards.append(
+                    build_cems_card(
+                        label=f"{label} (lb/hr)",
+                        tag=ppm_tag,
+                        current_hour_lb_hr=current_hour_lb_hr,
+                        current_hour_avg=current_hour_avg,
+                        rolling_12hr_stats=rolling_12hr_stats,
+                        thresholds=thresholds,
+                        alias_map=alias_map,
+                        units_label="lb/hr",
+                        value_source="avg_lb_hr",
+                    )
+                )
 
         if last_ts is not None:
             try:

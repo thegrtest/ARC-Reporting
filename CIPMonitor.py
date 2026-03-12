@@ -623,12 +623,22 @@ def _compute_avg_flow(hourly_range: pd.DataFrame, flow_tag: Optional[str]) -> Op
     return float(values.mean())
 
 
-def _compute_total_weight(hourly_range: pd.DataFrame, tag: Optional[str]) -> Optional[float]:
+def _compute_total_weight(
+    hourly_range: pd.DataFrame,
+    tag: Optional[str],
+    processing_hour_starts: Optional[set] = None,
+) -> Optional[float]:
     if not tag or hourly_range is None or hourly_range.empty:
         return None
     tag_series = hourly_range.loc[hourly_range["tag"] == tag]
     if tag_series.empty:
         return None
+    if processing_hour_starts is not None:
+        if "hour_start" not in tag_series.columns:
+            return None
+        tag_series = tag_series.loc[tag_series["hour_start"].astype(str).isin(processing_hour_starts)]
+        if tag_series.empty:
+            return None
     values = tag_series.get("avg_lb_hr")
     if values is None:
         values = tag_series.get("avg_value")
@@ -708,8 +718,10 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
         flow_tag = find_flow_tag(tags, thresholds, alias_map)
     flow_avg = _compute_avg_flow(hourly_range, flow_tag)
     flow_label = _display_name(flow_tag, alias_map, "Flow")
-    co_weight = _compute_total_weight(hourly_range, co_tag)
-    nox_weight = _compute_total_weight(hourly_range, nox_tag)
+    machine_state_tag = load_machine_state_tag_from_settings()
+    processing_hour_starts = _processing_hour_starts(hourly_range, machine_state_tag)
+    co_weight = _compute_total_weight(hourly_range, co_tag, processing_hour_starts)
+    nox_weight = _compute_total_weight(hourly_range, nox_tag, processing_hour_starts)
 
     report_text_primary = "#1b1f2a"
     report_text_muted = "#3b4a5f"
@@ -1733,6 +1745,38 @@ def load_alias_map_from_settings() -> Dict[str, str]:
     tags_text = data.get("tags", "")
     _, alias_map = parse_tags_and_aliases(tags_text)
     return alias_map
+
+
+def load_machine_state_tag_from_settings() -> str:
+    if not os.path.exists(SETTINGS_JSON):
+        return ""
+    try:
+        with open(SETTINGS_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("machine_state_tag", "") or "").strip()
+
+
+def _processing_hour_starts(
+    hourly_range: pd.DataFrame,
+    machine_state_tag: str,
+) -> set:
+    if not machine_state_tag or hourly_range is None or hourly_range.empty:
+        return set()
+    if "tag" not in hourly_range.columns or "hour_start" not in hourly_range.columns:
+        return set()
+    state_rows = hourly_range.loc[hourly_range["tag"] == machine_state_tag].copy()
+    if state_rows.empty:
+        return set()
+    values = pd.to_numeric(state_rows.get("avg_value"), errors="coerce")
+    state_rows = state_rows.assign(_avg_state=values)
+    processing_rows = state_rows.loc[(state_rows["_avg_state"] >= 2.5) & (state_rows["_avg_state"] <= 3.5)]
+    if processing_rows.empty:
+        return set()
+    return set(processing_rows["hour_start"].astype(str))
 
 
 def _merge_alias_from_df(df: pd.DataFrame, alias_map: Dict[str, str]) -> None:

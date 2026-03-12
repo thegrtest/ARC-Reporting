@@ -451,6 +451,7 @@ class PollThread(QThread):
         self,
         ip: str,
         tags: List[str],
+        always_poll_tags: Optional[List[str]] = None,
         interval_sec: int = 10,
         chunk_size: int = 20,
         reconnect_delay_sec: int = 10,
@@ -466,6 +467,9 @@ class PollThread(QThread):
 
         # main tags to poll (excluding machine-state logic)
         self.tags_main = [t for t in tags if t.strip()]
+        self.always_poll_tags = {
+            t.strip() for t in (always_poll_tags or []) if isinstance(t, str) and t.strip()
+        }
 
         self.interval_sec = max(1, int(interval_sec))
 
@@ -636,6 +640,7 @@ class PollThread(QThread):
                     self.info.emit(
                         f"Connected to PLC at {self.ip} "
                         f"({len(self.tags_main)} main tags, chunk_size={self.chunk_size}, "
+                        f"always_poll_tags={len(self.always_poll_tags)}, "
                         f"machine_state_tag={self.machine_state_tag or 'None'}, "
                         f"pause_when_down={self.pause_when_down}, "
                         f"heartbeat_tag={self.heartbeat_tag or 'None'}, "
@@ -696,11 +701,14 @@ class PollThread(QThread):
 
                         # 4) If not paused, read main tags
                         try:
-                            if (not pause_main) and self.tags_main:
-                                main_tags = [
-                                    t for t in self.tags_main
-                                    if t != self.machine_state_tag
-                                ]
+                            main_tags = [
+                                t for t in self.tags_main
+                                if t != self.machine_state_tag
+                            ]
+                            if pause_main:
+                                main_tags = [t for t in main_tags if t in self.always_poll_tags]
+
+                            if main_tags:
                                 for batch in chunked(main_tags, self.chunk_size):
                                     if not batch:
                                         continue
@@ -3382,9 +3390,15 @@ class MainWindow(QMainWindow):
         self.raw_csv_path = self._ensure_raw_csv_for_date(self.current_log_date)
         self._ensure_env_events_csv()
 
+        always_poll_tags: List[str] = []
+        resolved_nox_tag_for_poll = self._resolve_tag_from_alias(self.epa_nox_tag)
+        if resolved_nox_tag_for_poll:
+            always_poll_tags.append(resolved_nox_tag_for_poll)
+
         self.poll_thread = PollThread(
             ip=ip,
             tags=tags,
+            always_poll_tags=always_poll_tags,
             interval_sec=interval,
             chunk_size=chunk_size,
             reconnect_delay_sec=10,

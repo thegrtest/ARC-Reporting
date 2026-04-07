@@ -20,6 +20,28 @@ Run:
 
 Then open:
     http://<this_machine_ip>:8050
+
+File layout
+-----------
+ 1. Imports
+ 2. Configuration          -- file paths, CSV headers, EPA constants
+ 3. Styling                -- colors, card / button / gauge styles
+ 4. File & directory utils -- ensure_dir, ensure_csv, config-change log
+ 5. Export file helpers    -- lock, copy, filter, payload builders
+ 6. Report utilities       -- formatting, chart helpers, time-range math
+ 7. PDF report generation  -- emissions & incident reports
+ 8. Data loading           -- raw, hourly, rolling, events, exceedances,
+                              thresholds, system health
+ 9. Settings & tag utils   -- alias maps, tag parsing, EPA settings
+10. EPA Method 19 calcs    -- O2 correction, ppmv-to-lb/hr
+11. Gauge helpers          -- classify_value, status_color, compute_gauge_range
+12. DataFrame extraction   -- stats, last-hour, rolling-12hr, quality, compliance
+13. Tag discovery          -- find_cems_tag, find_flow_tag, looks_numeric_tag
+14. Gauge card builders    -- Flow, CEMS, Processing Time
+15. Dashboard components   -- System Health, Data Quality, Compliance view
+16. Dash app layout
+17. Callbacks
+18. Main entry point
 """
 
 import os
@@ -61,7 +83,9 @@ except ModuleNotFoundError as exc:
         "dash-daq is required for CIPMonitor. Install via 'pip install dash-daq'."
     ) from exc
 
-# ----------------- config -----------------
+# ============================================================================
+#  CONFIGURATION -- file paths, CSV headers, EPA constants
+# ============================================================================
 
 LOG_DIR = "logs"
 MINUTE_CSV = os.path.join(LOG_DIR, "minute_averages.csv")
@@ -135,7 +159,168 @@ EPA19_MOLECULAR_WEIGHTS = {
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
-# ----------------- helpers: files & thresholds -----------------
+# ============================================================================
+#  STYLING -- colours, card / button / gauge container styles
+# ============================================================================
+
+COLOR_BG = "#0b0f14"
+COLOR_SURFACE = "#151c25"
+COLOR_SURFACE_ALT = "#1a2332"
+COLOR_BORDER = "#253345"
+COLOR_TEXT_PRIMARY = "#edf1f7"
+COLOR_TEXT_MUTED = "#8b99ab"
+COLOR_TEXT_SUBTLE = "#5e6e82"
+COLOR_ACCENT = "#6c63ff"
+COLOR_ACCENT_HOVER = "#7f78ff"
+COLOR_ACCENT_BORDER = "#5a52e0"
+COLOR_GOOD = "#34d399"
+COLOR_WARNING = "#fbbf24"
+COLOR_BAD = "#f87171"
+COLOR_BUTTON_SECONDARY = "#374a60"
+COLOR_BUTTON_SECONDARY_BORDER = "#2d3e52"
+COLOR_BUTTON_TERTIARY = "#4a5d72"
+COLOR_BUTTON_TERTIARY_BORDER = "#3e5065"
+COLOR_TABLE_HEADER = "#1e2a38"
+COLOR_TABLE_CELL = "#151c25"
+COLOR_TABLE_CELL_ALT = "#192433"
+
+CARD_STYLE = {
+    "backgroundColor": COLOR_SURFACE,
+    "borderRadius": "14px",
+    "border": f"1px solid {COLOR_BORDER}",
+    "padding": "18px 20px",
+    "display": "flex",
+    "flexDirection": "column",
+    "gap": "10px",
+    "boxShadow": "0 2px 12px rgba(0,0,0,0.25)",
+    "transition": "box-shadow 0.2s ease",
+    "minWidth": "240px",
+}
+
+GAUGE_ROW_STYLE = {
+    "display": "flex",
+    "gap": "16px",
+    "flexWrap": "wrap",
+}
+
+GAUGE_CONTAINER_STYLE = {
+    "flex": "1",
+    "textAlign": "center",
+    "padding": "4px 0",
+}
+
+CARD_HEADER_STYLE = {
+    "fontWeight": "700",
+    "fontSize": "14px",
+    "color": COLOR_TEXT_PRIMARY,
+    "letterSpacing": "0.01em",
+}
+
+CARD_SUBTITLE_STYLE = {
+    "fontSize": "11px",
+    "color": COLOR_TEXT_MUTED,
+    "letterSpacing": "0.02em",
+}
+
+CARD_FOOTER_STYLE = {
+    "fontSize": "11px",
+    "color": COLOR_TEXT_MUTED,
+    "borderTop": f"1px solid {COLOR_BORDER}",
+    "paddingTop": "8px",
+    "marginTop": "2px",
+}
+
+EXPORT_SECTION_TITLE_STYLE = {
+    "fontSize": "14px",
+    "fontWeight": "700",
+    "color": COLOR_TEXT_PRIMARY,
+}
+
+EXPORT_SECTION_HELP_STYLE = {
+    "fontSize": "12px",
+    "color": COLOR_TEXT_MUTED,
+    "lineHeight": "1.5",
+}
+
+EXPORT_BUTTON_ROW_STYLE = {
+    "display": "flex",
+    "gap": "10px",
+    "flexWrap": "wrap",
+    "marginTop": "4px",
+}
+
+EXPORT_BUTTON_STYLE = {
+    "backgroundColor": COLOR_ACCENT,
+    "color": "white",
+    "border": "none",
+    "padding": "9px 16px",
+    "borderRadius": "8px",
+    "fontSize": "12px",
+    "fontWeight": "600",
+    "cursor": "pointer",
+    "boxShadow": f"0 2px 8px {COLOR_ACCENT}33",
+    "letterSpacing": "0.02em",
+}
+
+REPORT_BUTTON_STYLE = {
+    "backgroundColor": COLOR_BUTTON_SECONDARY,
+    "color": "white",
+    "border": "none",
+    "padding": "9px 16px",
+    "borderRadius": "8px",
+    "fontSize": "12px",
+    "fontWeight": "600",
+    "cursor": "pointer",
+    "boxShadow": "0 2px 6px rgba(0,0,0,0.2)",
+}
+
+INCIDENT_BUTTON_STYLE = {
+    "backgroundColor": COLOR_BUTTON_TERTIARY,
+    "color": "white",
+    "border": "none",
+    "padding": "9px 16px",
+    "borderRadius": "8px",
+    "fontSize": "12px",
+    "fontWeight": "600",
+    "cursor": "pointer",
+    "boxShadow": "0 2px 6px rgba(0,0,0,0.15)",
+}
+
+INPUT_STYLE = {
+    "width": "100%",
+    "backgroundColor": COLOR_SURFACE_ALT,
+    "color": COLOR_TEXT_PRIMARY,
+    "border": f"1px solid {COLOR_BORDER}",
+    "borderRadius": "8px",
+    "padding": "8px 10px",
+    "fontSize": "12px",
+    "outline": "none",
+}
+
+TAB_STYLE = {
+    "backgroundColor": COLOR_SURFACE_ALT,
+    "color": COLOR_TEXT_MUTED,
+    "border": "none",
+    "borderBottom": f"2px solid transparent",
+    "padding": "10px 20px",
+    "fontSize": "13px",
+    "fontWeight": "500",
+}
+
+TAB_SELECTED_STYLE = {
+    "backgroundColor": COLOR_SURFACE,
+    "color": COLOR_TEXT_PRIMARY,
+    "fontWeight": "700",
+    "border": "none",
+    "borderBottom": f"2px solid {COLOR_ACCENT}",
+    "padding": "10px 20px",
+    "fontSize": "13px",
+}
+
+
+# ============================================================================
+#  FILE & DIRECTORY UTILITIES
+# ============================================================================
 
 
 def ensure_dir(path: str) -> None:
@@ -188,6 +373,11 @@ def compute_config_version_text() -> str:
         return f"Config: v{mdate} ({digest[:8]})"
     except Exception:
         return "Config: unavailable"
+
+
+# ============================================================================
+#  EXPORT FILE HELPERS -- lock, copy, filter, payload builders
+# ============================================================================
 
 
 def ensure_export_csv(path: str, headers: List[str]) -> None:
@@ -372,6 +562,11 @@ def build_export_payload(path: str, headers: List[str], filename: str):
     if not export_copy or not os.path.exists(export_copy):
         return None
     return dcc.send_file(export_copy, filename=filename)
+
+
+# ============================================================================
+#  REPORT UTILITIES -- formatting, chart helpers, time-range math
+# ============================================================================
 
 
 def _format_report_dt(value: Optional[datetime]) -> str:
@@ -654,6 +849,11 @@ def _format_lb_hr_ppm(lb_hr: Optional[float], ppm: Optional[float]) -> str:
     lb_hr_text = f"{lb_hr:.2f} LB/HR" if lb_hr is not None else "N/A LB/HR"
     ppm_text = f"{ppm:.2f} ppm" if ppm is not None else "N/A ppm"
     return f"{lb_hr_text} - {ppm_text}"
+
+# ============================================================================
+#  PDF REPORT GENERATION -- emissions & incident reports
+# ============================================================================
+
 
 def generate_report_pdf(range_key: str) -> Optional[str]:
     rolling_df = load_rolling_12hr_stats()
@@ -1151,6 +1351,11 @@ def build_incident_report_payload(range_key: str):
         return None
     filename = os.path.basename(report_path)
     return dcc.send_file(report_path, filename=filename)
+
+
+# ============================================================================
+#  DATA LOADING -- CSV / JSON readers for raw, hourly, rolling, events, etc.
+# ============================================================================
 
 
 def get_latest_raw_path() -> Optional[str]:
@@ -1709,6 +1914,11 @@ def save_thresholds(th: Dict[str, Dict[str, float]]) -> None:
         pass
 
 
+# ============================================================================
+#  SETTINGS & TAG UTILITIES -- alias maps, tag parsing, EPA settings
+# ============================================================================
+
+
 def load_configured_tags_from_settings() -> List[str]:
     """
     Optionally discover tags from settings.json (the PySide app config),
@@ -1760,6 +1970,246 @@ def load_machine_state_tag_from_settings() -> str:
     return str(data.get("machine_state_tag", "") or "").strip()
 
 
+def load_feed_settings() -> Dict[str, str]:
+    """Load conveyor / feed system detection settings from settings.json.
+
+    Returns dict with keys:
+        detection  -- "none", "weight", or "tag"
+        weight_tag -- PLC tag for the hopper/silo weight
+        weight_units -- display units for the weight value
+        conveyor_tag -- PLC tag for direct conveyor on/off signal
+    """
+    default = {"detection": "none", "weight_tag": "", "weight_units": "", "conveyor_tag": ""}
+    if not os.path.exists(SETTINGS_JSON):
+        return default
+    try:
+        with open(SETTINGS_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return default
+    if not isinstance(data, dict):
+        return default
+
+    prod = data.get("production_tracking", {})
+    if not isinstance(prod, dict):
+        return default
+
+    tags_text = data.get("tags", "")
+    _, alias_map = parse_tags_and_aliases(tags_text)
+
+    detection = str(prod.get("conveyor_detection", "none") or "none").strip().lower()
+    if detection not in ("none", "weight", "tag"):
+        detection = "none"
+
+    weight_tag = resolve_tag_from_alias(str(prod.get("weight_tag", "") or ""), alias_map)
+    conveyor_tag = resolve_tag_from_alias(str(prod.get("conveyor_tag", "") or ""), alias_map)
+    weight_units = str(prod.get("weight_units", "") or "")
+
+    return {
+        "detection": detection,
+        "weight_tag": weight_tag,
+        "weight_units": weight_units,
+        "conveyor_tag": conveyor_tag,
+    }
+
+
+def compute_feed_status(
+    raw_df: pd.DataFrame,
+    feed_settings: Dict[str, str],
+) -> Dict[str, object]:
+    """Determine whether the feed system / conveyor is currently running.
+
+    Weight-based: looks at the last ~5 minutes of weight samples. If the
+    weight shows a steady decrease (linear slope < 0) the conveyor is
+    considered ON. Large positive spikes (refills) are filtered out so
+    they don't mask a real feeding trend.
+
+    Tag-based: simply checks the latest value of the conveyor tag.
+
+    Returns dict:
+        running      -- bool or None (unknown)
+        method       -- "weight" | "tag" | "none"
+        feed_rate    -- float (units/min, weight-based only) or None
+        weight_units -- str
+        detail       -- short human-readable explanation
+    """
+    detection = feed_settings.get("detection", "none")
+    result: Dict[str, object] = {
+        "running": None,
+        "method": detection,
+        "feed_rate": None,
+        "weight_units": feed_settings.get("weight_units", ""),
+        "detail": "",
+    }
+
+    if detection == "none" or raw_df is None or raw_df.empty:
+        result["detail"] = "Feed detection not configured"
+        return result
+
+    if "tag" not in raw_df.columns or "timestamp" not in raw_df.columns:
+        result["detail"] = "No data available"
+        return result
+
+    # --- Tag-based detection ---
+    if detection == "tag":
+        tag = feed_settings.get("conveyor_tag", "")
+        if not tag:
+            result["detail"] = "Conveyor tag not set"
+            return result
+        tag_df = raw_df.loc[raw_df["tag"] == tag].copy()
+        if tag_df.empty:
+            result["detail"] = f"No samples for {tag}"
+            return result
+        tag_df = tag_df.sort_values("timestamp")
+        latest_val = tag_df.iloc[-1].get("value")
+        try:
+            num = float(latest_val)
+            running = num > 0
+        except (TypeError, ValueError):
+            running = str(latest_val).strip().lower() in ("true", "1", "on", "yes")
+        result["running"] = running
+        result["detail"] = "ON" if running else "OFF"
+        return result
+
+    # --- Weight-based detection ---
+    if detection == "weight":
+        tag = feed_settings.get("weight_tag", "")
+        if not tag:
+            result["detail"] = "Weight tag not set"
+            return result
+        tag_df = raw_df.loc[raw_df["tag"] == tag].copy()
+        if tag_df.empty:
+            result["detail"] = f"No samples for {tag}"
+            return result
+
+        tag_df = tag_df.sort_values("timestamp").reset_index(drop=True)
+        tag_df["_val"] = pd.to_numeric(tag_df.get("value", None), errors="coerce")
+        tag_df = tag_df.dropna(subset=["_val", "timestamp"])
+        if len(tag_df) < 3:
+            result["detail"] = "Not enough samples"
+            return result
+
+        # Use last 5 minutes of data
+        cutoff = tag_df["timestamp"].max() - timedelta(minutes=5)
+        window = tag_df.loc[tag_df["timestamp"] >= cutoff].copy()
+        if len(window) < 3:
+            window = tag_df.tail(10).copy()
+
+        # Filter out large positive spikes (refills): any sample-to-sample
+        # increase > 20% of the window range is treated as a refill and the
+        # sample after the jump is dropped.
+        vals = window["_val"].values
+        diffs = pd.Series(vals).diff().fillna(0).values
+        val_range = float(max(vals) - min(vals)) if len(vals) > 1 else 1.0
+        spike_threshold = max(val_range * 0.20, 1.0)
+        keep_mask = diffs <= spike_threshold
+        keep_mask[0] = True  # always keep first
+        window = window.loc[window.index[keep_mask]]
+
+        if len(window) < 3:
+            result["detail"] = "Insufficient data after spike filtering"
+            return result
+
+        # Compute linear slope (units per second)
+        t_seconds = (window["timestamp"] - window["timestamp"].iloc[0]).dt.total_seconds().values
+        w_vals = window["_val"].values
+        if t_seconds[-1] - t_seconds[0] < 1:
+            result["detail"] = "Time span too short"
+            return result
+
+        n = len(t_seconds)
+        sum_t = t_seconds.sum()
+        sum_w = w_vals.sum()
+        sum_tw = (t_seconds * w_vals).sum()
+        sum_tt = (t_seconds * t_seconds).sum()
+        denom = n * sum_tt - sum_t * sum_t
+        if abs(denom) < 1e-12:
+            result["detail"] = "Cannot compute slope"
+            return result
+
+        slope_per_sec = (n * sum_tw - sum_t * sum_w) / denom  # units/sec
+
+        # Negative slope means weight is decreasing = conveyor feeding
+        units = feed_settings.get("weight_units", "") or "units"
+        if slope_per_sec < -0.001:
+            feed_rate_per_min = abs(slope_per_sec) * 60.0
+            result["running"] = True
+            result["feed_rate"] = round(feed_rate_per_min, 2)
+            result["detail"] = f"Feeding at {feed_rate_per_min:.1f} {units}/min"
+        else:
+            result["running"] = False
+            result["feed_rate"] = 0.0
+            result["detail"] = "Weight stable or increasing"
+
+        return result
+
+    return result
+
+
+def compute_processing_time_minutes(
+    raw_df: pd.DataFrame,
+    machine_state_tag: str,
+) -> Tuple[float, float]:
+    """
+    Compute processing time (minutes) for the current hour from raw data.
+
+    Looks at the machine state tag in raw samples. State == 3 means Processing.
+    Estimates time in Processing by counting consecutive sample intervals where
+    the machine was in state 3.
+
+    Returns:
+        (current_hour_processing_minutes, today_total_processing_minutes)
+    """
+    if (
+        not machine_state_tag
+        or raw_df is None
+        or raw_df.empty
+        or "tag" not in raw_df.columns
+    ):
+        return float("nan"), float("nan")
+
+    state_df = raw_df.loc[raw_df["tag"] == machine_state_tag].copy()
+    if state_df.empty:
+        return float("nan"), float("nan")
+
+    if "timestamp" not in state_df.columns:
+        return float("nan"), float("nan")
+
+    state_df = state_df.sort_values("timestamp").reset_index(drop=True)
+    state_df["_val"] = pd.to_numeric(state_df.get("value", None), errors="coerce")
+
+    # Determine processing state: value rounds to 3
+    state_df["_is_processing"] = (state_df["_val"] >= 2.5) & (state_df["_val"] <= 3.5)
+
+    # Calculate interval between consecutive samples
+    state_df["_dt"] = state_df["timestamp"].diff().dt.total_seconds().fillna(0)
+    # Cap individual intervals at 120s to avoid inflating from gaps
+    state_df["_dt"] = state_df["_dt"].clip(upper=120)
+
+    # Current hour
+    now = datetime.now()
+    hour_start = now.replace(minute=0, second=0, microsecond=0)
+    hour_end = hour_start + timedelta(hours=1)
+    current_mask = (
+        (state_df["timestamp"] >= hour_start)
+        & (state_df["timestamp"] < hour_end)
+        & state_df["_is_processing"]
+    )
+    current_hour_seconds = state_df.loc[current_mask, "_dt"].sum()
+    current_hour_minutes = current_hour_seconds / 60.0
+
+    # Today total
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_mask = (
+        (state_df["timestamp"] >= today_start)
+        & state_df["_is_processing"]
+    )
+    today_seconds = state_df.loc[today_mask, "_dt"].sum()
+    today_total_minutes = today_seconds / 60.0
+
+    return current_hour_minutes, today_total_minutes
+
+
 def _processing_hour_starts(
     hourly_range: pd.DataFrame,
     machine_state_tag: str,
@@ -1777,6 +2227,109 @@ def _processing_hour_starts(
     if processing_rows.empty:
         return set()
     return set(processing_rows["hour_start"].astype(str))
+
+
+def compute_cems_uptime(
+    hourly_df: pd.DataFrame,
+    machine_state_tag: str,
+    cems_tags: List[str],
+    start: datetime,
+    end: datetime,
+) -> Dict[str, object]:
+    """Calculate CEMS data availability against operating hours.
+
+    For each hour in [start, end) where the machine was in state 3
+    (Processing), check whether at least one CEMS tag has valid data
+    (sample_count > 0).  Returns stats for the period.
+
+    Args:
+        hourly_df:  Full hourly_averages dataframe.
+        machine_state_tag:  Tag that reports machine state (3 = Processing).
+        cems_tags:  List of CEMS tag names (CO, NOx, O2) to check.
+        start, end: Period boundaries.
+
+    Returns dict:
+        operating_hours   -- int, hours machine was processing
+        valid_cems_hours  -- int, operating hours with CEMS data
+        missing_hours     -- int, operating hours WITHOUT CEMS data
+        uptime_pct        -- float, valid / operating * 100  (0 if no op hrs)
+        total_hours       -- int, calendar hours in the period
+        period_label      -- str, human-readable period description
+    """
+    result: Dict[str, object] = {
+        "operating_hours": 0,
+        "valid_cems_hours": 0,
+        "missing_hours": 0,
+        "uptime_pct": 0.0,
+        "total_hours": 0,
+        "period_label": "",
+    }
+
+    if hourly_df is None or hourly_df.empty or not machine_state_tag:
+        return result
+
+    if "hour_start" not in hourly_df.columns or "tag" not in hourly_df.columns:
+        return result
+
+    # Filter to the requested time window
+    df = hourly_df.copy()
+    df["hour_start"] = pd.to_datetime(df["hour_start"], errors="coerce")
+    windowed = df.loc[(df["hour_start"] >= start) & (df["hour_start"] < end)]
+    if windowed.empty:
+        return result
+
+    # Total calendar hours in the period
+    total_hours = max(1, int((end - start).total_seconds() / 3600))
+    result["total_hours"] = total_hours
+
+    # Find operating hours (machine state ~= 3)
+    state_rows = windowed.loc[windowed["tag"] == machine_state_tag].copy()
+    state_vals = pd.to_numeric(state_rows.get("avg_value"), errors="coerce")
+    state_rows = state_rows.assign(_state=state_vals)
+    processing = state_rows.loc[
+        (state_rows["_state"] >= 2.5) & (state_rows["_state"] <= 3.5)
+    ]
+    operating_hour_starts = set(processing["hour_start"])
+    operating_hours = len(operating_hour_starts)
+    result["operating_hours"] = operating_hours
+
+    if operating_hours == 0:
+        return result
+
+    # For each operating hour check if any CEMS tag has sample_count > 0
+    cems_tags_set = set(t for t in cems_tags if t)
+    if not cems_tags_set:
+        # No CEMS tags configured — count any non-state tag with data
+        cems_data = windowed.loc[
+            (windowed["tag"] != machine_state_tag)
+            & (windowed["hour_start"].isin(operating_hour_starts))
+        ]
+    else:
+        cems_data = windowed.loc[
+            (windowed["tag"].isin(cems_tags_set))
+            & (windowed["hour_start"].isin(operating_hour_starts))
+        ]
+
+    # An hour counts as "valid" if at least one CEMS tag has sample_count > 0
+    if not cems_data.empty:
+        sample_counts = pd.to_numeric(cems_data.get("sample_count"), errors="coerce").fillna(0)
+        cems_data = cems_data.assign(_cnt=sample_counts)
+        valid_hours_set = set(
+            cems_data.loc[cems_data["_cnt"] > 0, "hour_start"]
+        )
+    else:
+        valid_hours_set = set()
+
+    valid_cems_hours = len(valid_hours_set & operating_hour_starts)
+    missing_hours = operating_hours - valid_cems_hours
+
+    result["valid_cems_hours"] = valid_cems_hours
+    result["missing_hours"] = missing_hours
+    result["uptime_pct"] = round(
+        (valid_cems_hours / operating_hours) * 100.0, 1
+    ) if operating_hours > 0 else 0.0
+
+    return result
 
 
 def _merge_alias_from_df(df: pd.DataFrame, alias_map: Dict[str, str]) -> None:
@@ -1849,34 +2402,6 @@ def resolve_tag_from_alias(name: str, alias_map: Dict[str, str]) -> str:
     return name
 
 
-def load_epa_ppm_to_lbhr_map() -> Dict[str, str]:
-    if not os.path.exists(SETTINGS_JSON):
-        return {}
-    try:
-        with open(SETTINGS_JSON, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return {}
-
-    if not isinstance(data, dict):
-        return {}
-
-    mapping: Dict[str, str] = {}
-    tags_text = data.get("tags", "")
-    _, alias_map = parse_tags_and_aliases(tags_text)
-    nox_tag = resolve_tag_from_alias(str(data.get("epa_nox_tag", "") or ""), alias_map)
-    co_tag = resolve_tag_from_alias(str(data.get("epa_co_tag", "") or ""), alias_map)
-    o2_tag = resolve_tag_from_alias(str(data.get("epa_o2_tag", "") or ""), alias_map)
-
-    if nox_tag:
-        mapping[nox_tag] = "EPA19:NOx_LBHR"
-    if co_tag:
-        mapping[co_tag] = "EPA19:CO_LBHR"
-    if o2_tag:
-        mapping[o2_tag] = "EPA19:O2_LBHR"
-    return mapping
-
-
 def load_epa_settings() -> Dict[str, object]:
     if not os.path.exists(SETTINGS_JSON):
         return {}
@@ -1908,6 +2433,11 @@ def load_epa_settings() -> Dict[str, object]:
             str(data.get("epa_co_tag", "") or ""), alias_map
         ),
     }
+
+
+# ============================================================================
+#  EPA METHOD 19 CALCULATIONS -- O2 correction, ppmv-to-lb/hr
+# ============================================================================
 
 
 def _epa_o2_values(raw_o2: Optional[float], units: str) -> Tuple[Optional[float], Optional[float]]:
@@ -1987,7 +2517,9 @@ def compute_rolling_lbhr_from_epa(
     return (ppmv * flow_avg * 60.0 * mw) / (1_000_000.0 * EPA19_MOLAR_VOLUME_SCF)
 
 
-# ----------------- helpers: classification & ranges -----------------
+# ============================================================================
+#  GAUGE HELPERS -- classification, status colour, gauge-range computation
+# ============================================================================
 
 
 def classify_value(value: float, low: float, high: float) -> str:
@@ -2014,11 +2546,11 @@ def classify_value(value: float, low: float, high: float) -> str:
 
 def status_color(status: str) -> str:
     if status == "good":
-        return "#4caf50"  # green
+        return COLOR_GOOD
     if status == "warning":
-        return "#fdd835"  # yellow
+        return COLOR_WARNING
     if status == "bad":
-        return "#ef5350"  # red
+        return COLOR_BAD
     return COLOR_TEXT_SUBTLE
 
 
@@ -2064,7 +2596,9 @@ def compute_gauge_range(
     return vmin, vmax, gmin, gmax
 
 
-# ----------------- helpers: extraction from dataframes -----------------
+# ============================================================================
+#  DATAFRAME EXTRACTION & ANALYSIS -- stats, quality metrics, compliance
+# ============================================================================
 
 
 def extract_raw_stats(raw_df: pd.DataFrame):
@@ -2422,92 +2956,9 @@ def discover_all_tags_for_dropdown() -> List[str]:
     return all_tags
 
 
-# ----------------- styling helpers -----------------
-
-COLOR_BG = "#0f141b"
-COLOR_SURFACE = "#1b232d"
-COLOR_SURFACE_ALT = "#212a36"
-COLOR_BORDER = "#2a3442"
-COLOR_TEXT_PRIMARY = "#f2f5f9"
-COLOR_TEXT_MUTED = "#a3adba"
-COLOR_TEXT_SUBTLE = "#c1c9d4"
-COLOR_ACCENT = "#7c5cff"
-COLOR_ACCENT_BORDER = "#6d4ee6"
-COLOR_BUTTON_SECONDARY = "#53657a"
-COLOR_BUTTON_SECONDARY_BORDER = "#46576b"
-COLOR_BUTTON_TERTIARY = "#617487"
-COLOR_BUTTON_TERTIARY_BORDER = "#556679"
-COLOR_TABLE_HEADER = "#273240"
-COLOR_TABLE_CELL = "#1b232d"
-COLOR_TABLE_CELL_ALT = "#202a38"
-
-CARD_STYLE = {
-    "backgroundColor": COLOR_SURFACE,
-    "borderRadius": "10px",
-    "border": f"1px solid {COLOR_BORDER}",
-    "padding": "12px 16px",
-    "display": "flex",
-    "flexDirection": "column",
-    "gap": "8px",
-}
-
-GAUGE_ROW_STYLE = {
-    "display": "flex",
-    "gap": "12px",
-    "flexWrap": "wrap",   # allow wrapping on very narrow screens
-}
-
-GAUGE_CONTAINER_STYLE = {
-    "flex": "1",
-    "textAlign": "center",
-}
-
-EXPORT_SECTION_TITLE_STYLE = {
-    "fontSize": "13px",
-    "fontWeight": "600",
-    "color": COLOR_TEXT_PRIMARY,
-}
-
-EXPORT_SECTION_HELP_STYLE = {
-    "fontSize": "11px",
-    "color": COLOR_TEXT_MUTED,
-}
-
-EXPORT_BUTTON_ROW_STYLE = {
-    "display": "flex",
-    "gap": "10px",
-    "flexWrap": "wrap",
-}
-
-EXPORT_BUTTON_STYLE = {
-    "backgroundColor": COLOR_ACCENT,
-    "color": "white",
-    "border": f"1px solid {COLOR_ACCENT_BORDER}",
-    "padding": "8px 12px",
-    "borderRadius": "8px",
-    "fontSize": "12px",
-    "fontWeight": "600",
-}
-
-REPORT_BUTTON_STYLE = {
-    "backgroundColor": COLOR_BUTTON_SECONDARY,
-    "color": "white",
-    "border": f"1px solid {COLOR_BUTTON_SECONDARY_BORDER}",
-    "padding": "8px 12px",
-    "borderRadius": "8px",
-    "fontSize": "12px",
-    "fontWeight": "600",
-}
-
-INCIDENT_BUTTON_STYLE = {
-    "backgroundColor": COLOR_BUTTON_TERTIARY,
-    "color": "white",
-    "border": f"1px solid {COLOR_BUTTON_TERTIARY_BORDER}",
-    "padding": "8px 12px",
-    "borderRadius": "8px",
-    "fontSize": "12px",
-    "fontWeight": "600",
-}
+# ============================================================================
+#  TAG DISCOVERY & MATCHING -- find CEMS / flow tags by alias or name
+# ============================================================================
 
 
 def _normalize_label(value: str) -> str:
@@ -2569,6 +3020,11 @@ def find_flow_tag(
         if _match_flow_metric(tag):
             return tag
     return None
+
+
+# ============================================================================
+#  GAUGE CARD BUILDERS -- Flow, CEMS (ppm / lb-hr), Processing Time
+# ============================================================================
 
 
 def build_cems_card(
@@ -2641,14 +3097,16 @@ def build_cems_card(
     subtitle_bits.append(f"Units: {units_label}")
     subtitle = " • ".join(subtitle_bits)
 
+    card_style = {
+        **CARD_STYLE,
+        "borderTop": f"3px solid {color}",
+    }
+
     return html.Div(
-        style=CARD_STYLE,
+        style=card_style,
         children=[
-            html.Div(
-                header,
-                style={"fontWeight": "600", "fontSize": "13px", "color": COLOR_TEXT_PRIMARY},
-            ),
-            html.Div(subtitle, style={"fontSize": "11px", "color": COLOR_TEXT_MUTED}),
+            html.Div(header, style=CARD_HEADER_STYLE),
+            html.Div(subtitle, style=CARD_SUBTITLE_STYLE),
             html.Div(
                 style=GAUGE_CONTAINER_STYLE,
                 children=[
@@ -2660,12 +3118,12 @@ def build_cems_card(
                         showCurrentValue=True,
                         color=color,
                         label=f"Current hourly avg: {value_label}",
-                        size=200,
+                        size=220,
                         units=units_label,
                     ),
                 ],
             ),
-            html.Div(rolling_text, style={"fontSize": "11px", "color": COLOR_TEXT_MUTED}),
+            html.Div(rolling_text, style=CARD_FOOTER_STYLE),
         ],
     )
 
@@ -2740,14 +3198,16 @@ def build_flow_card(
     subtitle_bits.append(f"Units: {units_label}")
     subtitle = " • ".join(subtitle_bits)
 
+    card_style = {
+        **CARD_STYLE,
+        "borderTop": f"3px solid {color}",
+    }
+
     return html.Div(
-        style=CARD_STYLE,
+        style=card_style,
         children=[
-            html.Div(
-                header,
-                style={"fontWeight": "600", "fontSize": "13px", "color": COLOR_TEXT_PRIMARY},
-            ),
-            html.Div(subtitle, style={"fontSize": "11px", "color": COLOR_TEXT_MUTED}),
+            html.Div(header, style=CARD_HEADER_STYLE),
+            html.Div(subtitle, style=CARD_SUBTITLE_STYLE),
             html.Div(
                 style=GAUGE_CONTAINER_STYLE,
                 children=[
@@ -2759,14 +3219,352 @@ def build_flow_card(
                         showCurrentValue=True,
                         color=color,
                         label=f"Current hourly avg: {value_label}",
-                        size=200,
+                        size=220,
                         units=units_label,
                     ),
                 ],
             ),
-            html.Div(rolling_text, style={"fontSize": "11px", "color": COLOR_TEXT_MUTED}),
+            html.Div(rolling_text, style=CARD_FOOTER_STYLE),
         ],
     )
+
+
+def build_processing_time_card(
+    current_hour_minutes: float,
+    today_total_minutes: float,
+) -> html.Div:
+    """
+    Build a gauge card showing processing time for the current hour.
+    Gauge runs 0–60 minutes. Footer shows today's total processing time.
+    """
+    # Gauge range is fixed: 0 to 60 minutes (one full hour)
+    gmin = 0
+    gmax = 60
+
+    value = current_hour_minutes
+    has_value = isinstance(value, (int, float)) and value == value
+
+    if has_value:
+        value = min(max(value, 0), 60)
+        # Color based on how much of the hour was processing
+        if value >= 45:
+            color = COLOR_GOOD
+        elif value >= 15:
+            color = COLOR_WARNING
+        elif value > 0:
+            color = "#fb923c"   # orange — light
+        else:
+            color = COLOR_TEXT_SUBTLE  # gray — none
+        value_label = f"{value:.1f}"
+    else:
+        color = COLOR_TEXT_SUBTLE
+        value_label = "—"
+        value = 0
+
+    # Footer: today's total
+    has_today = isinstance(today_total_minutes, (int, float)) and today_total_minutes == today_total_minutes
+    if has_today:
+        total_hrs = today_total_minutes / 60.0
+        footer_text = f"Today total: {today_total_minutes:.1f} min ({total_hrs:.1f} hrs)"
+    else:
+        footer_text = "Today total: no data"
+
+    card_style = {
+        **CARD_STYLE,
+        "borderTop": f"3px solid {color}",
+    }
+
+    return html.Div(
+        style=card_style,
+        children=[
+            html.Div("Processing Time", style=CARD_HEADER_STYLE),
+            html.Div(
+                "Time in Processing state (state 3) this hour",
+                style=CARD_SUBTITLE_STYLE,
+            ),
+            html.Div(
+                style=GAUGE_CONTAINER_STYLE,
+                children=[
+                    daq.Gauge(
+                        id="processing-time-gauge",
+                        min=gmin,
+                        max=gmax,
+                        value=value,
+                        showCurrentValue=True,
+                        color=color,
+                        label=f"Current hour: {value_label} min",
+                        size=220,
+                        units="min",
+                    ),
+                ],
+            ),
+            html.Div(footer_text, style=CARD_FOOTER_STYLE),
+        ],
+    )
+
+
+def build_feed_status_card(
+    feed_status: Dict[str, object],
+    processing_running: bool,
+) -> html.Div:
+    """Build a card showing feed system and processing status side-by-side."""
+
+    feed_running = feed_status.get("running")
+    feed_method = feed_status.get("method", "none")
+    feed_detail = str(feed_status.get("detail", ""))
+    feed_rate = feed_status.get("feed_rate")
+    weight_units = str(feed_status.get("weight_units", "") or "")
+
+    # --- Feed system indicator ---
+    if feed_running is True:
+        feed_color = COLOR_GOOD
+        feed_label = "FEEDING"
+    elif feed_running is False:
+        feed_color = COLOR_TEXT_SUBTLE
+        feed_label = "IDLE"
+    else:
+        feed_color = COLOR_TEXT_SUBTLE
+        feed_label = "UNKNOWN"
+
+    method_labels = {"weight": "Weight-Based", "tag": "Tag-Based", "none": "Not Configured"}
+    method_text = method_labels.get(feed_method, feed_method)
+
+    feed_children = [
+        html.Div(
+            style={"display": "flex", "alignItems": "center", "gap": "8px"},
+            children=[
+                html.Div(style={
+                    "width": "10px",
+                    "height": "10px",
+                    "borderRadius": "50%",
+                    "backgroundColor": feed_color,
+                    "boxShadow": f"0 0 6px {feed_color}" if feed_running else "none",
+                    "flexShrink": "0",
+                }),
+                html.Div(feed_label, style={
+                    "fontSize": "18px",
+                    "fontWeight": "700",
+                    "color": feed_color,
+                }),
+            ],
+        ),
+        html.Div(f"Detection: {method_text}", style={"fontSize": "11px", "color": COLOR_TEXT_MUTED}),
+    ]
+
+    if feed_detail and feed_detail not in ("ON", "OFF"):
+        feed_children.append(
+            html.Div(feed_detail, style={"fontSize": "12px", "color": COLOR_TEXT_PRIMARY})
+        )
+
+    if feed_rate is not None and feed_rate > 0:
+        units_label = weight_units or "units"
+        feed_children.append(
+            html.Div(
+                f"Rate: {feed_rate:.1f} {units_label}/min",
+                style={"fontSize": "14px", "fontWeight": "600", "color": COLOR_TEXT_PRIMARY},
+            )
+        )
+
+    # --- Processing indicator ---
+    if processing_running:
+        proc_color = COLOR_GOOD
+        proc_label = "PROCESSING"
+    else:
+        proc_color = COLOR_TEXT_SUBTLE
+        proc_label = "NOT PROCESSING"
+
+    proc_children = [
+        html.Div(
+            style={"display": "flex", "alignItems": "center", "gap": "8px"},
+            children=[
+                html.Div(style={
+                    "width": "10px",
+                    "height": "10px",
+                    "borderRadius": "50%",
+                    "backgroundColor": proc_color,
+                    "boxShadow": f"0 0 6px {proc_color}" if processing_running else "none",
+                    "flexShrink": "0",
+                }),
+                html.Div(proc_label, style={
+                    "fontSize": "18px",
+                    "fontWeight": "700",
+                    "color": proc_color,
+                }),
+            ],
+        ),
+        html.Div("Machine state 3 = Processing", style={"fontSize": "11px", "color": COLOR_TEXT_MUTED}),
+    ]
+
+    # Pick card border color: green if both running, yellow if only one, gray if neither
+    if feed_running and processing_running:
+        border_color = COLOR_GOOD
+    elif feed_running or processing_running:
+        border_color = COLOR_WARNING
+    else:
+        border_color = COLOR_TEXT_SUBTLE
+
+    card_style = {
+        **CARD_STYLE,
+        "borderTop": f"3px solid {border_color}",
+    }
+
+    return html.Div(
+        style=card_style,
+        children=[
+            html.Div("System Status", style=CARD_HEADER_STYLE),
+            html.Div(
+                style={
+                    "display": "grid",
+                    "gridTemplateColumns": "1fr 1fr",
+                    "gap": "16px",
+                },
+                children=[
+                    # Feed column
+                    html.Div(
+                        style={"display": "flex", "flexDirection": "column", "gap": "4px"},
+                        children=feed_children,
+                    ),
+                    # Processing column
+                    html.Div(
+                        style={
+                            "display": "flex",
+                            "flexDirection": "column",
+                            "gap": "4px",
+                            "borderLeft": f"1px solid {COLOR_BORDER}",
+                            "paddingLeft": "16px",
+                        },
+                        children=proc_children,
+                    ),
+                ],
+            ),
+        ],
+    )
+
+
+def build_cems_uptime_card(
+    month_stats: Dict[str, object],
+    quarter_stats: Dict[str, object],
+    required_pct: float = 90.0,
+) -> html.Div:
+    """Build a card showing CEMS data availability for the current month and quarter."""
+
+    def _uptime_section(label: str, stats: Dict[str, object]) -> html.Div:
+        pct = float(stats.get("uptime_pct", 0))
+        op_hrs = int(stats.get("operating_hours", 0))
+        valid_hrs = int(stats.get("valid_cems_hours", 0))
+        missing_hrs = int(stats.get("missing_hours", 0))
+
+        if op_hrs == 0:
+            color = COLOR_TEXT_SUBTLE
+            status_text = "No operating hours"
+        elif pct >= required_pct:
+            color = COLOR_GOOD
+            status_text = f"{pct:.1f}%"
+        elif pct >= required_pct - 5:
+            color = COLOR_WARNING
+            status_text = f"{pct:.1f}%"
+        else:
+            color = COLOR_BAD
+            status_text = f"{pct:.1f}%"
+
+        return html.Div(
+            style={"display": "flex", "flexDirection": "column", "gap": "6px"},
+            children=[
+                html.Div(label, style={
+                    "fontSize": "12px",
+                    "fontWeight": "600",
+                    "color": COLOR_TEXT_MUTED,
+                    "textTransform": "uppercase",
+                    "letterSpacing": "0.05em",
+                }),
+                html.Div(
+                    style={"display": "flex", "alignItems": "baseline", "gap": "6px"},
+                    children=[
+                        html.Div(status_text, style={
+                            "fontSize": "28px",
+                            "fontWeight": "800",
+                            "color": color,
+                            "lineHeight": "1",
+                        }),
+                        html.Div(
+                            f"of {required_pct:.0f}% required",
+                            style={"fontSize": "11px", "color": COLOR_TEXT_MUTED},
+                        ) if op_hrs > 0 else html.Div(),
+                    ],
+                ),
+                # Progress bar
+                html.Div(
+                    style={
+                        "height": "6px",
+                        "backgroundColor": COLOR_SURFACE_ALT,
+                        "borderRadius": "3px",
+                        "overflow": "hidden",
+                        "position": "relative",
+                    },
+                    children=[
+                        html.Div(style={
+                            "height": "100%",
+                            "width": f"{min(pct, 100):.1f}%",
+                            "backgroundColor": color,
+                            "borderRadius": "3px",
+                            "transition": "width 0.5s ease",
+                        }),
+                    ],
+                ) if op_hrs > 0 else html.Div(),
+                html.Div(
+                    f"{valid_hrs} valid / {op_hrs} operating hrs"
+                    + (f" ({missing_hrs} missing)" if missing_hrs > 0 else ""),
+                    style={"fontSize": "11px", "color": COLOR_TEXT_MUTED},
+                ) if op_hrs > 0 else html.Div(),
+            ],
+        )
+
+    # Card border color based on worst-case of the two periods
+    month_pct = float(month_stats.get("uptime_pct", 0))
+    month_op = int(month_stats.get("operating_hours", 0))
+    if month_op == 0:
+        border_color = COLOR_TEXT_SUBTLE
+    elif month_pct >= required_pct:
+        border_color = COLOR_GOOD
+    elif month_pct >= required_pct - 5:
+        border_color = COLOR_WARNING
+    else:
+        border_color = COLOR_BAD
+
+    card_style = {**CARD_STYLE, "borderTop": f"3px solid {border_color}"}
+
+    return html.Div(
+        style=card_style,
+        children=[
+            html.Div("CEMS Data Availability", style=CARD_HEADER_STYLE),
+            html.Div(
+                "Monitor uptime vs. operating hours (requires machine state tag)",
+                style=CARD_SUBTITLE_STYLE,
+            ),
+            html.Div(
+                style={
+                    "display": "grid",
+                    "gridTemplateColumns": "1fr 1fr",
+                    "gap": "20px",
+                },
+                children=[
+                    _uptime_section("This Month", month_stats),
+                    html.Div(
+                        style={
+                            "borderLeft": f"1px solid {COLOR_BORDER}",
+                            "paddingLeft": "20px",
+                        },
+                        children=[_uptime_section("This Quarter", quarter_stats)],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+
+# ============================================================================
+#  DASHBOARD COMPONENT BUILDERS -- health, quality, compliance, stats
+# ============================================================================
 
 
 def build_system_health_card(health: Dict[str, object]) -> html.Div:
@@ -2774,11 +3572,11 @@ def build_system_health_card(health: Dict[str, object]) -> html.Div:
     status_reason = str(health.get("status_reason", ""))
     status_upper = status.lower()
     if "critical" in status_upper:
-        color = "#ef9a9a"
+        color = COLOR_BAD
     elif "degraded" in status_upper:
-        color = "#ffb74d"
+        color = COLOR_WARNING
     elif "healthy" in status_upper:
-        color = "#a5d6a7"
+        color = COLOR_GOOD
     else:
         color = COLOR_TEXT_SUBTLE
 
@@ -2797,23 +3595,38 @@ def build_system_health_card(health: Dict[str, object]) -> html.Div:
                     html.Span(f"{label}: ", style={"color": COLOR_TEXT_MUTED}),
                     html.Span("—" if val is None else str(val)),
                 ],
-                style={"fontSize": "11px"},
+                style={"fontSize": "12px"},
             )
         )
 
+    card_style = {
+        **CARD_STYLE,
+        "borderTop": f"3px solid {color}",
+    }
+
     return html.Div(
-        style=CARD_STYLE,
+        style=card_style,
         children=[
+            html.Div("System Health", style=CARD_HEADER_STYLE),
             html.Div(
-                "System Health",
-                style={"fontWeight": "600", "fontSize": "13px", "marginBottom": "6px"},
+                status,
+                style={"color": color, "fontSize": "22px", "fontWeight": "700", "marginTop": "2px"},
             ),
-            html.Div(status, style={"color": color, "fontSize": "20px", "fontWeight": "700"}),
             html.Div(
                 status_reason,
-                style={"fontSize": "11px", "color": COLOR_TEXT_MUTED, "marginBottom": "6px"},
+                style={"fontSize": "12px", "color": COLOR_TEXT_MUTED},
             ),
-            html.Div(details, style={"display": "flex", "flexDirection": "column", "gap": "2px"}),
+            html.Div(
+                details,
+                style={
+                    "display": "flex",
+                    "flexDirection": "column",
+                    "gap": "3px",
+                    "borderTop": f"1px solid {COLOR_BORDER}",
+                    "paddingTop": "8px",
+                    "marginTop": "4px",
+                },
+            ),
         ],
     )
 
@@ -2867,13 +3680,10 @@ def build_quality_card(stats: Dict[str, Dict[str, float]]) -> html.Div:
     return html.Div(
         style=CARD_STYLE,
         children=[
-            html.Div(
-                "Data Quality (last 24h)",
-                style={"fontWeight": "600", "fontSize": "13px"},
-            ),
+            html.Div("Data Quality (last 24h)", style=CARD_HEADER_STYLE),
             html.Div(
                 "QA flags drive valid %; DATA_GAP events summarize missing runs.",
-                style={"fontSize": "11px", "color": COLOR_TEXT_MUTED},
+                style=CARD_SUBTITLE_STYLE,
             ),
             table,
         ],
@@ -2884,17 +3694,18 @@ def build_stat_tile(title: str, value: str, subtitle: str = "") -> html.Div:
     return html.Div(
         style={
             "backgroundColor": COLOR_SURFACE_ALT,
-            "padding": "10px",
-            "borderRadius": "8px",
-            "minWidth": "200px",
+            "padding": "14px 16px",
+            "borderRadius": "12px",
+            "minWidth": "220px",
             "color": COLOR_TEXT_PRIMARY,
+            "border": f"1px solid {COLOR_BORDER}",
         },
         children=[
-            html.Div(title, style={"fontSize": "12px", "color": COLOR_TEXT_MUTED}),
-            html.Div(value, style={"fontSize": "18px", "fontWeight": "700", "marginTop": "4px"}),
+            html.Div(title, style={"fontSize": "12px", "color": COLOR_TEXT_MUTED, "fontWeight": "500"}),
+            html.Div(value, style={"fontSize": "20px", "fontWeight": "700", "marginTop": "6px"}),
             html.Div(
                 subtitle,
-                style={"fontSize": "11px", "color": COLOR_TEXT_SUBTLE, "marginTop": "2px"},
+                style={"fontSize": "11px", "color": COLOR_TEXT_SUBTLE, "marginTop": "3px"},
             ),
         ],
     )
@@ -3048,15 +3859,7 @@ def build_compliance_thresholds_table(
                         "Save Compliance Thresholds",
                         id="compliance-threshold-save-btn",
                         n_clicks=0,
-                        style={
-                            "marginTop": "6px",
-                            "backgroundColor": COLOR_ACCENT,
-                            "color": "white",
-                            "border": "none",
-                            "padding": "6px 10px",
-                            "borderRadius": "6px",
-                            "fontSize": "11px",
-                        },
+                        style={"marginTop": "6px", **EXPORT_BUTTON_STYLE},
                     ),
                     html.Div(
                         id="compliance-threshold-save-status",
@@ -3097,8 +3900,8 @@ def build_compliance_view(
                 value=summary.get("pct_24h", 0.0),
                 showCurrentValue=True,
                 label="Within limits (last 24h)",
-                color="#4caf50",
-                size=170,
+                color=COLOR_GOOD,
+                size=180,
             ),
             daq.Gauge(
                 min=0,
@@ -3106,8 +3909,8 @@ def build_compliance_view(
                 value=summary.get("pct_30d", 0.0),
                 showCurrentValue=True,
                 label="Within limits (last 30d)",
-                color="#81c784",
-                size=170,
+                color="#6ee7b7",
+                size=180,
             ),
         ],
     )
@@ -3131,7 +3934,9 @@ def build_compliance_view(
     )
 
 
-# ----------------- dash app -----------------
+# ============================================================================
+#  DASH APP LAYOUT
+# ============================================================================
 
 app = Dash(__name__)
 app.title = "ARC Reporting"
@@ -3141,8 +3946,8 @@ app.layout = html.Div(
     style={
         "backgroundColor": COLOR_BG,
         "color": COLOR_TEXT_PRIMARY,
-        "fontFamily": "Segoe UI, sans-serif",
-        "padding": "16px",
+        "fontFamily": "'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif",
+        "padding": "20px 24px",
         "minHeight": "100vh",
     },
     children=[
@@ -3150,12 +3955,14 @@ app.layout = html.Div(
         html.Div(
             style={
                 "backgroundColor": COLOR_SURFACE,
-                "borderRadius": "8px",
-                "padding": "12px 16px",
+                "borderRadius": "14px",
+                "padding": "16px 24px",
                 "display": "flex",
                 "justifyContent": "space-between",
                 "alignItems": "center",
-                "marginBottom": "12px",
+                "marginBottom": "16px",
+                "boxShadow": "0 2px 12px rgba(0,0,0,0.25)",
+                "borderBottom": f"2px solid {COLOR_ACCENT}",
             },
             children=[
                 html.Div(
@@ -3163,15 +3970,18 @@ app.layout = html.Div(
                         html.Div(
                             "ARC Reporting",
                             style={
-                                "fontSize": "18px",
-                                "fontWeight": "700",
+                                "fontSize": "22px",
+                                "fontWeight": "800",
+                                "letterSpacing": "-0.02em",
+                                "color": COLOR_TEXT_PRIMARY,
                             },
                         ),
                         html.Div(
-                            "Live view of PLC tags and hourly aggregates",
+                            "Live PLC tag monitoring & hourly aggregates",
                             style={
-                                "fontSize": "11px",
+                                "fontSize": "12px",
                                 "color": COLOR_TEXT_MUTED,
+                                "marginTop": "2px",
                             },
                         ),
                     ]
@@ -3189,9 +3999,11 @@ app.layout = html.Div(
                         html.Div(
                             id="last-update-label",
                             style={
-                                "fontSize": "11px",
-                                "color": COLOR_TEXT_SUBTLE,
+                                "fontSize": "12px",
+                                "color": COLOR_TEXT_MUTED,
                                 "textAlign": "right",
+                                "fontWeight": "500",
+                                "marginTop": "2px",
                             },
                         ),
                     ]
@@ -3227,32 +4039,28 @@ app.layout = html.Div(
             id="main-tabs",
             value="overview",
             colors={
-                "border": COLOR_BORDER,
+                "border": "transparent",
                 "primary": COLOR_ACCENT,
                 "background": COLOR_SURFACE_ALT,
             },
             style={
-                "borderRadius": "8px",
+                "borderRadius": "12px",
                 "overflow": "hidden",
             },
             children=[
                 dcc.Tab(
                     label="Overview",
                     value="overview",
-                    style={"backgroundColor": COLOR_SURFACE_ALT, "color": COLOR_TEXT_MUTED},
-                    selected_style={
-                        "backgroundColor": COLOR_SURFACE,
-                        "color": COLOR_TEXT_PRIMARY,
-                        "fontWeight": "600",
-                    },
+                    style=TAB_STYLE,
+                    selected_style=TAB_SELECTED_STYLE,
                     children=[
                         html.Div(
                             id="tag-cards-container",
                             style={
-                                "padding": "12px",
-                                "display": "flex",
-                                "flexWrap": "wrap",
-                                "gap": "16px",
+                                "padding": "20px 16px",
+                                "display": "grid",
+                                "gridTemplateColumns": "repeat(auto-fill, minmax(280px, 1fr))",
+                                "gap": "20px",
                             },
                         ),
                     ],
@@ -3260,104 +4068,108 @@ app.layout = html.Div(
                 dcc.Tab(
                     label="Thresholds",
                     value="thresholds",
-                    style={"backgroundColor": COLOR_SURFACE_ALT, "color": COLOR_TEXT_MUTED},
-                    selected_style={
-                        "backgroundColor": COLOR_SURFACE,
-                        "color": COLOR_TEXT_PRIMARY,
-                        "fontWeight": "600",
-                    },
+                    style=TAB_STYLE,
+                    selected_style=TAB_SELECTED_STYLE,
                     children=[
                         html.Div(
                             style={
-                                "padding": "12px 16px",
+                                "padding": "20px 24px",
                                 "display": "flex",
                                 "flexDirection": "column",
-                                "gap": "8px",
-                                "maxWidth": "380px",
+                                "gap": "12px",
+                                "maxWidth": "480px",
                             },
                             children=[
                                 html.Div(
-                                    "Threshold / Limit Editor",
-                                    style={
-                                        "fontSize": "14px",
-                                        "fontWeight": "600",
-                                    },
-                                ),
-                                html.Div(
-                                    "Separate operator warning bands from regulatory/permit limits. "
-                                    "Operational thresholds drive gauge coloring; limits track strict compliance.",
-                                    style={"fontSize": "11px", "color": COLOR_TEXT_MUTED},
+                                    children=[
+                                        html.Div(
+                                            "Threshold / Limit Editor",
+                                            style={
+                                                "fontSize": "16px",
+                                                "fontWeight": "700",
+                                            },
+                                        ),
+                                        html.Div(
+                                            "Operational thresholds drive gauge coloring. "
+                                            "Regulatory limits track permit compliance.",
+                                            style={
+                                                "fontSize": "12px",
+                                                "color": COLOR_TEXT_MUTED,
+                                                "marginTop": "4px",
+                                                "lineHeight": "1.5",
+                                            },
+                                        ),
+                                    ],
                                 ),
                                 html.Label(
                                     "Tag:",
-                                    style={"marginTop": "6px", "fontSize": "11px"},
+                                    style={"fontSize": "12px", "fontWeight": "600"},
                                 ),
                                 dcc.Dropdown(
                                     id="threshold-tag-dropdown",
                                     options=[],
                                     value=None,
-                                    placeholder="No tags yet",
-                                    style={"color": "#000"},
+                                    placeholder="Select a tag...",
                                 ),
                                 html.Label(
                                     "Alias (friendly name):",
-                                    style={"marginTop": "6px", "fontSize": "11px"},
+                                    style={"fontSize": "12px", "fontWeight": "600"},
                                 ),
                                 dcc.Input(
                                     id="threshold-alias-input",
                                     type="text",
-                                    placeholder="Kiln Temperature",
-                                    style={"width": "100%"},
+                                    placeholder="e.g. Kiln Temperature",
+                                    style=INPUT_STYLE,
                                 ),
                                 html.Label(
                                     "Units:",
-                                    style={"marginTop": "6px", "fontSize": "11px"},
+                                    style={"fontSize": "12px", "fontWeight": "600"},
                                 ),
                                 dcc.Input(
                                     id="threshold-units-input",
                                     type="text",
-                                    placeholder="°C",
-                                    style={"width": "100%"},
+                                    placeholder="e.g. ppm, lb/hr, %",
+                                    style=INPUT_STYLE,
                                 ),
                                 html.Label(
                                     "Operational thresholds (warning band):",
-                                    style={"marginTop": "6px", "fontSize": "11px"},
+                                    style={"fontSize": "12px", "fontWeight": "600"},
                                 ),
                                 html.Div(
-                                    style={"display": "flex", "gap": "6px"},
+                                    style={"display": "flex", "gap": "10px"},
                                     children=[
                                         dcc.Input(
                                             id="threshold-low-input",
                                             type="number",
-                                            placeholder="Low operational",
-                                            style={"flex": 1},
+                                            placeholder="Low",
+                                            style={**INPUT_STYLE, "flex": "1"},
                                         ),
                                         dcc.Input(
                                             id="threshold-high-input",
                                             type="number",
-                                            placeholder="High operational",
-                                            style={"flex": 1},
+                                            placeholder="High",
+                                            style={**INPUT_STYLE, "flex": "1"},
                                         ),
                                     ],
                                 ),
                                 html.Label(
                                     "Regulatory limits (permit/compliance):",
-                                    style={"marginTop": "6px", "fontSize": "11px"},
+                                    style={"fontSize": "12px", "fontWeight": "600"},
                                 ),
                                 html.Div(
-                                    style={"display": "flex", "gap": "6px"},
+                                    style={"display": "flex", "gap": "10px"},
                                     children=[
                                         dcc.Input(
                                             id="threshold-low-limit-input",
                                             type="number",
                                             placeholder="Low limit",
-                                            style={"flex": 1},
+                                            style={**INPUT_STYLE, "flex": "1"},
                                         ),
                                         dcc.Input(
                                             id="threshold-high-limit-input",
                                             type="number",
                                             placeholder="High limit",
-                                            style={"flex": 1},
+                                            style={**INPUT_STYLE, "flex": "1"},
                                         ),
                                     ],
                                 ),
@@ -3366,25 +4178,20 @@ app.layout = html.Div(
                                     id="threshold-save-btn",
                                     n_clicks=0,
                                     style={
-                                        "marginTop": "6px",
-                                        "backgroundColor": COLOR_ACCENT,
-                                        "color": "white",
-                                        "border": "none",
-                                        "padding": "6px 10px",
-                                        "borderRadius": "6px",
-                                        "fontSize": "11px",
+                                        "marginTop": "4px",
+                                        **EXPORT_BUTTON_STYLE,
                                     },
                                 ),
                                 html.Div(
                                     id="threshold-save-status",
-                                    style={"fontSize": "11px", "color": COLOR_TEXT_SUBTLE},
+                                    style={"fontSize": "12px", "color": COLOR_TEXT_MUTED},
                                 ),
                                 html.Div(
                                     f"File: {THRESHOLDS_JSON}",
                                     style={
-                                        "marginTop": "8px",
-                                        "fontSize": "9px",
+                                        "fontSize": "10px",
                                         "color": COLOR_TEXT_SUBTLE,
+                                        "marginTop": "4px",
                                     },
                                 ),
                             ],
@@ -3394,20 +4201,16 @@ app.layout = html.Div(
                 dcc.Tab(
                     label="Exports",
                     value="exports",
-                    style={"backgroundColor": COLOR_SURFACE_ALT, "color": COLOR_TEXT_MUTED},
-                    selected_style={
-                        "backgroundColor": COLOR_SURFACE,
-                        "color": COLOR_TEXT_PRIMARY,
-                        "fontWeight": "600",
-                    },
+                    style=TAB_STYLE,
+                    selected_style=TAB_SELECTED_STYLE,
                     children=[
                         html.Div(
                             style={
-                                "padding": "12px 16px",
+                                "padding": "20px 24px",
                                 "display": "flex",
                                 "flexDirection": "column",
-                                "gap": "12px",
-                                "maxWidth": "760px",
+                                "gap": "16px",
+                                "maxWidth": "800px",
                             },
                             children=[
                                 html.Div(
@@ -3447,7 +4250,7 @@ app.layout = html.Div(
                                                 style={
                                                     "marginTop": "8px",
                                                     "fontSize": "11px",
-                                                    "color": "#b0bec5",
+                                                    "color": COLOR_TEXT_MUTED,
                                                 },
                                             ),
                                         ),
@@ -3472,7 +4275,7 @@ app.layout = html.Div(
                                             ],
                                             value="month",
                                             clearable=False,
-                                            style={"marginTop": "8px", "fontSize": "11px"},
+                                            style={"marginTop": "8px", "fontSize": "12px"},
                                         ),
                                         html.Div(
                                             style=EXPORT_BUTTON_ROW_STYLE,
@@ -3509,7 +4312,7 @@ app.layout = html.Div(
                                                 style={
                                                     "marginTop": "8px",
                                                     "fontSize": "11px",
-                                                    "color": "#b0bec5",
+                                                    "color": COLOR_TEXT_MUTED,
                                                 },
                                             ),
                                         ),
@@ -3564,7 +4367,7 @@ app.layout = html.Div(
                                                 style={
                                                     "marginTop": "8px",
                                                     "fontSize": "11px",
-                                                    "color": "#b0bec5",
+                                                    "color": COLOR_TEXT_MUTED,
                                                 },
                                             ),
                                         ),
@@ -3622,7 +4425,7 @@ app.layout = html.Div(
                                                 style={
                                                     "marginTop": "8px",
                                                     "fontSize": "11px",
-                                                    "color": "#b0bec5",
+                                                    "color": COLOR_TEXT_MUTED,
                                                 },
                                             ),
                                         ),
@@ -3638,7 +4441,9 @@ app.layout = html.Div(
 )
 
 
-# ----------------- callbacks -----------------
+# ============================================================================
+#  CALLBACKS
+# ============================================================================
 
 
 @app.callback(
@@ -4060,7 +4865,10 @@ def update_dashboard(n):
             | set(thresholds.keys()),
             key=str,
         )
-        tags = [t for t in tags if not looks_numeric_tag(str(t))]
+        tags = [
+            t for t in tags
+            if not looks_numeric_tag(str(t)) and not str(t).startswith("EPA19:")
+        ]
 
         cems_map = {
             "o2": "CEMS O2",
@@ -4089,6 +4897,58 @@ def update_dashboard(n):
                 alias_map=alias_map,
             )
         )
+
+        # Processing Time gauge
+        machine_state_tag = load_machine_state_tag_from_settings()
+        processing_is_running = False
+        if machine_state_tag:
+            current_hr_proc, today_proc = compute_processing_time_minutes(
+                raw_df, machine_state_tag
+            )
+            cards.append(
+                build_processing_time_card(current_hr_proc, today_proc)
+            )
+            processing_is_running = (
+                isinstance(current_hr_proc, (int, float))
+                and current_hr_proc == current_hr_proc
+                and current_hr_proc > 0
+            )
+
+        # Feed System / Conveyor status card
+        feed_settings = load_feed_settings()
+        if feed_settings.get("detection", "none") != "none":
+            feed_status = compute_feed_status(raw_df, feed_settings)
+            cards.append(
+                build_feed_status_card(feed_status, processing_is_running)
+            )
+
+        # CEMS Data Availability / Uptime card
+        if machine_state_tag:
+            now = datetime.now()
+            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            # Quarter start: Jan/Apr/Jul/Oct
+            quarter_month = ((now.month - 1) // 3) * 3 + 1
+            quarter_start = now.replace(
+                month=quarter_month, day=1, hour=0, minute=0, second=0, microsecond=0
+            )
+
+            # Collect CEMS tag names for availability check
+            cems_tag_list = []
+            for metric in ("o2", "nox", "co"):
+                t = find_cems_tag(metric, tags, thresholds, alias_map)
+                if t:
+                    cems_tag_list.append(t)
+
+            month_uptime = compute_cems_uptime(
+                hourly_df, machine_state_tag, cems_tag_list, month_start, now,
+            )
+            quarter_uptime = compute_cems_uptime(
+                hourly_df, machine_state_tag, cems_tag_list, quarter_start, now,
+            )
+            cards.append(
+                build_cems_uptime_card(month_uptime, quarter_uptime)
+            )
+
         for metric, label in cems_map.items():
             ppm_tag = find_cems_tag(metric, tags, thresholds, alias_map)
             if ppm_tag:
@@ -4140,23 +5000,15 @@ def update_dashboard(n):
 
     except Exception as e:
         error_card = html.Div(
-            style=CARD_STYLE,
+            style={**CARD_STYLE, "borderTop": f"3px solid {COLOR_BAD}"},
             children=[
                 html.Div(
                     "Dashboard Error",
-                    style={
-                        "fontWeight": "600",
-                        "fontSize": "13px",
-                        "marginBottom": "4px",
-                        "color": "#ef9a9a",
-                    },
+                    style={**CARD_HEADER_STYLE, "color": COLOR_BAD},
                 ),
                 html.Div(
                     f"An error occurred while updating the dashboard: {e}",
-                    style={
-                        "fontSize": "11px",
-                        "color": "#ef9a9a",
-                    },
+                    style={"fontSize": "12px", "color": COLOR_TEXT_MUTED},
                 ),
             ],
         )
@@ -4164,7 +5016,9 @@ def update_dashboard(n):
         return [error_card], last_update, compute_config_version_text()
 
 
-# ----------------- main -----------------
+# ============================================================================
+#  MAIN ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8050, debug=False)

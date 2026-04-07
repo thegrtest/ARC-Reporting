@@ -978,6 +978,8 @@ class MainWindow(QMainWindow):
         self.production_weight_limits_enabled = False
         self.production_weight_min = 0.0
         self.production_weight_max = 0.0
+        self.conveyor_detection = "none"   # "none", "weight", "tag"
+        self.conveyor_tag = ""
         self.log_dir = os.path.join("logs")
         self.raw_csv_path = ""   # will be set based on current date
         self.current_log_date: date = datetime.now().date()
@@ -1971,6 +1973,24 @@ class MainWindow(QMainWindow):
         )
         self._toggle_production_weight_limits(self.production_weight_limits_checkbox.checkState())
 
+        conveyor_label = QLabel("Feed System / Conveyor")
+        conveyor_label.setStyleSheet("font-weight: 600; color: #b0bec5; padding-top: 6px;")
+        cfg_layout.addRow(conveyor_label)
+
+        self.conveyor_detection_combo = QComboBox()
+        self.conveyor_detection_combo.addItems([
+            "None",
+            "Weight-Based (decreasing weight)",
+            "Tag-Based (digital/bool tag)",
+        ])
+        cfg_layout.addRow(QLabel("Conveyor Detection:"), self.conveyor_detection_combo)
+
+        self.conveyor_tag_edit = QLineEdit()
+        self.conveyor_tag_edit.setPlaceholderText(
+            "e.g. Program:MainRoutine.Conveyor_Running"
+        )
+        cfg_layout.addRow(QLabel("Conveyor Status Tag:"), self.conveyor_tag_edit)
+
         # Machine state tag + behavior
         self.machine_state_tag_edit = QLineEdit()
         self.machine_state_tag_edit.setPlaceholderText(
@@ -2703,61 +2723,6 @@ class MainWindow(QMainWindow):
 
         return self._ppmv_to_lb_hr(ppmv, flow_avg, mw)
 
-    def _compute_epa_method19(self, data: Dict[str, Tuple[object, str]]) -> Dict[str, Tuple[float, str]]:
-        if not self.epa_enabled:
-            return {}
-
-        flow_tag = self._resolve_tag_from_alias(self.epa_flow_tag)
-        o2_tag = self._resolve_tag_from_alias(self.epa_o2_tag)
-        nox_tag = self._resolve_tag_from_alias(self.epa_nox_tag)
-        co_tag = self._resolve_tag_from_alias(self.epa_co_tag)
-
-        flow = self._get_numeric_from_poll(data, flow_tag)
-        if flow is None:
-            return {}
-
-        raw_o2 = self._get_numeric_from_poll(data, o2_tag)
-        o2_pct, o2_ppmv = self._epa_o2_values(raw_o2)
-        calc_tags = self._epa_calc_tag_names()
-
-        results: Dict[str, Tuple[float, str]] = {}
-        status_success = "success"
-        pollutant_map = [
-            ("NOx", nox_tag, True),
-            ("CO", co_tag, True),
-            ("O2", o2_tag, False),
-        ]
-
-        for pollutant, tag, needs_correction in pollutant_map:
-            if not tag:
-                continue
-            raw_val = self._get_numeric_from_poll(data, tag)
-            if raw_val is None:
-                continue
-            if pollutant == "O2":
-                ppmv = o2_ppmv if tag == o2_tag else raw_val
-            else:
-                ppmv = raw_val
-            if ppmv is None:
-                continue
-            if needs_correction:
-                if o2_pct is None:
-                    continue
-                corrected_ppmv = self._correct_ppmv_for_o2(ppmv, o2_pct)
-                if corrected_ppmv is None:
-                    continue
-            else:
-                corrected_ppmv = ppmv
-
-            mw = self.EPA19_MOLECULAR_WEIGHTS.get(pollutant)
-            if mw is None:
-                continue
-            lb_hr = self._ppmv_to_lb_hr(corrected_ppmv, flow, mw)
-            calc_tag = calc_tags[pollutant]
-            results[calc_tag] = (lb_hr, status_success)
-
-        return results
-
     # ---------------- settings ----------------
 
     def _load_settings(self):
@@ -2866,6 +2831,15 @@ class MainWindow(QMainWindow):
         self.production_weight_max_spin.setValue(self.production_weight_max)
         self._toggle_production_weight_limits(self.production_weight_limits_checkbox.checkState())
 
+        conveyor_detection = str(production_data.get("conveyor_detection", "none") or "none").strip().lower()
+        if conveyor_detection not in ("none", "weight", "tag"):
+            conveyor_detection = "none"
+        self.conveyor_detection = conveyor_detection
+        detection_index = {"none": 0, "weight": 1, "tag": 2}.get(conveyor_detection, 0)
+        self.conveyor_detection_combo.setCurrentIndex(detection_index)
+        self.conveyor_tag = str(production_data.get("conveyor_tag", "") or "")
+        self.conveyor_tag_edit.setText(self.conveyor_tag)
+
         # Machine state settings
         self.machine_state_tag_edit.setText(data.get("machine_state_tag", ""))
         pause_when_down = bool(data.get("pause_when_down", False))
@@ -2941,6 +2915,8 @@ class MainWindow(QMainWindow):
                 "product_tag": self.production_product_tag_edit.text().strip(),
                 "weight_tag": self.production_weight_tag_edit.text().strip(),
                 "weight_units": self.production_weight_units_edit.text().strip(),
+                "conveyor_detection": ["none", "weight", "tag"][self.conveyor_detection_combo.currentIndex()],
+                "conveyor_tag": self.conveyor_tag_edit.text().strip(),
                 "limits": {
                     "enabled": self.production_weight_limits_checkbox.isChecked(),
                     "min": (
@@ -3615,14 +3591,6 @@ class MainWindow(QMainWindow):
             time_str = ts.strftime("%H:%M:%S")
 
             try:
-                # --- inject EPA Method 19 derived lb/hr tags into the same datapath ---
-                try:
-                    derived = self._compute_epa_method19(data)
-                    if derived:
-                        data.update(derived)
-                except Exception as e:
-                    self.log_message(f"EPA Method 19 compute failed: {e}")
-
                 rows: List[List[object]] = []
                 for tag, (val, status) in data.items():
                     qa_flag = self._determine_qa_flag(tag, val, status)
@@ -3741,7 +3709,6 @@ class MainWindow(QMainWindow):
             return
 
         ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
-        epa_calc_tags = self._epa_calc_tags()
         rows: List[List[object]] = []
 
         for tag, minute_avg in avg_lookup.items():
@@ -3752,8 +3719,6 @@ class MainWindow(QMainWindow):
                 derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
                 if derived_lbhr is not None:
                     lbhr_avg = derived_lbhr
-            if tag in epa_calc_tags and lbhr_avg is None:
-                lbhr_avg = minute_avg
             alias = self.alias_map.get(tag, "")
             rows.append(
                 [
@@ -3793,7 +3758,7 @@ class MainWindow(QMainWindow):
                 latest: Dict[str, Tuple[datetime, Optional[float], Optional[float]]] = {}
                 for row in reader:
                     tag = row.get("tag", "")
-                    if not tag:
+                    if not tag or tag.startswith("EPA19:"):
                         continue
                     window_end_str = row.get("window_end", "")
                     try:
@@ -3826,7 +3791,7 @@ class MainWindow(QMainWindow):
                 for row in reader:
                     window_end = row.get("window_end", "")
                     tag = row.get("tag", "")
-                    if not window_end or not tag:
+                    if not window_end or not tag or tag.startswith("EPA19:"):
                         continue
                     alias = row.get("alias", "") or ""
                     records[(window_end, tag)] = (
@@ -3878,6 +3843,8 @@ class MainWindow(QMainWindow):
         window_start = window_end - timedelta(hours=12)
         tag_entries: Dict[str, List[Tuple[datetime, Optional[float], Optional[float]]]] = {}
         for (hour_start_iso, tag), (_, avg, lbhr_avg, count, _) in records.items():
+            if tag.startswith("EPA19:"):
+                continue
             try:
                 hour_start = datetime.fromisoformat(hour_start_iso)
             except Exception:
@@ -3967,6 +3934,8 @@ class MainWindow(QMainWindow):
     ) -> None:
         tag_entries: Dict[str, List[Tuple[datetime, Optional[float], Optional[float]]]] = {}
         for (hour_start_iso, tag), (_, avg, lbhr_avg, count, _) in records.items():
+            if tag.startswith("EPA19:"):
+                continue
             try:
                 hour_start = datetime.fromisoformat(hour_start_iso)
             except Exception:
@@ -4061,7 +4030,10 @@ class MainWindow(QMainWindow):
                 with open(self.hourly_csv_path, "r", encoding="utf-8") as f:
                     reader = csv.DictReader(f)
                     for row in reader:
-                        key = (row["hour_start"], row["tag"])
+                        tag = row.get("tag", "")
+                        if tag.startswith("EPA19:"):
+                            continue
+                        key = (row["hour_start"], tag)
                         records[key] = (
                             row["hour_end"],
                             self._safe_float(row.get("avg_value")),
@@ -4084,7 +4056,6 @@ class MainWindow(QMainWindow):
 
         self.last_hour_avg.clear()
         self.last_hour_avg.update(avg_lookup)
-        epa_calc_tags = self._epa_calc_tags()
 
         for tag, acc in self.hour_accumulators.items():
             if acc["count"] <= 0:
@@ -4098,8 +4069,6 @@ class MainWindow(QMainWindow):
                 derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
                 if derived_lbhr is not None:
                     lbhr_avg = derived_lbhr
-            if tag in epa_calc_tags and lbhr_avg is None:
-                lbhr_avg = avg
             existing_alias = existing[4] if existing else ""
             alias = existing_alias or self.alias_map.get(tag, "")
             records[key] = (hour_end_iso, avg, lbhr_avg, int(acc["count"]), alias)
@@ -4203,7 +4172,7 @@ class MainWindow(QMainWindow):
                             continue
 
                         tag = row.get("tag", "")
-                        if not tag:
+                        if not tag or tag.startswith("EPA19:"):
                             continue
                         alias = str(row.get("alias", "") or "").strip()
                         if alias:
@@ -4253,7 +4222,6 @@ class MainWindow(QMainWindow):
             return
 
         ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
-        epa_calc_tags = self._epa_calc_tags()
         if ppm_to_lbhr:
             avg_by_hour: Dict[str, Dict[str, float]] = {}
             for (hstart_iso, tag), (_, avg, _, _, _) in records.items():
@@ -4262,21 +4230,14 @@ class MainWindow(QMainWindow):
                 avg_by_hour.setdefault(hstart_iso, {})[tag] = avg
 
             for (hstart_iso, tag), (hend_iso, avg, lbhr_avg, count, alias) in list(records.items()):
-                lbhr_tag = ppm_to_lbhr.get(tag)
-                if not lbhr_tag:
+                if tag not in ppm_to_lbhr:
                     continue
-                lbhr_record = records.get((hstart_iso, lbhr_tag))
-                if lbhr_record:
-                    lbhr_avg = lbhr_record[1]
-                elif lbhr_avg is None:
+                if lbhr_avg is None:
                     avg_lookup = avg_by_hour.get(hstart_iso, {})
                     derived = self._compute_lbhr_from_avg(tag, avg_lookup)
                     if derived is not None:
                         lbhr_avg = derived
                 records[(hstart_iso, tag)] = (hend_iso, avg, lbhr_avg, count, alias)
-        for (hstart_iso, tag), (hend_iso, avg, lbhr_avg, count, alias) in list(records.items()):
-            if tag in epa_calc_tags and avg is not None and lbhr_avg is None:
-                records[(hstart_iso, tag)] = (hend_iso, avg, avg, count, alias)
 
         try:
             ensure_csv(
@@ -4321,14 +4282,17 @@ class MainWindow(QMainWindow):
             | Rolling 12 Hr Avg | Rolling 12 Hr Avg (lb/hr) | QA Flag
         """
         if self.tag_order:
-            tags = list(self.tag_order)
+            tags = [t for t in self.tag_order if not t.startswith("EPA19:")]
         else:
             tags = sorted(
-                set(self.current_values.keys())
-                | set(self.last_hour_avg.keys())
-                | set(self.current_hour_preview.keys())
-                | set(self.rolling_12hr_avg.keys())
-                | set(self.rolling_12hr_lbhr_avg.keys())
+                t for t in (
+                    set(self.current_values.keys())
+                    | set(self.last_hour_avg.keys())
+                    | set(self.current_hour_preview.keys())
+                    | set(self.rolling_12hr_avg.keys())
+                    | set(self.rolling_12hr_lbhr_avg.keys())
+                )
+                if not t.startswith("EPA19:")
             )
 
         ppm_to_lbhr = self._epa_ppm_to_lbhr_map()

@@ -851,8 +851,29 @@ def _format_lb_hr_ppm(lb_hr: Optional[float], ppm: Optional[float]) -> str:
     return f"{lb_hr_text} - {ppm_text}"
 
 # ============================================================================
-#  PDF REPORT GENERATION -- emissions & incident reports
+#  PDF REPORT GENERATION -- emissions, incident & daily operations reports
 # ============================================================================
+
+# Shared report colour palette (light-background print-friendly)
+_RPT = {
+    "text": "#1b1f2a",
+    "muted": "#3b4a5f",
+    "subtle": "#5a6b82",
+    "bg": "#f4f7fb",
+    "panel": "#ffffff",
+    "grid": "#d6e0ef",
+    "header": "#dbe9f6",
+    "alt_row": "#f1f6fc",
+    "border": "#b7c7dd",
+    "blue": "#1f77b4",
+    "orange": "#ff7f0e",
+    "green": "#2ca02c",
+    "red": "#d32f2f",
+    "limit": "#6c6c6c",
+    "bar_co": "#4a90d9",
+    "bar_nox": "#f5a623",
+    "bar_o2": "#7bc67e",
+}
 
 
 def generate_report_pdf(range_key: str) -> Optional[str]:
@@ -885,20 +906,23 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
         nox_tag = _find_tag_by_patterns(rolling_df, alias_map, nox_pattern)
         o2_tag = _find_tag_by_patterns(rolling_df, alias_map, o2_pattern)
 
+    # Also try hourly data for tag discovery (covers cases where rolling is empty)
+    if not co_tag:
+        co_tag = _find_tag_by_patterns(hourly_range, alias_map, co_pattern)
+    if not nox_tag:
+        nox_tag = _find_tag_by_patterns(hourly_range, alias_map, nox_pattern)
+    if not o2_tag:
+        o2_tag = _find_tag_by_patterns(hourly_range, alias_map, o2_pattern)
+
     co_series = rolling_range.loc[rolling_range["tag"] == co_tag] if co_tag else pd.DataFrame()
     nox_series = rolling_range.loc[rolling_range["tag"] == nox_tag] if nox_tag else pd.DataFrame()
     o2_series = rolling_range.loc[rolling_range["tag"] == o2_tag] if o2_tag else pd.DataFrame()
 
     co_entry = thresholds.get(co_tag, {}) if co_tag and isinstance(thresholds.get(co_tag, {}), dict) else {}
     nox_entry = thresholds.get(nox_tag, {}) if nox_tag and isinstance(thresholds.get(nox_tag, {}), dict) else {}
-    o2_entry = thresholds.get(o2_tag, {}) if o2_tag and isinstance(thresholds.get(o2_tag, {}), dict) else {}
 
     co_high_oper = _to_float(co_entry.get("high_oper"))
-    co_high_limit = _to_float(co_entry.get("high_limit"))
     nox_high_oper = _to_float(nox_entry.get("high_oper"))
-    nox_high_limit = _to_float(nox_entry.get("high_limit"))
-    o2_high_oper = _to_float(o2_entry.get("high_oper"))
-    o2_high_limit = _to_float(o2_entry.get("high_limit"))
 
     co_peak_lb_hr, co_peak_ppm, co_peak_time = _compute_peak_pair(
         rolling_range, co_tag, "avg_lb_hr", "avg_value", "window_end"
@@ -923,19 +947,14 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
     co_weight = _compute_total_weight(hourly_range, co_tag, processing_hour_starts)
     nox_weight = _compute_total_weight(hourly_range, nox_tag, processing_hour_starts)
 
-    report_text_primary = "#1b1f2a"
-    report_text_muted = "#3b4a5f"
-    report_text_subtle = "#5a6b82"
-    report_bg = "#f4f7fb"
-    report_panel = "#ffffff"
-    report_grid = "#d6e0ef"
-    report_table_header = "#dbe9f6"
-    report_table_alt = "#f1f6fc"
-    report_border = "#b7c7dd"
-    report_line_primary = "#1f77b4"
-    report_line_secondary = "#ff7f0e"
-    report_line_tertiary = "#2ca02c"
-    report_limit_line = "#6c6c6c"
+    # CEMS uptime for the reporting period
+    cems_tags = [t for t in [co_tag, nox_tag, o2_tag] if t]
+    uptime = compute_cems_uptime(hourly_df, machine_state_tag, cems_tags, start, end)
+    uptime_pct = uptime.get("uptime_pct", 0.0)
+    op_hours = uptime.get("operating_hours", 0)
+    valid_hours = uptime.get("valid_cems_hours", 0)
+
+    R = _RPT  # shorthand
 
     ensure_dir(EXPORT_TMP_DIR)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -943,195 +962,405 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
     report_path = os.path.join(EXPORT_TMP_DIR, filename)
 
     with PdfPages(report_path) as pdf:
+        # ---- Page 1: Rolling 12-hr chart + summary table ----
         fig = plt.figure(figsize=(11, 8.5))
-        fig.patch.set_facecolor(report_bg)
+        fig.patch.set_facecolor(R["bg"])
         gs = fig.add_gridspec(3, 1, height_ratios=[0.18, 0.55, 0.27])
         fig.subplots_adjust(right=0.78)
 
         ax_title = fig.add_subplot(gs[0, 0])
         ax_title.axis("off")
-        title_text = f"CIP Emissions Report - {label}"
-        subtitle = f"Reporting Window: {_format_report_dt(start)} to {_format_report_dt(end)}"
-        ax_title.text(
-            0.0,
-            0.75,
-            title_text,
-            fontsize=18,
-            fontweight="bold",
-            color=report_text_primary,
-        )
-        ax_title.text(
-            0.0,
-            0.4,
-            subtitle,
-            fontsize=11,
-            color=report_text_muted,
-        )
-        ax_title.text(
-            0.0,
-            0.1,
-            "Rolling 12-hour averages for CO/NOx (lb/hr) with %O2 trend overlay.",
-            fontsize=9.5,
-            color=report_text_subtle,
-        )
+        ax_title.text(0.0, 0.75, f"CIP Emissions Report - {label}",
+                      fontsize=18, fontweight="bold", color=R["text"])
+        ax_title.text(0.0, 0.4,
+                      f"Reporting Window: {_format_report_dt(start)} to {_format_report_dt(end)}",
+                      fontsize=11, color=R["muted"])
+        ax_title.text(0.0, 0.1,
+                      "Rolling 12-hour averages for CO/NOx (lb/hr) with %O2 trend overlay.",
+                      fontsize=9.5, color=R["subtle"])
 
         ax_chart = fig.add_subplot(gs[1, 0])
-        ax_chart.set_title("Rolling 12-Hour Averages", fontsize=12, color=report_text_primary)
-        ax_chart.set_ylabel("lb/hr", color=report_text_primary)
-        ax_chart.set_facecolor(report_panel)
-        ax_chart.grid(True, linestyle="--", color=report_grid, alpha=0.6)
+        ax_chart.set_title("Rolling 12-Hour Averages", fontsize=12, color=R["text"])
+        ax_chart.set_ylabel("lb/hr", color=R["text"])
+        ax_chart.set_facecolor(R["panel"])
+        ax_chart.grid(True, linestyle="--", color=R["grid"], alpha=0.6)
         ax_chart.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%m-%d\n%H:%M"))
 
         lines = []
         labels = []
 
         if not co_series.empty:
-            line, = ax_chart.plot(
-                co_series["window_end"],
-                co_series["avg_lb_hr"],
-                color=report_line_primary,
-                linewidth=2,
-                linestyle="-",
-            )
+            line, = ax_chart.plot(co_series["window_end"], co_series["avg_lb_hr"],
+                                 color=R["blue"], linewidth=2, linestyle="-")
             lines.append(line)
             labels.append(f"CO 12-hr avg ({_display_name(co_tag, alias_map, 'CO')})")
 
         if not nox_series.empty:
-            line, = ax_chart.plot(
-                nox_series["window_end"],
-                nox_series["avg_lb_hr"],
-                color=report_line_secondary,
-                linewidth=2,
-                linestyle="--",
-            )
+            line, = ax_chart.plot(nox_series["window_end"], nox_series["avg_lb_hr"],
+                                 color=R["orange"], linewidth=2, linestyle="--")
             lines.append(line)
             labels.append(f"NOx 12-hr avg ({_display_name(nox_tag, alias_map, 'NOx')})")
 
         ax_o2 = ax_chart.twinx()
-        ax_o2.set_ylabel("%O2", color=report_text_primary)
+        ax_o2.set_ylabel("%O2", color=R["text"])
         ax_o2.set_facecolor("none")
         if not o2_series.empty:
-            line, = ax_o2.plot(
-                o2_series["window_end"],
-                o2_series["avg_value"],
-                color=report_line_tertiary,
-                linestyle=":",
-                linewidth=2,
-            )
+            line, = ax_o2.plot(o2_series["window_end"], o2_series["avg_value"],
+                               color=R["green"], linestyle=":", linewidth=2)
             lines.append(line)
             labels.append(f"O2 % ({_display_name(o2_tag, alias_map, 'O2')})")
 
-        co_limit_value = co_high_oper
-        nox_limit_value = nox_high_oper
-        o2_limit_value = None
-
-        if co_limit_value is not None:
-            _ensure_limit_visible(ax_chart, co_limit_value)
-            _append_limit_lines(
-                ax_chart,
-                "CO",
-                co_high_oper,
-                None,
-                lines,
-                labels,
-                color=report_limit_line,
-            )
-        if nox_limit_value is not None:
-            _ensure_limit_visible(ax_chart, nox_limit_value)
-            _append_limit_lines(
-                ax_chart,
-                "NOx",
-                nox_high_oper,
-                None,
-                lines,
-                labels,
-                color=report_limit_line,
-            )
+        if co_high_oper is not None:
+            _ensure_limit_visible(ax_chart, co_high_oper)
+            _append_limit_lines(ax_chart, "CO", co_high_oper, None, lines, labels, color=R["limit"])
+        if nox_high_oper is not None:
+            _ensure_limit_visible(ax_chart, nox_high_oper)
+            _append_limit_lines(ax_chart, "NOx", nox_high_oper, None, lines, labels, color=R["limit"])
 
         if lines:
-            ax_chart.legend(
-                lines,
-                labels,
-                loc="center left",
-                bbox_to_anchor=(1.02, 0.5),
-                fontsize=8,
-                frameon=False,
-                borderaxespad=0.0,
-            )
+            ax_chart.legend(lines, labels, loc="center left", bbox_to_anchor=(1.02, 0.5),
+                            fontsize=8, frameon=False, borderaxespad=0.0)
         else:
-            ax_chart.text(
-                0.5,
-                0.5,
-                "No rolling 12-hour data available for the selected window.",
-                ha="center",
-                va="center",
-                fontsize=11,
-                color=report_text_muted,
-                transform=ax_chart.transAxes,
-            )
+            ax_chart.text(0.5, 0.5, "No rolling 12-hour data available for the selected window.",
+                          ha="center", va="center", fontsize=11, color=R["muted"],
+                          transform=ax_chart.transAxes)
 
         ax_table = fig.add_subplot(gs[2, 0])
         ax_table.axis("off")
 
+        uptime_text = f"{uptime_pct:.1f}% ({valid_hours}/{op_hours} operating hrs)" if op_hours > 0 else "N/A"
         summary_rows = [
-            [
-                "CO Peak (LB/HR - ppm)",
-                (
-                    f"{_format_lb_hr_ppm(co_peak_lb_hr, co_peak_ppm)} @ {_format_report_dt(co_peak_time)}"
-                    if co_peak_lb_hr is not None
-                    else "N/A"
-                ),
-            ],
-            [
-                "NOx Peak (LB/HR - ppm)",
-                (
-                    f"{_format_lb_hr_ppm(nox_peak_lb_hr, nox_peak_ppm)} @ {_format_report_dt(nox_peak_time)}"
-                    if nox_peak_lb_hr is not None
-                    else "N/A"
-                ),
-            ],
-            ["O2 Peak (%)", f"{o2_peak:.2f} @ {_format_report_dt(o2_peak_time)}" if o2_peak is not None else "N/A"],
-            [
-                f"Average Flow Rate ({flow_label})",
-                f"{flow_avg:.2f}" if flow_avg is not None else "N/A",
-            ],
-            [
-                "CO Total Weight (lb)",
-                f"{co_weight:.2f}" if co_weight is not None else "N/A",
-            ],
-            [
-                "NOx Total Weight (lb)",
-                f"{nox_weight:.2f}" if nox_weight is not None else "N/A",
-            ],
+            ["CO Peak (LB/HR - ppm)",
+             f"{_format_lb_hr_ppm(co_peak_lb_hr, co_peak_ppm)} @ {_format_report_dt(co_peak_time)}"
+             if co_peak_lb_hr is not None else "N/A"],
+            ["NOx Peak (LB/HR - ppm)",
+             f"{_format_lb_hr_ppm(nox_peak_lb_hr, nox_peak_ppm)} @ {_format_report_dt(nox_peak_time)}"
+             if nox_peak_lb_hr is not None else "N/A"],
+            ["O2 Peak (%)",
+             f"{o2_peak:.2f} @ {_format_report_dt(o2_peak_time)}" if o2_peak is not None else "N/A"],
+            [f"Average Flow Rate ({flow_label})", f"{flow_avg:.2f}" if flow_avg is not None else "N/A"],
+            ["CO Total Weight (lb)", f"{co_weight:.2f}" if co_weight is not None else "N/A"],
+            ["NOx Total Weight (lb)", f"{nox_weight:.2f}" if nox_weight is not None else "N/A"],
             ["Total Hours Tracked", f"{total_hours}"],
             ["Running Hours", f"{running_hours}"],
             ["Not Running Hours", f"{not_running_hours}"],
+            ["CEMS Data Availability", uptime_text],
         ]
 
-        table = ax_table.table(
-            cellText=summary_rows,
-            colLabels=["Metric", "Value"],
-            cellLoc="left",
-            colLoc="left",
-            loc="center",
-        )
-        table.auto_set_font_size(False)
-        table.set_fontsize(9.5)
-        table.scale(1, 1.4)
-
-        for (row, col), cell in table.get_celld().items():
+        tbl = ax_table.table(cellText=summary_rows, colLabels=["Metric", "Value"],
+                             cellLoc="left", colLoc="left", loc="center")
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9.5)
+        tbl.scale(1, 1.35)
+        for (row, _col), cell in tbl.get_celld().items():
             if row == 0:
-                cell.set_text_props(weight="bold", color=report_text_primary)
-                cell.set_facecolor(report_table_header)
+                cell.set_text_props(weight="bold", color=R["text"])
+                cell.set_facecolor(R["header"])
             else:
-                cell.set_facecolor(report_table_alt)
-                cell.set_edgecolor(report_border)
+                cell.set_facecolor(R["alt_row"])
+                cell.set_edgecolor(R["border"])
 
         fig.tight_layout()
         pdf.savefig(fig)
         plt.close(fig)
 
+        # ---- Page 2: Hourly averages bar chart ----
+        _add_hourly_chart_page(pdf, hourly_range, co_tag, nox_tag, o2_tag,
+                               alias_map, thresholds, label, start, end)
+
     return report_path
+
+
+def _add_hourly_chart_page(
+    pdf: PdfPages,
+    hourly_range: pd.DataFrame,
+    co_tag: str,
+    nox_tag: str,
+    o2_tag: str,
+    alias_map: Dict[str, str],
+    thresholds: Dict[str, Dict[str, object]],
+    label: str,
+    start: datetime,
+    end: datetime,
+) -> None:
+    """Render a second PDF page showing hourly average bar charts for CO, NOx, and O2."""
+    R = _RPT
+
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.patch.set_facecolor(R["bg"])
+
+    # Title area
+    ax_title = fig.add_axes([0.05, 0.92, 0.9, 0.06])
+    ax_title.axis("off")
+    ax_title.text(0.0, 0.7, f"Hourly Averages - {label}", fontsize=16, fontweight="bold", color=R["text"])
+    ax_title.text(0.0, 0.0,
+                  f"{_format_report_dt(start)} to {_format_report_dt(end)}",
+                  fontsize=10, color=R["muted"])
+
+    plot_specs = []
+    if co_tag:
+        plot_specs.append(("CO", co_tag, "avg_lb_hr", "lb/hr", R["bar_co"]))
+    if nox_tag:
+        plot_specs.append(("NOx", nox_tag, "avg_lb_hr", "lb/hr", R["bar_nox"]))
+    if o2_tag:
+        plot_specs.append(("O2", o2_tag, "avg_value", "%", R["bar_o2"]))
+
+    n_plots = max(len(plot_specs), 1)
+    plot_height = 0.85 / n_plots
+    plot_gap = 0.03
+
+    for idx, (name, tag, value_col, unit, color) in enumerate(plot_specs):
+        bottom = 0.92 - (idx + 1) * (plot_height + plot_gap) + plot_gap
+        ax = fig.add_axes([0.08, bottom, 0.86, plot_height - plot_gap])
+        ax.set_facecolor(R["panel"])
+        ax.grid(True, axis="y", linestyle="--", color=R["grid"], alpha=0.5)
+
+        tag_data = hourly_range.loc[hourly_range["tag"] == tag].copy() if not hourly_range.empty else pd.DataFrame()
+
+        if tag_data.empty or value_col not in tag_data.columns:
+            ax.text(0.5, 0.5, f"No hourly data for {_display_name(tag, alias_map, name)}",
+                    ha="center", va="center", fontsize=10, color=R["muted"], transform=ax.transAxes)
+            ax.set_title(f"{name} ({_display_name(tag, alias_map, name)})",
+                         fontsize=11, color=R["text"], loc="left")
+            continue
+
+        tag_data = tag_data.sort_values("hour_start")
+        hours = tag_data["hour_start"]
+        values = pd.to_numeric(tag_data[value_col], errors="coerce").fillna(0)
+
+        ax.bar(hours, values, width=timedelta(hours=0.8), color=color, alpha=0.85, edgecolor="none")
+        ax.set_ylabel(unit, fontsize=9, color=R["text"])
+        ax.set_title(f"{name} Hourly Average ({_display_name(tag, alias_map, name)})",
+                     fontsize=11, color=R["text"], loc="left")
+        ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%m-%d %H:%M"))
+        ax.tick_params(axis="x", labelsize=7, rotation=30)
+        ax.tick_params(axis="y", labelsize=8)
+
+        # Add limit lines
+        entry = thresholds.get(tag, {}) if isinstance(thresholds.get(tag, {}), dict) else {}
+        high_oper = _to_float(entry.get("high_oper"))
+        high_limit = _to_float(entry.get("high_limit"))
+        if high_oper is not None:
+            ax.axhline(high_oper, color=R["limit"], linewidth=1, linestyle="--", label="Oper limit")
+            _ensure_limit_visible(ax, high_oper)
+        if high_limit is not None:
+            ax.axhline(high_limit, color=R["red"], linewidth=1.2, linestyle="-", label="Reg limit")
+            _ensure_limit_visible(ax, high_limit)
+        if high_oper is not None or high_limit is not None:
+            ax.legend(fontsize=7, loc="upper right", framealpha=0.8)
+
+    if not plot_specs:
+        ax = fig.add_axes([0.1, 0.2, 0.8, 0.6])
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No CEMS tags found for hourly chart.",
+                ha="center", va="center", fontsize=12, color=R["muted"])
+
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
+    """Generate a Daily Operations PDF report.
+
+    Page 1 -- 24-hour hourly-average bar charts (CO, NOx, O2) with limit lines
+    Page 2 -- Data availability summary, hourly data table, CEMS uptime stats
+    """
+    hourly_df = load_hourly_stats()
+    rolling_df = load_rolling_12hr_stats()
+    raw_df = load_latest_raw_df()
+    data_start = _get_report_data_start(rolling_df, hourly_df)
+    label, start, end = _get_report_range(range_key, data_start=data_start)
+    alias_map = build_alias_lookup(raw_df, hourly_df, rolling_df, load_alias_map_from_settings())
+    thresholds = load_thresholds()
+    epa_settings = load_epa_settings()
+
+    hourly_range = _filter_time_range(hourly_df, "hour_end", start, end)
+    rolling_range = _filter_time_range(rolling_df, "window_end", start, end)
+
+    co_pattern = [re.compile(r"\bco\b|co[_\s-]", re.IGNORECASE)]
+    nox_pattern = [re.compile(r"\bnox\b|no[_\s-]?x", re.IGNORECASE)]
+    o2_pattern = [re.compile(r"\bo2\b|o2[_\s-]", re.IGNORECASE)]
+
+    co_tag = (_find_tag_by_patterns(hourly_range, alias_map, co_pattern)
+              or _find_tag_by_patterns(rolling_range, alias_map, co_pattern))
+    nox_tag = (_find_tag_by_patterns(hourly_range, alias_map, nox_pattern)
+               or _find_tag_by_patterns(rolling_range, alias_map, nox_pattern))
+    o2_tag = (_find_tag_by_patterns(hourly_range, alias_map, o2_pattern)
+              or _find_tag_by_patterns(rolling_range, alias_map, o2_pattern))
+
+    tags = sorted(set(hourly_range.get("tag", pd.Series(dtype=str)).dropna().astype(str)))
+    flow_tag = str(epa_settings.get("epa_flow_tag", "") or "")
+    if not flow_tag:
+        flow_tag = find_flow_tag(tags, thresholds, alias_map)
+
+    machine_state_tag = load_machine_state_tag_from_settings()
+    cems_tags = [t for t in [co_tag, nox_tag, o2_tag] if t]
+    uptime = compute_cems_uptime(hourly_df, machine_state_tag, cems_tags, start, end)
+
+    R = _RPT
+    ensure_dir(EXPORT_TMP_DIR)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"cip_daily_ops_{range_key}_{timestamp}.pdf"
+    report_path = os.path.join(EXPORT_TMP_DIR, filename)
+
+    with PdfPages(report_path) as pdf:
+        # ---- Page 1: Hourly bar charts ----
+        _add_hourly_chart_page(pdf, hourly_range, co_tag, nox_tag, o2_tag,
+                               alias_map, thresholds, label, start, end)
+
+        # ---- Page 2: Operational summary + data table ----
+        fig = plt.figure(figsize=(11, 8.5))
+        fig.patch.set_facecolor(R["bg"])
+
+        # Title
+        ax_hdr = fig.add_axes([0.05, 0.92, 0.9, 0.06])
+        ax_hdr.axis("off")
+        ax_hdr.text(0.0, 0.7, f"Operational Summary - {label}",
+                    fontsize=16, fontweight="bold", color=R["text"])
+        ax_hdr.text(0.0, 0.0,
+                    f"{_format_report_dt(start)} to {_format_report_dt(end)}",
+                    fontsize=10, color=R["muted"])
+
+        # --- Left: CEMS uptime + operations stats ---
+        ax_stats = fig.add_axes([0.05, 0.42, 0.42, 0.48])
+        ax_stats.axis("off")
+
+        op_hrs = int(uptime.get("operating_hours", 0))
+        valid_hrs = int(uptime.get("valid_cems_hours", 0))
+        missing_hrs = int(uptime.get("missing_hours", 0))
+        uptime_pct = float(uptime.get("uptime_pct", 0))
+        total_cal = int(uptime.get("total_hours", 0))
+        flow_avg = _compute_avg_flow(hourly_range, flow_tag)
+        processing_hour_starts = _processing_hour_starts(hourly_range, machine_state_tag)
+        co_weight = _compute_total_weight(hourly_range, co_tag, processing_hour_starts)
+        nox_weight = _compute_total_weight(hourly_range, nox_tag, processing_hour_starts)
+
+        co_peak_lb, _, co_peak_t = _compute_peak_pair(
+            hourly_range, co_tag, "avg_lb_hr", "avg_value", "hour_end")
+        nox_peak_lb, _, nox_peak_t = _compute_peak_pair(
+            hourly_range, nox_tag, "avg_lb_hr", "avg_value", "hour_end")
+        o2_peak, o2_peak_t = _compute_peak(hourly_range, o2_tag, "avg_value", "hour_end")
+
+        flow_label = _display_name(flow_tag, alias_map, "Flow")
+
+        stats_rows = [
+            ["CEMS Availability", f"{uptime_pct:.1f}%" if op_hrs > 0 else "N/A"],
+            ["Operating Hours", f"{op_hrs}"],
+            ["Valid CEMS Hours", f"{valid_hrs}"],
+            ["Missing CEMS Hours", f"{missing_hrs}"],
+            ["Calendar Hours", f"{total_cal}"],
+            ["", ""],
+            [f"Avg Flow ({flow_label})", f"{flow_avg:.1f}" if flow_avg is not None else "N/A"],
+            ["CO Peak (lb/hr)",
+             f"{co_peak_lb:.2f} @ {_format_report_dt(co_peak_t)}" if co_peak_lb is not None else "N/A"],
+            ["NOx Peak (lb/hr)",
+             f"{nox_peak_lb:.2f} @ {_format_report_dt(nox_peak_t)}" if nox_peak_lb is not None else "N/A"],
+            ["O2 Peak (%)",
+             f"{o2_peak:.2f} @ {_format_report_dt(o2_peak_t)}" if o2_peak is not None else "N/A"],
+            ["CO Total Weight (lb)", f"{co_weight:.2f}" if co_weight is not None else "N/A"],
+            ["NOx Total Weight (lb)", f"{nox_weight:.2f}" if nox_weight is not None else "N/A"],
+        ]
+
+        tbl = ax_stats.table(cellText=stats_rows, colLabels=["Metric", "Value"],
+                             cellLoc="left", colLoc="left", loc="upper left")
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9)
+        tbl.scale(1, 1.3)
+        for (row, _c), cell in tbl.get_celld().items():
+            if row == 0:
+                cell.set_text_props(weight="bold", color=R["text"])
+                cell.set_facecolor(R["header"])
+            else:
+                cell.set_facecolor(R["alt_row"])
+                cell.set_edgecolor(R["border"])
+
+        # --- Right: Hourly data table (last 24 rows) ---
+        ax_data = fig.add_axes([0.52, 0.42, 0.46, 0.48])
+        ax_data.axis("off")
+        ax_data.set_title("Hourly Averages (most recent)", fontsize=11,
+                          color=R["text"], loc="left", pad=8)
+
+        # Build a pivot of the last hours
+        data_rows: List[List[str]] = []
+        data_cols = ["Hour", "CO (lb/hr)", "NOx (lb/hr)", "O2 (%)"]
+        if not hourly_range.empty:
+            hr_sorted = hourly_range.sort_values("hour_start")
+            unique_hours = sorted(hr_sorted["hour_start"].dropna().unique())[-24:]
+            for h in unique_hours:
+                hour_data = hr_sorted.loc[hr_sorted["hour_start"] == h]
+                try:
+                    h_label = pd.Timestamp(h).strftime("%m-%d %H:%M")
+                except Exception:
+                    h_label = str(h)
+                co_val = ""
+                nox_val = ""
+                o2_val = ""
+                if co_tag:
+                    co_row = hour_data.loc[hour_data["tag"] == co_tag]
+                    if not co_row.empty:
+                        v = pd.to_numeric(co_row.iloc[0].get("avg_lb_hr"), errors="coerce")
+                        co_val = f"{v:.2f}" if pd.notna(v) else ""
+                if nox_tag:
+                    nox_row = hour_data.loc[hour_data["tag"] == nox_tag]
+                    if not nox_row.empty:
+                        v = pd.to_numeric(nox_row.iloc[0].get("avg_lb_hr"), errors="coerce")
+                        nox_val = f"{v:.2f}" if pd.notna(v) else ""
+                if o2_tag:
+                    o2_row = hour_data.loc[hour_data["tag"] == o2_tag]
+                    if not o2_row.empty:
+                        v = pd.to_numeric(o2_row.iloc[0].get("avg_value"), errors="coerce")
+                        o2_val = f"{v:.2f}" if pd.notna(v) else ""
+                data_rows.append([h_label, co_val, nox_val, o2_val])
+
+        if data_rows:
+            dtbl = ax_data.table(cellText=data_rows, colLabels=data_cols,
+                                 cellLoc="center", colLoc="center", loc="upper left")
+            dtbl.auto_set_font_size(False)
+            dtbl.set_fontsize(7.5)
+            dtbl.scale(1, 1.1)
+            for (row, _c), cell in dtbl.get_celld().items():
+                if row == 0:
+                    cell.set_text_props(weight="bold", color=R["text"])
+                    cell.set_facecolor(R["header"])
+                else:
+                    cell.set_facecolor(R["alt_row"] if row % 2 == 0 else R["panel"])
+                    cell.set_edgecolor(R["border"])
+        else:
+            ax_data.text(0.5, 0.5, "No hourly data available.",
+                         ha="center", va="center", fontsize=10, color=R["muted"],
+                         transform=ax_data.transAxes)
+
+        # --- Bottom: Compliance note ---
+        ax_footer = fig.add_axes([0.05, 0.02, 0.9, 0.08])
+        ax_footer.axis("off")
+        ax_footer.text(
+            0.0, 0.8,
+            "CEMS Data Availability = hours with valid CEMS data / total operating hours. "
+            "Regulatory requirement is typically 90% or greater.",
+            fontsize=8.5, color=R["subtle"], style="italic",
+        )
+        ax_footer.text(
+            0.0, 0.2,
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            fontsize=8, color=R["subtle"],
+        )
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    return report_path
+
+
+def build_daily_ops_payload(range_key: str):
+    _write_export_lock()
+    try:
+        report_path = generate_daily_ops_pdf(range_key)
+    finally:
+        _clear_export_lock()
+    if not report_path or not os.path.exists(report_path):
+        return None
+    filename = os.path.basename(report_path)
+    return dcc.send_file(report_path, filename=filename)
 
 
 def generate_incident_report_pdf(range_key: str) -> Optional[str]:
@@ -1169,13 +1398,22 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
         raw_df, load_thresholds(), load_exceedances()
     )
 
-    report_text_primary = "#1b1f2a"
-    report_text_muted = "#3b4a5f"
-    report_text_subtle = "#5a6b82"
-    report_bg = "#f4f7fb"
-    report_table_header = "#dbe9f6"
-    report_table_alt = "#f1f6fc"
-    report_border = "#b7c7dd"
+    # CEMS uptime for the reporting period
+    machine_state_tag = load_machine_state_tag_from_settings()
+    alias_map = build_alias_lookup(raw_df, hourly_df, rolling_df, load_alias_map_from_settings())
+    thresholds = load_thresholds()
+    tags = sorted(set(hourly_df.get("tag", pd.Series(dtype=str)).dropna().astype(str)))
+    cems_tags = []
+    for metric in ("o2", "nox", "co"):
+        t = find_cems_tag(metric, tags, thresholds, alias_map)
+        if t:
+            cems_tags.append(t)
+    uptime = compute_cems_uptime(hourly_df, machine_state_tag, cems_tags, start, end)
+    uptime_pct = float(uptime.get("uptime_pct", 0))
+    op_hrs = int(uptime.get("operating_hours", 0))
+    valid_hrs = int(uptime.get("valid_cems_hours", 0))
+
+    R = _RPT
 
     ensure_dir(EXPORT_TMP_DIR)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1184,38 +1422,25 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
 
     with PdfPages(report_path) as pdf:
         fig = plt.figure(figsize=(11, 8.5))
-        fig.patch.set_facecolor(report_bg)
+        fig.patch.set_facecolor(R["bg"])
         gs = fig.add_gridspec(3, 1, height_ratios=[0.2, 0.4, 0.4])
 
         ax_title = fig.add_subplot(gs[0, 0])
         ax_title.axis("off")
-        title_text = f"CIP Exceedances & System Failures - {label}"
-        subtitle = f"Reporting Window: {_format_report_dt(start)} to {_format_report_dt(end)}"
-        ax_title.text(
-            0.0,
-            0.75,
-            title_text,
-            fontsize=17,
-            fontweight="bold",
-            color=report_text_primary,
-        )
-        ax_title.text(
-            0.0,
-            0.4,
-            subtitle,
-            fontsize=11,
-            color=report_text_muted,
-        )
-        ax_title.text(
-            0.0,
-            0.1,
-            "Exceedances reflect regulatory limit violations; system failures summarize health and data events.",
-            fontsize=9.5,
-            color=report_text_subtle,
-        )
+        ax_title.text(0.0, 0.75, f"CIP Exceedances & System Failures - {label}",
+                      fontsize=17, fontweight="bold", color=R["text"])
+        ax_title.text(0.0, 0.4,
+                      f"Reporting Window: {_format_report_dt(start)} to {_format_report_dt(end)}",
+                      fontsize=11, color=R["muted"])
+        ax_title.text(0.0, 0.1,
+                      "Exceedances reflect regulatory limit violations; "
+                      "system failures summarize health and data events.",
+                      fontsize=9.5, color=R["subtle"])
 
         ax_summary = fig.add_subplot(gs[1, 0])
         ax_summary.axis("off")
+
+        uptime_text = f"{uptime_pct:.1f}% ({valid_hrs}/{op_hrs} operating hrs)" if op_hrs > 0 else "N/A"
         summary_rows = [
             ["Exceedance events", str(exceed_count)],
             ["Exceedance duration", f"{exceed_minutes:.1f} min"],
@@ -1223,26 +1448,24 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
             ["Failure duration", f"{failure_minutes:.1f} min"],
             ["Within limits (last 24h)", f"{threshold_summary.get('pct_24h', 0.0):.1f}%"],
             ["Within limits (last 30d)", f"{threshold_summary.get('pct_30d', 0.0):.1f}%"],
+            ["CEMS Data Availability", uptime_text],
             ["System health status", str(system_health.get("status", "Unknown"))],
             ["System health detail", str(system_health.get("status_reason", ""))],
         ]
         summary_table = ax_summary.table(
-            cellText=summary_rows,
-            colLabels=["Metric", "Value"],
-            cellLoc="left",
-            colLoc="left",
-            loc="center",
+            cellText=summary_rows, colLabels=["Metric", "Value"],
+            cellLoc="left", colLoc="left", loc="center",
         )
         summary_table.auto_set_font_size(False)
         summary_table.set_fontsize(10)
-        summary_table.scale(1, 1.3)
-        for (row, col), cell in summary_table.get_celld().items():
+        summary_table.scale(1, 1.25)
+        for (row, _c), cell in summary_table.get_celld().items():
             if row == 0:
-                cell.set_text_props(weight="bold", color=report_text_primary)
-                cell.set_facecolor(report_table_header)
+                cell.set_text_props(weight="bold", color=R["text"])
+                cell.set_facecolor(R["header"])
             else:
-                cell.set_facecolor(report_table_alt)
-                cell.set_edgecolor(report_border)
+                cell.set_facecolor(R["alt_row"])
+                cell.set_edgecolor(R["border"])
 
         ax_tables = fig.add_subplot(gs[2, 0])
         ax_tables.axis("off")
@@ -1252,14 +1475,12 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
                 return [["No exceedance events in this window.", "", "", ""]]
             rows: List[List[str]] = []
             for _, row in df.sort_values("start_time", ascending=False).head(8).iterrows():
-                rows.append(
-                    [
-                        str(row.get("tag", "")),
-                        _format_report_dt(pd.to_datetime(row.get("start_time"), errors="coerce")),
-                        _format_report_dt(pd.to_datetime(row.get("end_time"), errors="coerce")),
-                        _format_duration(row.get("duration_sec")),
-                    ]
-                )
+                rows.append([
+                    str(row.get("tag", "")),
+                    _format_report_dt(pd.to_datetime(row.get("start_time"), errors="coerce")),
+                    _format_report_dt(pd.to_datetime(row.get("end_time"), errors="coerce")),
+                    _format_duration(row.get("duration_sec")),
+                ])
             return rows
 
         def _prepare_failure_rows(df: pd.DataFrame) -> List[List[str]]:
@@ -1267,14 +1488,12 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
                 return [["No system failure events in this window.", "", "", ""]]
             rows: List[List[str]] = []
             for _, row in df.sort_values("timestamp", ascending=False).head(8).iterrows():
-                rows.append(
-                    [
-                        str(row.get("event_type", "")),
-                        str(row.get("tag", "")),
-                        _format_report_dt(pd.to_datetime(row.get("timestamp"), errors="coerce")),
-                        _format_duration(row.get("duration_sec")),
-                    ]
-                )
+                rows.append([
+                    str(row.get("event_type", "")),
+                    str(row.get("tag", "")),
+                    _format_report_dt(pd.to_datetime(row.get("timestamp"), errors="coerce")),
+                    _format_duration(row.get("duration_sec")),
+                ])
             return rows
 
         exceed_rows = _prepare_exceed_rows(exceed_range)
@@ -1282,13 +1501,10 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
 
         table_ax = ax_tables.inset_axes([0.0, 0.05, 0.48, 0.9])
         table_ax.axis("off")
-        table_ax.set_title("Recent Exceedances", fontsize=11, color=report_text_primary, pad=6)
+        table_ax.set_title("Recent Exceedances", fontsize=11, color=R["text"], pad=6)
         exceed_table = table_ax.table(
-            cellText=exceed_rows,
-            colLabels=["Tag", "Start", "End", "Duration"],
-            cellLoc="left",
-            colLoc="left",
-            loc="center",
+            cellText=exceed_rows, colLabels=["Tag", "Start", "End", "Duration"],
+            cellLoc="left", colLoc="left", loc="center",
         )
         exceed_table.auto_set_font_size(False)
         exceed_table.set_fontsize(9)
@@ -1296,31 +1512,23 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
 
         failure_ax = ax_tables.inset_axes([0.52, 0.05, 0.48, 0.9])
         failure_ax.axis("off")
-        failure_ax.set_title(
-            "System Failures / Errors",
-            fontsize=11,
-            color=report_text_primary,
-            pad=6,
-        )
+        failure_ax.set_title("System Failures / Errors", fontsize=11, color=R["text"], pad=6)
         failure_table = failure_ax.table(
-            cellText=failure_rows,
-            colLabels=["Type", "Tag", "Timestamp", "Duration"],
-            cellLoc="left",
-            colLoc="left",
-            loc="center",
+            cellText=failure_rows, colLabels=["Type", "Tag", "Timestamp", "Duration"],
+            cellLoc="left", colLoc="left", loc="center",
         )
         failure_table.auto_set_font_size(False)
         failure_table.set_fontsize(9)
         failure_table.scale(1, 1.2)
 
-        for table in (exceed_table, failure_table):
-            for (row, col), cell in table.get_celld().items():
+        for tbl in (exceed_table, failure_table):
+            for (row, _c), cell in tbl.get_celld().items():
                 if row == 0:
-                    cell.set_text_props(weight="bold", color=report_text_primary)
-                    cell.set_facecolor(report_table_header)
+                    cell.set_text_props(weight="bold", color=R["text"])
+                    cell.set_facecolor(R["header"])
                 else:
-                    cell.set_facecolor(report_table_alt)
-                    cell.set_edgecolor(report_border)
+                    cell.set_facecolor(R["alt_row"])
+                    cell.set_edgecolor(R["border"])
 
         fig.tight_layout()
         pdf.savefig(fig)
@@ -2452,14 +2660,6 @@ def _epa_o2_values(raw_o2: Optional[float], units: str) -> Tuple[Optional[float]
     return o2_pct, o2_ppmv
 
 
-def _correct_ppmv_for_o2(ppmv: float, o2_pct: float, ref_o2_pct: float) -> Optional[float]:
-    if not (0.0 <= o2_pct < EPA19_STD_O2_PCT):
-        return None
-    if not (0.0 <= ref_o2_pct < EPA19_STD_O2_PCT):
-        return None
-    return ppmv * (EPA19_STD_O2_PCT - ref_o2_pct) / (EPA19_STD_O2_PCT - o2_pct)
-
-
 def compute_rolling_lbhr_from_epa(
     tag: str,
     rolling_12hr_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
@@ -2471,7 +2671,6 @@ def compute_rolling_lbhr_from_epa(
     flow_tag = str(epa_settings.get("epa_flow_tag", "") or "")
     o2_tag = str(epa_settings.get("epa_o2_tag", "") or "")
     o2_units = str(epa_settings.get("epa_o2_units", "percent") or "percent")
-    ref_o2_pct = float(epa_settings.get("epa_ref_o2_pct", 3.0) or 3.0)
 
     pollutant_map = {
         str(epa_settings.get("epa_nox_tag", "") or ""): "NOx",
@@ -2495,17 +2694,12 @@ def compute_rolling_lbhr_from_epa(
 
     o2_entry = rolling_12hr_stats.get(o2_tag)
     o2_avg = o2_entry[0] if o2_entry else None
-    o2_pct, o2_ppmv = _epa_o2_values(o2_avg, o2_units)
+    _, o2_ppmv = _epa_o2_values(o2_avg, o2_units)
 
     if pollutant == "O2":
         ppmv = o2_ppmv
     else:
-        if o2_pct is None:
-            return None
-        corrected = _correct_ppmv_for_o2(tag_avg, o2_pct, ref_o2_pct)
-        if corrected is None:
-            return None
-        ppmv = corrected
+        ppmv = tag_avg
 
     if ppmv is None:
         return None
@@ -2558,11 +2752,15 @@ def compute_gauge_range(
     low: Optional[float],
     high: Optional[float],
     sample_values: List[float],
+    regulatory_high: Optional[float] = None,
+    regulatory_low: Optional[float] = None,
 ) -> Tuple[float, float, float, float]:
     """
     Compute (low, high, gauge_min, gauge_max) for a tag.
     - If thresholds exist, use them (and swap if low/high reversed).
     - Otherwise derive a reasonable range from sample values or fall back to [0, 1].
+    - If regulatory limits are provided, the gauge range is extended so the
+      permit limit is always visible on the scale (with a small buffer beyond).
     Gauge min/max are rounded to 2 decimals to avoid messy tick labels.
     """
     values = [v for v in sample_values if v == v]
@@ -2575,25 +2773,29 @@ def compute_gauge_range(
         span = max(1.0, abs(high - low) * 1.5)
         gmin = round(center - span / 2.0, 2)
         gmax = round(center + span / 2.0, 2)
-        return low, high, gmin, gmax
-
-    # No thresholds: derive from data if possible
-    if values:
+    elif values:
+        # No thresholds: derive from data
         vmin = min(values)
         vmax = max(values)
         if vmin == vmax:
             vmin -= 0.5
             vmax += 0.5
+        low, high = vmin, vmax
+        center = (vmin + vmax) / 2.0
+        span = max(1.0, (vmax - vmin) * 1.5)
+        gmin = round(center - span / 2.0, 2)
+        gmax = round(center + span / 2.0, 2)
     else:
-        vmin = 0.0
-        vmax = 1.0
+        low, high = 0.0, 1.0
+        gmin, gmax = 0.0, 1.0
 
-    center = (vmin + vmax) / 2.0
-    span = max(1.0, (vmax - vmin) * 1.5)
-    gmin = round(center - span / 2.0, 2)
-    gmax = round(center + span / 2.0, 2)
+    # Extend gauge range to always show regulatory limits with 10% buffer
+    if regulatory_high is not None and regulatory_high > gmax:
+        gmax = round(regulatory_high * 1.1, 2)
+    if regulatory_low is not None and regulatory_low < gmin:
+        gmin = round(regulatory_low * 0.9, 2) if regulatory_low > 0 else round(regulatory_low - abs(regulatory_low) * 0.1, 2)
 
-    return vmin, vmax, gmin, gmax
+    return low, high, gmin, gmax
 
 
 # ============================================================================
@@ -3061,7 +3263,9 @@ def build_cems_card(
     low_for_range = low_oper if low_oper is not None else low_limit
     high_for_range = high_oper if high_oper is not None else high_limit
     low_eff, high_eff, gmin, gmax = compute_gauge_range(
-        low_for_range, high_for_range, [value, rolling_avg]
+        low_for_range, high_for_range, [value, rolling_avg],
+        regulatory_high=_to_float(high_limit),
+        regulatory_low=_to_float(low_limit),
     )
     low_for_class = low_oper if low_oper is not None else low_eff
     high_for_class = high_oper if high_oper is not None else high_eff
@@ -3088,6 +3292,7 @@ def build_cems_card(
     else:
         rolling_text = "Rolling 12h: no data"
 
+    # Show permit limit in subtitle when set
     header = alias or label
     subtitle_bits = []
     if tag:
@@ -3095,6 +3300,8 @@ def build_cems_card(
     else:
         subtitle_bits.append("No matching tag found yet")
     subtitle_bits.append(f"Units: {units_label}")
+    if high_limit is not None:
+        subtitle_bits.append(f"Permit: {high_limit} {units_label}")
     subtitle = " • ".join(subtitle_bits)
 
     card_style = {
@@ -3117,7 +3324,7 @@ def build_cems_card(
                         value=value if value == value else gmin,
                         showCurrentValue=True,
                         color=color,
-                        label=f"Current hourly avg: {value_label}",
+                        label=f"Current {units_label.upper()}: {value_label}",
                         size=220,
                         units=units_label,
                     ),
@@ -3157,7 +3364,9 @@ def build_flow_card(
     low_for_range = low_oper if low_oper is not None else low_limit
     high_for_range = high_oper if high_oper is not None else high_limit
     low_eff, high_eff, gmin, gmax = compute_gauge_range(
-        low_for_range, high_for_range, [value, rolling_avg]
+        low_for_range, high_for_range, [value, rolling_avg],
+        regulatory_high=_to_float(high_limit),
+        regulatory_low=_to_float(low_limit),
     )
     low_for_class = low_oper if low_oper is not None else low_eff
     high_for_class = high_oper if high_oper is not None else high_eff
@@ -4033,6 +4242,11 @@ app.layout = html.Div(
         dcc.Download(id="incident-report-month-download"),
         dcc.Download(id="incident-report-prev-month-download"),
         dcc.Download(id="incident-report-all-time-download"),
+        dcc.Download(id="daily-ops-today-download"),
+        dcc.Download(id="daily-ops-week-download"),
+        dcc.Download(id="daily-ops-month-download"),
+        dcc.Download(id="daily-ops-prev-month-download"),
+        dcc.Download(id="daily-ops-all-time-download"),
 
         # Tabs: Overview (gauges) & Thresholds (editor)
         dcc.Tabs(
@@ -4431,6 +4645,65 @@ app.layout = html.Div(
                                         ),
                                     ],
                                 ),
+                                html.Div(
+                                    style=CARD_STYLE,
+                                    children=[
+                                        html.Div(
+                                            "Daily Operations Report (PDF)",
+                                            style=EXPORT_SECTION_TITLE_STYLE,
+                                        ),
+                                        html.Div(
+                                            "Hourly average charts, CEMS data availability, "
+                                            "and operational summary with peak values and weight totals.",
+                                            style=EXPORT_SECTION_HELP_STYLE,
+                                        ),
+                                        html.Div(
+                                            style=EXPORT_BUTTON_ROW_STYLE,
+                                            children=[
+                                                html.Button(
+                                                    "Today",
+                                                    id="daily-ops-today-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "This Week",
+                                                    id="daily-ops-week-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "This Month",
+                                                    id="daily-ops-month-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "Previous Month",
+                                                    id="daily-ops-prev-month-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "All Time",
+                                                    id="daily-ops-all-time-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                            ],
+                                        ),
+                                        dcc.Loading(
+                                            children=html.Div(
+                                                id="export-daily-ops-status",
+                                                style={
+                                                    "marginTop": "8px",
+                                                    "fontSize": "11px",
+                                                    "color": COLOR_TEXT_MUTED,
+                                                },
+                                            ),
+                                        ),
+                                    ],
+                                ),
                             ],
                         ),
                     ],
@@ -4714,6 +4987,42 @@ def export_incident_reports(
 
 
 @app.callback(
+    Output("daily-ops-today-download", "data"),
+    Output("daily-ops-week-download", "data"),
+    Output("daily-ops-month-download", "data"),
+    Output("daily-ops-prev-month-download", "data"),
+    Output("daily-ops-all-time-download", "data"),
+    Output("export-daily-ops-status", "children"),
+    Input("daily-ops-today-btn", "n_clicks"),
+    Input("daily-ops-week-btn", "n_clicks"),
+    Input("daily-ops-month-btn", "n_clicks"),
+    Input("daily-ops-prev-month-btn", "n_clicks"),
+    Input("daily-ops-all-time-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_daily_ops_reports(
+    _today_clicks, _week_clicks, _month_clicks, _prev_month_clicks, _all_time_clicks
+):
+    trigger = ctx.triggered_id
+    range_map = {
+        "daily-ops-today-btn": ("today", 0),
+        "daily-ops-week-btn": ("week", 1),
+        "daily-ops-month-btn": ("month", 2),
+        "daily-ops-prev-month-btn": ("prev_month", 3),
+        "daily-ops-all-time-btn": ("all_time", 4),
+    }
+    entry = range_map.get(trigger)
+    if not entry:
+        return no_update, no_update, no_update, no_update, no_update, no_update
+    range_key, idx = entry
+    result = [no_update] * 5
+    result[idx] = build_daily_ops_payload(range_key)
+    label = range_key.replace("_", " ").title()
+    result.append(f"{label} daily operations report requested. Generating your PDF now.")
+    return tuple(result)
+
+
+@app.callback(
     Output("threshold-low-input", "value"),
     Output("threshold-high-input", "value"),
     Output("threshold-alias-input", "value"),
@@ -4922,32 +5231,6 @@ def update_dashboard(n):
                 build_feed_status_card(feed_status, processing_is_running)
             )
 
-        # CEMS Data Availability / Uptime card
-        if machine_state_tag:
-            now = datetime.now()
-            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            # Quarter start: Jan/Apr/Jul/Oct
-            quarter_month = ((now.month - 1) // 3) * 3 + 1
-            quarter_start = now.replace(
-                month=quarter_month, day=1, hour=0, minute=0, second=0, microsecond=0
-            )
-
-            # Collect CEMS tag names for availability check
-            cems_tag_list = []
-            for metric in ("o2", "nox", "co"):
-                t = find_cems_tag(metric, tags, thresholds, alias_map)
-                if t:
-                    cems_tag_list.append(t)
-
-            month_uptime = compute_cems_uptime(
-                hourly_df, machine_state_tag, cems_tag_list, month_start, now,
-            )
-            quarter_uptime = compute_cems_uptime(
-                hourly_df, machine_state_tag, cems_tag_list, quarter_start, now,
-            )
-            cards.append(
-                build_cems_uptime_card(month_uptime, quarter_uptime)
-            )
 
         for metric, label in cems_map.items():
             ppm_tag = find_cems_tag(metric, tags, thresholds, alias_map)

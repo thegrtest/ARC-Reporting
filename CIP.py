@@ -2648,18 +2648,6 @@ class MainWindow(QMainWindow):
             o2_ppmv = raw_o2 * 10000.0
         return o2_pct, o2_ppmv
 
-    def _correct_ppmv_for_o2(self, ppmv: float, o2_pct: float) -> Optional[float]:
-        if ppmv is None:
-            return None
-        if o2_pct is None:
-            return None
-        ref = float(self.epa_ref_o2_pct)
-        if not (0.0 <= o2_pct < self.EPA19_STD_O2_PCT):
-            return None
-        if not (0.0 <= ref < self.EPA19_STD_O2_PCT):
-            return None
-        return ppmv * (self.EPA19_STD_O2_PCT - ref) / (self.EPA19_STD_O2_PCT - o2_pct)
-
     def _ppmv_to_lb_hr(self, ppmv: float, flow_scfm: float, molecular_weight: float) -> float:
         return (
             ppmv
@@ -2686,7 +2674,7 @@ class MainWindow(QMainWindow):
             return None
 
         o2_avg = avg_lookup.get(o2_tag)
-        o2_pct, o2_ppmv = self._epa_o2_values(o2_avg)
+        _, o2_ppmv = self._epa_o2_values(o2_avg)
 
         nox_tag = self._resolve_tag_from_alias(self.epa_nox_tag)
         co_tag = self._resolve_tag_from_alias(self.epa_co_tag)
@@ -2697,20 +2685,10 @@ class MainWindow(QMainWindow):
             pollutant = "O2"
         elif tag == nox_tag:
             pollutant = "NOx"
-            if o2_pct is None:
-                return None
-            corrected = self._correct_ppmv_for_o2(tag_avg, o2_pct)
-            if corrected is None:
-                return None
-            ppmv = corrected
+            ppmv = tag_avg
         elif tag == co_tag:
             pollutant = "CO"
-            if o2_pct is None:
-                return None
-            corrected = self._correct_ppmv_for_o2(tag_avg, o2_pct)
-            if corrected is None:
-                return None
-            ppmv = corrected
+            ppmv = tag_avg
         else:
             return None
 

@@ -148,14 +148,6 @@ ROLLING_AVG_HEADERS = [
 
 REFRESH_MS = 5000  # dashboard refresh interval (ms)
 
-EPA19_STD_O2_PCT = 20.9
-EPA19_MOLAR_VOLUME_SCF = 385.8
-EPA19_MOLECULAR_WEIGHTS = {
-    "NOx": 46.0,  # as NO2
-    "CO": 28.01,
-    "O2": 32.0,
-}
-
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
@@ -2641,74 +2633,6 @@ def load_epa_settings() -> Dict[str, object]:
             str(data.get("epa_co_tag", "") or ""), alias_map
         ),
     }
-
-
-# ============================================================================
-#  EPA METHOD 19 CALCULATIONS -- O2 correction, ppmv-to-lb/hr
-# ============================================================================
-
-
-def _epa_o2_values(raw_o2: Optional[float], units: str) -> Tuple[Optional[float], Optional[float]]:
-    if raw_o2 is None:
-        return None, None
-    if units == "ppmv":
-        o2_ppmv = raw_o2
-        o2_pct = raw_o2 / 10000.0
-    else:
-        o2_pct = raw_o2
-        o2_ppmv = raw_o2 * 10000.0
-    return o2_pct, o2_ppmv
-
-
-def compute_rolling_lbhr_from_epa(
-    tag: str,
-    rolling_12hr_stats: Dict[str, Tuple[float, float, datetime, datetime, int]],
-    epa_settings: Dict[str, object],
-) -> Optional[float]:
-    if not epa_settings or not epa_settings.get("epa_enabled"):
-        return None
-
-    flow_tag = str(epa_settings.get("epa_flow_tag", "") or "")
-    o2_tag = str(epa_settings.get("epa_o2_tag", "") or "")
-    o2_units = str(epa_settings.get("epa_o2_units", "percent") or "percent")
-
-    pollutant_map = {
-        str(epa_settings.get("epa_nox_tag", "") or ""): "NOx",
-        str(epa_settings.get("epa_co_tag", "") or ""): "CO",
-        str(epa_settings.get("epa_o2_tag", "") or ""): "O2",
-    }
-
-    pollutant = pollutant_map.get(tag)
-    if not pollutant:
-        return None
-
-    flow_entry = rolling_12hr_stats.get(flow_tag)
-    tag_entry = rolling_12hr_stats.get(tag)
-    if not flow_entry or not tag_entry:
-        return None
-
-    flow_avg = flow_entry[0]
-    tag_avg = tag_entry[0]
-    if flow_avg != flow_avg or tag_avg != tag_avg:
-        return None
-
-    o2_entry = rolling_12hr_stats.get(o2_tag)
-    o2_avg = o2_entry[0] if o2_entry else None
-    _, o2_ppmv = _epa_o2_values(o2_avg, o2_units)
-
-    if pollutant == "O2":
-        ppmv = o2_ppmv
-    else:
-        ppmv = tag_avg
-
-    if ppmv is None:
-        return None
-
-    mw = EPA19_MOLECULAR_WEIGHTS.get(pollutant)
-    if mw is None:
-        return None
-
-    return (ppmv * flow_avg * 60.0 * mw) / (1_000_000.0 * EPA19_MOLAR_VOLUME_SCF)
 
 
 # ============================================================================

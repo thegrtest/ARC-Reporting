@@ -66,7 +66,7 @@ try:
     import pandas as pd
 except ModuleNotFoundError as exc:
     raise SystemExit(
-        "pandas is required for CIPMonitor. Install via 'pip install pandas'."
+        "pandas is anrequired for CIPMonitor. Install via 'pip install pandas'."
     ) from exc
 
 try:
@@ -147,6 +147,14 @@ ROLLING_AVG_HEADERS = [
 ]
 
 REFRESH_MS = 5000  # dashboard refresh interval (ms)
+
+# Default regulatory permit limits (lb/hr) for CEMS pollutants.
+# These are used as fallbacks when no high_limit is set in thresholds.json.
+# They drive gauge scaling and the "Permit:" subtitle on lb/hr gauges.
+DEFAULT_PERMIT_LIMITS_LB_HR = {
+    "nox": 10.6,
+    "co": 1.6,
+}
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -665,77 +673,6 @@ def _display_name(tag: str, alias_map: Dict[str, str], fallback: str) -> str:
     return tag
 
 
-def _compute_peak(
-    df: pd.DataFrame, tag: str, value_col: str, time_col: str
-) -> Tuple[Optional[float], Optional[datetime]]:
-    if not tag or df is None or df.empty:
-        return None, None
-    subset = df.loc[df["tag"] == tag].dropna(subset=[value_col, time_col])
-    if subset.empty:
-        return None, None
-    try:
-        idx = subset[value_col].idxmax()
-    except Exception:
-        return None, None
-    row = subset.loc[idx]
-    return _to_float(row.get(value_col)), row.get(time_col)
-
-
-def _compute_peak_pair(
-    df: pd.DataFrame,
-    tag: str,
-    base_value_col: str,
-    paired_value_col: str,
-    time_col: str,
-) -> Tuple[Optional[float], Optional[float], Optional[datetime]]:
-    if not tag or df is None or df.empty:
-        return None, None, None
-    subset = df.loc[df["tag"] == tag].dropna(subset=[base_value_col, time_col])
-    if subset.empty:
-        return None, None, None
-    try:
-        idx = subset[base_value_col].idxmax()
-    except Exception:
-        return None, None, None
-    row = subset.loc[idx]
-    return (
-        _to_float(row.get(base_value_col)),
-        _to_float(row.get(paired_value_col)),
-        row.get(time_col),
-    )
-
-
-def _compute_running_hours(
-    hourly_df: pd.DataFrame,
-    tags: List[str],
-    start: datetime,
-    end: datetime,
-) -> Tuple[int, int, int]:
-    if hourly_df is None or hourly_df.empty or not tags:
-        return 0, 0, 0
-    hourly_range = _filter_time_range(hourly_df, "hour_end", start, end)
-    if hourly_range.empty:
-        return 0, 0, 0
-    hourly_range = hourly_range.loc[hourly_range["tag"].isin(tags)]
-    if hourly_range.empty:
-        return 0, 0, 0
-    total_hours = 0
-    running_hours = 0
-    for hour_end, group in hourly_range.groupby("hour_end"):
-        if pd.isna(hour_end):
-            continue
-        total_hours += 1
-        values = group.get("avg_lb_hr")
-        if values is None:
-            values = group.get("avg_value")
-        if values is None:
-            values = group["avg_value"] if "avg_value" in group else None
-        if values is not None and (pd.to_numeric(values, errors="coerce").fillna(0) > 0).any():
-            running_hours += 1
-    not_running = max(total_hours - running_hours, 0)
-    return total_hours, running_hours, not_running
-
-
 def _get_report_range(
     range_key: str,
     data_start: Optional[datetime] = None,
@@ -837,11 +774,6 @@ def _compute_total_weight(
     return float(values.sum())
 
 
-def _format_lb_hr_ppm(lb_hr: Optional[float], ppm: Optional[float]) -> str:
-    lb_hr_text = f"{lb_hr:.2f} LB/HR" if lb_hr is not None else "N/A LB/HR"
-    ppm_text = f"{ppm:.2f} ppm" if ppm is not None else "N/A ppm"
-    return f"{lb_hr_text} - {ppm_text}"
-
 # ============================================================================
 #  PDF REPORT GENERATION -- emissions, incident & daily operations reports
 # ============================================================================
@@ -915,18 +847,6 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
 
     co_high_oper = _to_float(co_entry.get("high_oper"))
     nox_high_oper = _to_float(nox_entry.get("high_oper"))
-
-    co_peak_lb_hr, co_peak_ppm, co_peak_time = _compute_peak_pair(
-        rolling_range, co_tag, "avg_lb_hr", "avg_value", "window_end"
-    )
-    nox_peak_lb_hr, nox_peak_ppm, nox_peak_time = _compute_peak_pair(
-        rolling_range, nox_tag, "avg_lb_hr", "avg_value", "window_end"
-    )
-    o2_peak, o2_peak_time = _compute_peak(rolling_range, o2_tag, "avg_value", "window_end")
-
-    total_hours, running_hours, not_running_hours = _compute_running_hours(
-        hourly_range, [tag for tag in [co_tag, nox_tag] if tag], start, end
-    )
 
     tags = sorted(set(hourly_range.get("tag", pd.Series(dtype=str)).dropna().astype(str)))
     flow_tag = str(epa_settings.get("epa_flow_tag", "") or "")
@@ -1021,21 +941,12 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
         ax_table.axis("off")
 
         uptime_text = f"{uptime_pct:.1f}% ({valid_hours}/{op_hours} operating hrs)" if op_hours > 0 else "N/A"
+        hours_processed = len(processing_hour_starts)
         summary_rows = [
-            ["CO Peak (LB/HR - ppm)",
-             f"{_format_lb_hr_ppm(co_peak_lb_hr, co_peak_ppm)} @ {_format_report_dt(co_peak_time)}"
-             if co_peak_lb_hr is not None else "N/A"],
-            ["NOx Peak (LB/HR - ppm)",
-             f"{_format_lb_hr_ppm(nox_peak_lb_hr, nox_peak_ppm)} @ {_format_report_dt(nox_peak_time)}"
-             if nox_peak_lb_hr is not None else "N/A"],
-            ["O2 Peak (%)",
-             f"{o2_peak:.2f} @ {_format_report_dt(o2_peak_time)}" if o2_peak is not None else "N/A"],
             [f"Average Flow Rate ({flow_label})", f"{flow_avg:.2f}" if flow_avg is not None else "N/A"],
             ["CO Total Weight (lb)", f"{co_weight:.2f}" if co_weight is not None else "N/A"],
             ["NOx Total Weight (lb)", f"{nox_weight:.2f}" if nox_weight is not None else "N/A"],
-            ["Total Hours Tracked", f"{total_hours}"],
-            ["Running Hours", f"{running_hours}"],
-            ["Not Running Hours", f"{not_running_hours}"],
+            ["Hours Processed", f"{hours_processed}"],
             ["CEMS Data Availability", uptime_text],
         ]
 
@@ -1221,34 +1132,21 @@ def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
         valid_hrs = int(uptime.get("valid_cems_hours", 0))
         missing_hrs = int(uptime.get("missing_hours", 0))
         uptime_pct = float(uptime.get("uptime_pct", 0))
-        total_cal = int(uptime.get("total_hours", 0))
         flow_avg = _compute_avg_flow(hourly_range, flow_tag)
         processing_hour_starts = _processing_hour_starts(hourly_range, machine_state_tag)
         co_weight = _compute_total_weight(hourly_range, co_tag, processing_hour_starts)
         nox_weight = _compute_total_weight(hourly_range, nox_tag, processing_hour_starts)
-
-        co_peak_lb, _, co_peak_t = _compute_peak_pair(
-            hourly_range, co_tag, "avg_lb_hr", "avg_value", "hour_end")
-        nox_peak_lb, _, nox_peak_t = _compute_peak_pair(
-            hourly_range, nox_tag, "avg_lb_hr", "avg_value", "hour_end")
-        o2_peak, o2_peak_t = _compute_peak(hourly_range, o2_tag, "avg_value", "hour_end")
+        hours_processed = len(processing_hour_starts)
 
         flow_label = _display_name(flow_tag, alias_map, "Flow")
 
         stats_rows = [
             ["CEMS Availability", f"{uptime_pct:.1f}%" if op_hrs > 0 else "N/A"],
-            ["Operating Hours", f"{op_hrs}"],
+            ["Hours Processed", f"{hours_processed}"],
             ["Valid CEMS Hours", f"{valid_hrs}"],
             ["Missing CEMS Hours", f"{missing_hrs}"],
-            ["Calendar Hours", f"{total_cal}"],
             ["", ""],
             [f"Avg Flow ({flow_label})", f"{flow_avg:.1f}" if flow_avg is not None else "N/A"],
-            ["CO Peak (lb/hr)",
-             f"{co_peak_lb:.2f} @ {_format_report_dt(co_peak_t)}" if co_peak_lb is not None else "N/A"],
-            ["NOx Peak (lb/hr)",
-             f"{nox_peak_lb:.2f} @ {_format_report_dt(nox_peak_t)}" if nox_peak_lb is not None else "N/A"],
-            ["O2 Peak (%)",
-             f"{o2_peak:.2f} @ {_format_report_dt(o2_peak_t)}" if o2_peak is not None else "N/A"],
             ["CO Total Weight (lb)", f"{co_weight:.2f}" if co_weight is not None else "N/A"],
             ["NOx Total Weight (lb)", f"{nox_weight:.2f}" if nox_weight is not None else "N/A"],
         ]
@@ -5180,6 +5078,16 @@ def update_dashboard(n):
 
             # CO/NOx lb/hr is taken from the same pollutant tag's calculated avg_lb_hr.
             if ppm_tag and _has_lbhr_data(ppm_tag):
+                # Inject default permit limit for lb/hr gauge when no
+                # high_limit is set in thresholds.json
+                lbhr_thresholds = dict(thresholds)
+                default_limit = DEFAULT_PERMIT_LIMITS_LB_HR.get(metric)
+                if default_limit is not None:
+                    existing = dict(lbhr_thresholds.get(ppm_tag, {}) or {})
+                    if existing.get("high_limit") is None:
+                        existing["high_limit"] = default_limit
+                        lbhr_thresholds[ppm_tag] = existing
+
                 cards.append(
                     build_cems_card(
                         label=f"{label} (lb/hr)",
@@ -5187,7 +5095,7 @@ def update_dashboard(n):
                         current_hour_lb_hr=current_hour_lb_hr,
                         current_hour_avg=current_hour_avg,
                         rolling_12hr_stats=rolling_12hr_stats,
-                        thresholds=thresholds,
+                        thresholds=lbhr_thresholds,
                         alias_map=alias_map,
                         units_label="lb/hr",
                         value_source="avg_lb_hr",

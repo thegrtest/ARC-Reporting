@@ -855,7 +855,25 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
     flow_avg = _compute_avg_flow(hourly_range, flow_tag)
     flow_label = _display_name(flow_tag, alias_map, "Flow")
     machine_state_tag = load_machine_state_tag_from_settings()
-    processing_hour_starts = _processing_hour_starts(hourly_range, machine_state_tag)
+
+    # Precise processing-time calculation from raw data (sub-minute granularity)
+    days_span = max(1, int((end - start).total_seconds() / 86400) + 2)
+    raw_history = load_raw_history(max_days=min(days_span, 400))
+    processing_stats = compute_processing_time_range(
+        raw_history, machine_state_tag, start, end,
+    )
+    processing_hour_starts = processing_stats["hour_starts_with_any"]
+
+    # Secondary: weight-decrease-based conveyor run time (always computed
+    # when a weight tag is configured, regardless of primary detection method)
+    feed_settings = load_feed_settings()
+    weight_tag_for_metric = feed_settings.get("weight_tag", "")
+    weight_run_stats = compute_weight_decrease_time_range(
+        raw_history, weight_tag_for_metric, start, end,
+    ) if weight_tag_for_metric else None
+    if weight_run_stats:
+        weight_run_stats["weight_units"] = feed_settings.get("weight_units", "")
+
     co_weight = _compute_total_weight(hourly_range, co_tag, processing_hour_starts)
     nox_weight = _compute_total_weight(hourly_range, nox_tag, processing_hour_starts)
 
@@ -941,14 +959,28 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
         ax_table.axis("off")
 
         uptime_text = f"{uptime_pct:.1f}% ({valid_hours}/{op_hours} operating hrs)" if op_hours > 0 else "N/A"
-        hours_processed = len(processing_hour_starts)
+        hours_processed_precise = float(processing_stats.get("total_hours", 0.0))
+        capped_gaps = int(processing_stats.get("capped_gap_count", 0))
+        hours_text = f"{hours_processed_precise:.2f}"
+        if capped_gaps > 0:
+            hours_text += f"  (note: {capped_gaps} polling gap(s) capped)"
+
         summary_rows = [
             [f"Average Flow Rate ({flow_label})", f"{flow_avg:.2f}" if flow_avg is not None else "N/A"],
             ["CO Total Weight (lb)", f"{co_weight:.2f}" if co_weight is not None else "N/A"],
             ["NOx Total Weight (lb)", f"{nox_weight:.2f}" if nox_weight is not None else "N/A"],
-            ["Hours Processed", f"{hours_processed}"],
+            ["Hours Processed", hours_text],
             ["CEMS Data Availability", uptime_text],
         ]
+
+        if weight_run_stats and weight_run_stats.get("sample_count", 0) > 0:
+            run_hrs = float(weight_run_stats.get("total_hours", 0.0))
+            avg_rate = weight_run_stats.get("avg_feed_rate_per_min")
+            w_units = weight_run_stats.get("weight_units") or "units"
+            run_text = f"{run_hrs:.2f} hrs"
+            if avg_rate is not None and avg_rate > 0:
+                run_text += f"  (avg {avg_rate:.1f} {w_units}/min)"
+            summary_rows.append(["Conveyor Run Time (weight)", run_text])
 
         tbl = ax_table.table(cellText=summary_rows, colLabels=["Metric", "Value"],
                              cellLoc="left", colLoc="left", loc="center")
@@ -1133,16 +1165,36 @@ def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
         missing_hrs = int(uptime.get("missing_hours", 0))
         uptime_pct = float(uptime.get("uptime_pct", 0))
         flow_avg = _compute_avg_flow(hourly_range, flow_tag)
-        processing_hour_starts = _processing_hour_starts(hourly_range, machine_state_tag)
+
+        # Precise processing-time calculation from raw data (sub-minute granularity)
+        days_span = max(1, int((end - start).total_seconds() / 86400) + 2)
+        raw_history = load_raw_history(max_days=min(days_span, 400))
+        processing_stats = compute_processing_time_range(
+            raw_history, machine_state_tag, start, end,
+        )
+        processing_hour_starts = processing_stats["hour_starts_with_any"]
+        hours_processed_precise = float(processing_stats.get("total_hours", 0.0))
+        capped_gaps = int(processing_stats.get("capped_gap_count", 0))
+
         co_weight = _compute_total_weight(hourly_range, co_tag, processing_hour_starts)
         nox_weight = _compute_total_weight(hourly_range, nox_tag, processing_hour_starts)
-        hours_processed = len(processing_hour_starts)
+
+        hours_text = f"{hours_processed_precise:.2f}"
+        if capped_gaps > 0:
+            hours_text += f" ({capped_gaps} capped)"
+
+        # Secondary: weight-decrease-based conveyor run time
+        feed_settings = load_feed_settings()
+        weight_tag_for_metric = feed_settings.get("weight_tag", "")
+        weight_run_stats = compute_weight_decrease_time_range(
+            raw_history, weight_tag_for_metric, start, end,
+        ) if weight_tag_for_metric else None
 
         flow_label = _display_name(flow_tag, alias_map, "Flow")
 
         stats_rows = [
             ["CEMS Availability", f"{uptime_pct:.1f}%" if op_hrs > 0 else "N/A"],
-            ["Hours Processed", f"{hours_processed}"],
+            ["Hours Processed", hours_text],
             ["Valid CEMS Hours", f"{valid_hrs}"],
             ["Missing CEMS Hours", f"{missing_hrs}"],
             ["", ""],
@@ -1150,6 +1202,15 @@ def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
             ["CO Total Weight (lb)", f"{co_weight:.2f}" if co_weight is not None else "N/A"],
             ["NOx Total Weight (lb)", f"{nox_weight:.2f}" if nox_weight is not None else "N/A"],
         ]
+
+        if weight_run_stats and weight_run_stats.get("sample_count", 0) > 0:
+            run_hrs = float(weight_run_stats.get("total_hours", 0.0))
+            avg_rate = weight_run_stats.get("avg_feed_rate_per_min")
+            w_units = feed_settings.get("weight_units", "") or "units"
+            run_text = f"{run_hrs:.2f} hrs"
+            if avg_rate is not None and avg_rate > 0:
+                run_text += f" (avg {avg_rate:.1f} {w_units}/min)"
+            stats_rows.append(["Conveyor Run (weight)", run_text])
 
         tbl = ax_stats.table(cellText=stats_rows, colLabels=["Metric", "Value"],
                              cellLoc="left", colLoc="left", loc="upper left")
@@ -2244,6 +2305,153 @@ def compute_feed_status(
     return result
 
 
+def compute_weight_decrease_time_range(
+    raw_df: pd.DataFrame,
+    weight_tag: str,
+    start: datetime,
+    end: datetime,
+    max_gap_sec: int = 120,
+    window_sec: int = 300,
+    refill_spike_pct: float = 0.20,
+) -> Dict[str, object]:
+    """Compute conveyor run-time from weight-decrease patterns over a range.
+
+    This always runs when a weight tag is configured, even if the primary
+    conveyor detection method is tag-based or disabled. The result is a
+    secondary / corroborating metric useful for reports.
+
+    Algorithm:
+    - Walk weight samples in sliding windows of `window_sec` seconds.
+    - For each window, fit a linear slope.
+    - Filter out refill spikes (large positive jumps) before fitting.
+    - If the slope is negative (weight decreasing), attribute the window's
+      elapsed time to "conveyor running".
+    - Cap individual inter-sample gaps at `max_gap_sec` to avoid inflating
+      totals from polling outages.
+
+    Args:
+        raw_df: Raw samples (possibly multi-day).
+        weight_tag: Tag that reports hopper / silo weight.
+        start, end: Window boundaries (inclusive start, exclusive end).
+        max_gap_sec: Cap per inter-sample gap (default 120 s).
+        window_sec: Sliding-window size for slope detection (default 300 s).
+        refill_spike_pct: Sample-to-sample increase fraction of the window
+            range that counts as a refill and is filtered out.
+
+    Returns dict:
+        total_minutes          -- minutes where weight was decreasing
+        total_hours            -- total_minutes / 60
+        avg_feed_rate_per_min  -- average consumption rate (units/min) when feeding, or None
+        weight_units           -- units label (passthrough for display)
+        sample_count           -- number of OK weight samples examined
+        capped_gap_count       -- polling gaps that exceeded the cap
+    """
+    result: Dict[str, object] = {
+        "total_minutes": 0.0,
+        "total_hours": 0.0,
+        "avg_feed_rate_per_min": None,
+        "weight_units": "",
+        "sample_count": 0,
+        "capped_gap_count": 0,
+    }
+
+    if (
+        not weight_tag
+        or raw_df is None
+        or raw_df.empty
+        or "tag" not in raw_df.columns
+        or "timestamp" not in raw_df.columns
+    ):
+        return result
+
+    w_df = raw_df.loc[raw_df["tag"] == weight_tag].copy()
+    if w_df.empty:
+        return result
+
+    w_df["timestamp"] = pd.to_datetime(w_df["timestamp"], errors="coerce")
+    w_df = w_df.dropna(subset=["timestamp"])
+    w_df = w_df.loc[(w_df["timestamp"] >= start) & (w_df["timestamp"] < end)]
+    if w_df.empty:
+        return result
+
+    if "qa_flag" in w_df.columns:
+        w_df = w_df.loc[w_df["qa_flag"].astype(str).str.upper().eq("OK")]
+    if w_df.empty:
+        return result
+
+    w_df = w_df.sort_values("timestamp").reset_index(drop=True)
+    w_df["_val"] = pd.to_numeric(w_df.get("value", None), errors="coerce")
+    w_df = w_df.dropna(subset=["_val"])
+    if len(w_df) < 3:
+        return result
+
+    # Raw inter-sample gaps (seconds); clamp negatives from clock jumps to 0
+    raw_diffs = w_df["timestamp"].diff().dt.total_seconds().fillna(0).clip(lower=0)
+    capped_gap_count = int((raw_diffs > max_gap_sec).sum())
+    w_df["_dt"] = raw_diffs.clip(upper=max_gap_sec)
+
+    # Filter refill spikes: drop samples where value jumped up by more than
+    # refill_spike_pct of the overall value range
+    vals = w_df["_val"].values
+    val_range = float(vals.max() - vals.min()) if len(vals) > 1 else 1.0
+    spike_threshold = max(val_range * refill_spike_pct, 1.0)
+    val_diffs = pd.Series(vals).diff().fillna(0).values
+    keep_mask = val_diffs <= spike_threshold
+    keep_mask[0] = True
+    w_df = w_df.loc[w_df.index[keep_mask]].reset_index(drop=True)
+    if len(w_df) < 3:
+        return result
+
+    # Sliding-window slope detection
+    timestamps = w_df["timestamp"]
+    values = w_df["_val"].values
+    t_sec = (timestamps - timestamps.iloc[0]).dt.total_seconds().values
+
+    total_decrease_seconds = 0.0
+    total_weight_consumed = 0.0
+
+    # For each sample, look back up to window_sec and fit slope
+    # Attribute the sample's preceding gap as "conveyor running" if slope < 0
+    for i in range(1, len(w_df)):
+        # Find window start index
+        t_end = t_sec[i]
+        window_start_time = t_end - window_sec
+        j = i
+        while j > 0 and t_sec[j - 1] >= window_start_time:
+            j -= 1
+        if i - j < 2:
+            continue
+
+        wt = t_sec[j:i + 1]
+        wv = values[j:i + 1]
+        n = len(wt)
+        sum_t = wt.sum()
+        sum_v = wv.sum()
+        sum_tv = (wt * wv).sum()
+        sum_tt = (wt * wt).sum()
+        denom = n * sum_tt - sum_t * sum_t
+        if abs(denom) < 1e-12:
+            continue
+        slope_per_sec = (n * sum_tv - sum_t * sum_v) / denom
+
+        if slope_per_sec < -0.001:
+            gap_sec = float(w_df["_dt"].iloc[i])
+            total_decrease_seconds += gap_sec
+            total_weight_consumed += abs(slope_per_sec) * gap_sec
+
+    total_minutes = total_decrease_seconds / 60.0
+    avg_rate = None
+    if total_decrease_seconds > 0:
+        avg_rate = round((total_weight_consumed / total_decrease_seconds) * 60.0, 2)
+
+    result["total_minutes"] = round(total_minutes, 2)
+    result["total_hours"] = round(total_minutes / 60.0, 2)
+    result["avg_feed_rate_per_min"] = avg_rate
+    result["sample_count"] = int(len(w_df))
+    result["capped_gap_count"] = capped_gap_count
+    return result
+
+
 def compute_processing_time_minutes(
     raw_df: pd.DataFrame,
     machine_state_tag: str,
@@ -2308,23 +2516,119 @@ def compute_processing_time_minutes(
     return current_hour_minutes, today_total_minutes
 
 
-def _processing_hour_starts(
-    hourly_range: pd.DataFrame,
+def compute_processing_time_range(
+    raw_df: pd.DataFrame,
     machine_state_tag: str,
-) -> set:
-    if not machine_state_tag or hourly_range is None or hourly_range.empty:
-        return set()
-    if "tag" not in hourly_range.columns or "hour_start" not in hourly_range.columns:
-        return set()
-    state_rows = hourly_range.loc[hourly_range["tag"] == machine_state_tag].copy()
-    if state_rows.empty:
-        return set()
-    values = pd.to_numeric(state_rows.get("avg_value"), errors="coerce")
-    state_rows = state_rows.assign(_avg_state=values)
-    processing_rows = state_rows.loc[(state_rows["_avg_state"] >= 2.5) & (state_rows["_avg_state"] <= 3.5)]
-    if processing_rows.empty:
-        return set()
-    return set(processing_rows["hour_start"].astype(str))
+    start: datetime,
+    end: datetime,
+    max_gap_sec: int = 120,
+) -> Dict[str, object]:
+    """Compute processing time for an arbitrary range using sub-minute precision.
+
+    This is the canonical, precise calculation used by PDF reports. It walks
+    the raw machine-state samples and sums inter-sample gaps where the state
+    was 3 (Processing).
+
+    Improvements over hour-average counting:
+    - Sub-minute granularity instead of whole-hour counting
+    - Honors the qa_flag column (only OK samples contribute)
+    - Tracks gaps that exceeded the cap so the caller can warn
+    - Returns the set of hours that contained ANY processing time, not just
+      hours whose state-tag average rounded to 3
+
+    Args:
+        raw_df: Raw samples (possibly multi-day).
+        machine_state_tag: Tag that reports machine state (3 = Processing).
+        start, end: Window boundaries (inclusive start, exclusive end).
+        max_gap_sec: Cap on each inter-sample gap. Prevents long polling
+            outages from distorting the total. Default 120 s.
+
+    Returns dict:
+        total_minutes           -- precise processing minutes in range
+        total_hours             -- total_minutes / 60
+        hour_starts_with_any    -- set of hour_start ISO strings (for weight filtering)
+        capped_gap_count        -- number of gaps that hit the cap (data-gap indicator)
+        sample_count            -- number of OK state samples examined
+    """
+    result: Dict[str, object] = {
+        "total_minutes": 0.0,
+        "total_hours": 0.0,
+        "hour_starts_with_any": set(),
+        "capped_gap_count": 0,
+        "sample_count": 0,
+    }
+
+    if (
+        not machine_state_tag
+        or raw_df is None
+        or raw_df.empty
+        or "tag" not in raw_df.columns
+        or "timestamp" not in raw_df.columns
+    ):
+        return result
+
+    state_df = raw_df.loc[raw_df["tag"] == machine_state_tag].copy()
+    if state_df.empty:
+        return result
+
+    # Ensure timestamps are datetimes and filter to the requested range
+    state_df["timestamp"] = pd.to_datetime(state_df["timestamp"], errors="coerce")
+    state_df = state_df.dropna(subset=["timestamp"])
+    state_df = state_df.loc[
+        (state_df["timestamp"] >= start) & (state_df["timestamp"] < end)
+    ]
+    if state_df.empty:
+        return result
+
+    # Honor qa_flag — only "OK" samples contribute (filters out PLC_ERROR, STALE, etc.)
+    if "qa_flag" in state_df.columns:
+        state_df = state_df.loc[
+            state_df["qa_flag"].astype(str).str.upper().eq("OK")
+        ]
+    if state_df.empty:
+        return result
+
+    state_df = state_df.sort_values("timestamp").reset_index(drop=True)
+    state_df["_val"] = pd.to_numeric(state_df.get("value", None), errors="coerce")
+    state_df = state_df.dropna(subset=["_val"])
+    if state_df.empty:
+        return result
+
+    state_df["_is_processing"] = (state_df["_val"] >= 2.5) & (state_df["_val"] <= 3.5)
+
+    # Raw inter-sample gaps (seconds)
+    raw_diffs = state_df["timestamp"].diff().dt.total_seconds().fillna(0)
+    # Negative gaps (clock jumps) -> treat as 0
+    raw_diffs = raw_diffs.clip(lower=0)
+    # Count gaps that would exceed the cap BEFORE clipping so caller can warn
+    capped_gap_count = int((raw_diffs > max_gap_sec).sum())
+    # Cap to avoid inflating totals
+    state_df["_dt"] = raw_diffs.clip(upper=max_gap_sec)
+
+    # Processing gaps only
+    proc_mask = state_df["_is_processing"]
+    processing_seconds = float(state_df.loc[proc_mask, "_dt"].sum())
+    total_minutes = processing_seconds / 60.0
+
+    # Which hours contained any processing time? Use the LATER sample's hour
+    # (i.e. the hour the gap ended in — consistent with how gaps are attributed)
+    hour_starts_with_any: set = set()
+    if proc_mask.any():
+        proc_rows = state_df.loc[proc_mask & (state_df["_dt"] > 0)]
+        if not proc_rows.empty:
+            hour_starts = proc_rows["timestamp"].dt.floor("h")
+            hour_starts_with_any = set(
+                hs.isoformat(timespec="seconds")
+                for hs in hour_starts.unique()
+                if pd.notna(hs)
+            )
+
+    result["total_minutes"] = round(total_minutes, 2)
+    result["total_hours"] = round(total_minutes / 60.0, 2)
+    result["hour_starts_with_any"] = hour_starts_with_any
+    result["capped_gap_count"] = capped_gap_count
+    result["sample_count"] = int(len(state_df))
+    return result
 
 
 def compute_cems_uptime(

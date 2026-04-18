@@ -1,0 +1,56 @@
+/* Dark-theme overrides for Dash dropdown and input components.
+   Dash auto-loads any CSS file placed in the assets/ folder. */
+
+/* Dropdown control (the closed selector bar) */
+.Select-control,
+.Select.is-focused > .Select-control {
+    background-color: #1a2332 !important;
+    border: 1px solid #253345 !important;
+    border-radius: 8px !important;
+    color: #edf1f7 !important;
+    box-shadow: none !important;
+}
+.Select-value-label,
+.Select-placeholder,
+.Select--single > .Select-control .Select-value .Select-value-label {
+    color: #edf1f7 !important;
+}
+.Select-placeholder {
+    color: #8b99ab !important;
+}
+.Select-arrow-zone .Select-arrow {
+    border-top-color: #8b99ab !important;
+}
+.Select-clear-zone .Select-clear {
+    color: #8b99ab !important;
+}
+
+/* Dropdown menu (the open list) */
+.Select-menu-outer {
+    background-color: #1a2332 !important;
+    border: 1px solid #253345 !important;
+    border-radius: 0 0 8px 8px !important;
+    margin-top: -1px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.4) !important;
+}
+.VirtualizedSelectOption,
+.VirtualizedSelectFocusedOption {
+    background-color: #1a2332 !important;
+    color: #edf1f7 !important;
+    cursor: pointer;
+}
+.VirtualizedSelectFocusedOption {
+    background-color: #253345 !important;
+}
+
+/* Dash dcc.Input overrides */
+.dash-input {
+    background-color: #1a2332 !important;
+    color: #edf1f7 !important;
+    border: 1px solid #253345 !important;
+    border-radius: 8px !important;
+}
+.dash-input:focus {
+    border-color: #6c63ff !important;
+    box-shadow: 0 0 0 2px rgba(108,99,255,0.2) !important;
+}

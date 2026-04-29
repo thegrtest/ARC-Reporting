@@ -772,7 +772,7 @@ class WritebackThread(QThread):
         self._running = False
         self._mutex = QMutex()
         self._avg_mutex = QMutex()
-        self._current_averages: Dict[str, float] = {}
+        self._value_sources: Dict[str, Dict[str, float]] = {}
 
     def stop(self):
         with QMutexLocker(self._mutex):
@@ -782,27 +782,39 @@ class WritebackThread(QThread):
         with QMutexLocker(self._mutex):
             return self._running
 
-    def update_averages(self, averages: Dict[str, float]) -> None:
-        with QMutexLocker(self._avg_mutex):
-            self._current_averages = dict(averages)
+    def update_value_sources(
+        self, value_sources: Dict[str, Dict[str, float]]
+    ) -> None:
+        """Set the per-value-type lookup the thread should use.
 
-    def _snapshot_averages(self) -> Dict[str, float]:
+        value_sources is keyed by writeback value_type (e.g. 'rolling_12hr_avg',
+        'rolling_12hr_avg_lbhr', 'current_avg', 'current_avg_lbhr') and each entry
+        maps source_tag -> numeric value.
+        """
         with QMutexLocker(self._avg_mutex):
-            return dict(self._current_averages)
+            self._value_sources = {k: dict(v) for k, v in value_sources.items()}
 
-    def _write_values(self, comm: "PLC", averages: Dict[str, float]) -> None:
+    def _snapshot_value_sources(self) -> Dict[str, Dict[str, float]]:
+        with QMutexLocker(self._avg_mutex):
+            return {k: dict(v) for k, v in self._value_sources.items()}
+
+    def _write_values(
+        self, comm: "PLC", value_sources: Dict[str, Dict[str, float]]
+    ) -> None:
         for mapping in self.writeback_mappings:
             source_tag = mapping.get("source_tag", "")
             target_tag = mapping.get("target_tag", "")
             alias = mapping.get("alias", "") or source_tag
+            value_type = mapping.get("value_type", "")
             if not source_tag or not target_tag:
                 continue
-            if source_tag not in averages:
+            source_dict = value_sources.get(value_type, {})
+            if source_tag not in source_dict:
                 print(
-                    f"[WRITEBACK] Skipping {alias}: no current-hour average available."
+                    f"[WRITEBACK] Skipping {alias} ({value_type}): no value available yet."
                 )
                 continue
-            value = averages.get(source_tag)
+            value = source_dict.get(source_tag)
             if value is None:
                 continue
             try:
@@ -843,7 +855,7 @@ class WritebackThread(QThread):
                 with PLC() as comm:
                     comm.IPAddress = self.ip
                     self.info.emit(
-                        f"Connected to PLC at {self.ip} for hourly average writeback "
+                        f"Connected to PLC at {self.ip} for average writeback "
                         f"({len(self.writeback_mappings)} mapping(s), interval={self.interval_sec}s)."
                     )
                     print(
@@ -853,9 +865,9 @@ class WritebackThread(QThread):
 
                     while self._should_run():
                         start_t = time.time()
-                        averages = self._snapshot_averages()
-                        if averages:
-                            self._write_values(comm, averages)
+                        value_sources = self._snapshot_value_sources()
+                        if any(value_sources.values()):
+                            self._write_values(comm, value_sources)
 
                         elapsed = time.time() - start_t
                         sleep_for = max(0.0, self.interval_sec - elapsed)
@@ -889,17 +901,37 @@ class MainWindow(QMainWindow):
         "new_value",
         "reason",
     ]
-    EPA19_STD_O2_PCT = 20.9
-    EPA19_MOLAR_VOLUME_SCF = 385.8
+    EPA19_STD_O2_PCT = 20.9              # ambient O2 (% dry, by volume)
+    EPA19_MOLAR_VOLUME_SCF = 385.8        # SCF/lb-mol at 68 F, 14.696 psia (EPA std)
     EPA19_MOLECULAR_WEIGHTS = {
         "NOx": 46.0,  # as NO2
         "CO": 28.01,
         "O2": 32.0,
     }
+    # Pollutants to which the O2 correction is applied. O2 itself is the
+    # diluent and must NEVER be O2-corrected.
+    EPA19_O2_CORRECTABLE_POLLUTANTS = {"NOx", "CO"}
+    # Default validity bounds for the measured O2 used in the correction
+    # ratio (20.9 - O2_ref) / (20.9 - O2_meas). Values above the upper bound
+    # mean the source is essentially diluted to ambient air -- any rate
+    # computed from such a measurement is dominated by sensor noise and is
+    # not defensible. The lower bound rejects negative / clearly broken
+    # sensor readings. These are user-overridable in settings.json.
+    EPA19_DEFAULT_O2_MAX_VALID_PCT = 19.0
+    EPA19_DEFAULT_O2_MIN_VALID_PCT = 0.0
     WRITEBACK_VALUE_OPTIONS = [
-        ("Current Hour Avg", "current_avg"),
+        ("Rolling 12 Hr Avg (lb/hr)", "rolling_12hr_avg_lbhr"),
         ("Current Hour Avg (lb/hr)", "current_avg_lbhr"),
     ]
+    WRITEBACK_LBHR_VALUE_TYPES = {"current_avg_lbhr", "rolling_12hr_avg_lbhr"}
+    WRITEBACK_ROLLING_VALUE_TYPES = {"rolling_12hr_avg_lbhr"}
+    WRITEBACK_DEFAULT_VALUE_TYPE = "rolling_12hr_avg_lbhr"
+    # Legacy non-lb/hr value types are silently upgraded to their lb/hr peers
+    # when loaded from saved settings. Writeback now always sends lb/hr.
+    WRITEBACK_VALUE_TYPE_ALIASES = {
+        "current_avg": "current_avg_lbhr",
+        "rolling_12hr_avg": "rolling_12hr_avg_lbhr",
+    }
 
     def __init__(self):
         super().__init__()
@@ -969,7 +1001,10 @@ class MainWindow(QMainWindow):
         self.epa_flow_tag = ""
         self.epa_o2_tag = ""
         self.epa_o2_units = "percent"
-        self.epa_ref_o2_pct = 3.0
+        self.epa_ref_o2_pct = 7.0
+        self.epa_o2_correction_enabled = True
+        self.epa_o2_max_valid_pct = self.EPA19_DEFAULT_O2_MAX_VALID_PCT
+        self.epa_o2_min_valid_pct = self.EPA19_DEFAULT_O2_MIN_VALID_PCT
         self.epa_nox_tag = ""
         self.epa_co_tag = ""
         self.production_product_tag = ""
@@ -986,6 +1021,9 @@ class MainWindow(QMainWindow):
         self.minute_csv_path = os.path.join(self.log_dir, "minute_averages.csv")
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
         self.rolling_12hr_csv_path = os.path.join(self.log_dir, "rolling_12hr_averages.csv")
+        self.live_rolling_12hr_csv_path = os.path.join(
+            self.log_dir, "rolling_12hr_live.csv"
+        )
         self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
         self.system_health_path = os.path.join(self.log_dir, "system_health.json")
         self.log_dir_warn_gb = 5.0
@@ -1109,23 +1147,33 @@ class MainWindow(QMainWindow):
             mappings.append(
                 {
                     "alias": alias,
-                    "value_type": "current_avg",
+                    "value_type": "rolling_12hr_avg_lbhr",
                     "plc_tag": tag,
                 }
             )
         return mappings
 
     def _resolve_writeback_targets(self, mappings: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        """Resolve alias mappings into writeback rows using current alias map."""
+        """Resolve alias mappings into writeback rows using current alias map.
+
+        For lb/hr value types the source_tag stays as the resolved ppm tag
+        (e.g. Stack.NOx_PPM); the writeback thread looks up that key in the
+        per-value-type lb/hr dict produced by _writeback_value_sources, which
+        already contains the lb/hr value for that ppm tag. The value type --
+        not the tag name -- selects ppm vs lb/hr.
+        """
         if not mappings:
             return []
-        ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
-        epa_calc_tags = self._epa_calc_tags()
+        lbhr_capable = self._epa_lbhr_capable_ppm_tags()
         resolved: List[Dict[str, str]] = []
         for entry in mappings:
             alias = str(entry.get("alias", "") or "").strip()
             target_tag = str(entry.get("plc_tag", "") or "").strip()
-            value_type = str(entry.get("value_type", "current_avg") or "current_avg").strip()
+            value_type = str(
+                entry.get("value_type", self.WRITEBACK_DEFAULT_VALUE_TYPE)
+                or self.WRITEBACK_DEFAULT_VALUE_TYPE
+            ).strip()
+            value_type = self.WRITEBACK_VALUE_TYPE_ALIASES.get(value_type, value_type)
             if not alias or not target_tag:
                 continue
             source_tag = self._resolve_alias_to_tag(alias)
@@ -1134,14 +1182,11 @@ class MainWindow(QMainWindow):
                     f"Writeback mapping skipped: alias '{alias}' not found in configured tags."
                 )
                 continue
-            if value_type == "current_avg_lbhr":
-                if source_tag in ppm_to_lbhr:
-                    source_tag = ppm_to_lbhr[source_tag]
-                elif source_tag not in epa_calc_tags:
-                    self.log_message(
-                        f"Writeback mapping skipped: lb/hr not available for alias '{alias}'."
-                    )
-                    continue
+            if value_type in self.WRITEBACK_LBHR_VALUE_TYPES and source_tag not in lbhr_capable:
+                self.log_message(
+                    f"Writeback mapping skipped: lb/hr not available for alias '{alias}'."
+                )
+                continue
             resolved.append(
                 {
                     "alias": alias,
@@ -1180,22 +1225,20 @@ class MainWindow(QMainWindow):
         source_tag = self._resolve_alias_to_tag(alias)
         if not source_tag:
             return False
-        ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
-        if source_tag in ppm_to_lbhr:
-            return True
-        return source_tag in self._epa_calc_tags()
+        return source_tag in self._epa_lbhr_capable_ppm_tags()
 
     def _update_writeback_value_options(self, alias: str, combo: QComboBox) -> None:
-        current = combo.currentData() or "current_avg"
+        current = combo.currentData() or self.WRITEBACK_DEFAULT_VALUE_TYPE
+        current = self.WRITEBACK_VALUE_TYPE_ALIASES.get(current, current)
         allow_lbhr = self._lbhr_available_for_alias(alias)
         combo.blockSignals(True)
         combo.clear()
         for label, key in self.WRITEBACK_VALUE_OPTIONS:
-            if key == "current_avg_lbhr" and not allow_lbhr:
+            if key in self.WRITEBACK_LBHR_VALUE_TYPES and not allow_lbhr:
                 continue
             combo.addItem(label, key)
         if combo.findData(current) < 0:
-            current = "current_avg"
+            current = self.WRITEBACK_DEFAULT_VALUE_TYPE
         index = combo.findData(current)
         combo.setCurrentIndex(index if index >= 0 else 0)
         combo.blockSignals(False)
@@ -1226,8 +1269,12 @@ class MainWindow(QMainWindow):
         return combo
 
     def _add_writeback_row(
-        self, alias: str = "", value_type: str = "current_avg", plc_tag: str = ""
+        self,
+        alias: str = "",
+        value_type: str = "rolling_12hr_avg_lbhr",
+        plc_tag: str = "",
     ) -> None:
+        value_type = self.WRITEBACK_VALUE_TYPE_ALIASES.get(value_type, value_type)
         row = self.writeback_table.rowCount()
         self.writeback_table.insertRow(row)
 
@@ -1253,6 +1300,7 @@ class MainWindow(QMainWindow):
 
     def _collect_writeback_mappings(self) -> List[Dict[str, str]]:
         mappings: List[Dict[str, str]] = []
+        default_type = self.WRITEBACK_DEFAULT_VALUE_TYPE
         for row in range(self.writeback_table.rowCount()):
             plc_item = self.writeback_table.item(row, 2)
             plc_tag = plc_item.text().strip() if plc_item else ""
@@ -1261,9 +1309,10 @@ class MainWindow(QMainWindow):
             if isinstance(alias_combo, QComboBox):
                 alias = alias_combo.currentText().strip()
             combo = self.writeback_table.cellWidget(row, 1)
-            value_type = "current_avg"
+            value_type = default_type
             if isinstance(combo, QComboBox):
-                value_type = str(combo.currentData() or "current_avg")
+                value_type = str(combo.currentData() or default_type)
+            value_type = self.WRITEBACK_VALUE_TYPE_ALIASES.get(value_type, value_type)
             if not alias or not plc_tag:
                 continue
             mappings.append(
@@ -1277,9 +1326,11 @@ class MainWindow(QMainWindow):
 
     def _populate_writeback_table(self, mappings: List[Dict[str, str]]) -> None:
         self.writeback_table.setRowCount(0)
+        default_type = self.WRITEBACK_DEFAULT_VALUE_TYPE
         for entry in mappings:
             alias = str(entry.get("alias", "") or "")
-            value_type = str(entry.get("value_type", "current_avg") or "current_avg")
+            value_type = str(entry.get("value_type", default_type) or default_type)
+            value_type = self.WRITEBACK_VALUE_TYPE_ALIASES.get(value_type, value_type)
             plc_tag = str(entry.get("plc_tag", "") or "")
             if not alias and not plc_tag:
                 continue
@@ -1917,12 +1968,55 @@ class MainWindow(QMainWindow):
         self.epa_o2_units_combo.addItem("PPMV", "ppmv")
         cfg_layout.addRow(QLabel("O2 Units:"), self.epa_o2_units_combo)
 
+        self.epa_o2_correction_checkbox = QCheckBox(
+            "Apply O2 correction to NOx/CO ppm"
+        )
+        self.epa_o2_correction_checkbox.setToolTip(
+            "When enabled, NOx and CO ppm are scaled by "
+            "(20.9 - Reference O2) / (20.9 - Measured O2) before lb/hr is "
+            "computed. Required for permits expressed at a reference O2 "
+            "(e.g. 7% O2 dry). When disabled, lb/hr is the raw uncorrected "
+            "mass rate."
+        )
+        self.epa_o2_correction_checkbox.setChecked(self.epa_o2_correction_enabled)
+        cfg_layout.addRow(self.epa_o2_correction_checkbox)
+
         self.epa_ref_o2_spin = QDoubleSpinBox()
-        self.epa_ref_o2_spin.setRange(0.0, 20.9)
+        self.epa_ref_o2_spin.setRange(0.0, 20.89)
         self.epa_ref_o2_spin.setSingleStep(0.1)
         self.epa_ref_o2_spin.setDecimals(2)
         self.epa_ref_o2_spin.setValue(self.epa_ref_o2_pct)
+        self.epa_ref_o2_spin.setToolTip(
+            "Reference O2 percent for the correction. Common values: 7% "
+            "(RCRA HW incinerators, MSW combustors), 3% (industrial "
+            "boilers), 15% (combustion turbines)."
+        )
         cfg_layout.addRow(QLabel("Reference O2 (%):"), self.epa_ref_o2_spin)
+
+        self.epa_o2_max_valid_spin = QDoubleSpinBox()
+        self.epa_o2_max_valid_spin.setRange(0.1, 20.89)
+        self.epa_o2_max_valid_spin.setSingleStep(0.1)
+        self.epa_o2_max_valid_spin.setDecimals(2)
+        self.epa_o2_max_valid_spin.setValue(self.epa_o2_max_valid_pct)
+        self.epa_o2_max_valid_spin.setToolTip(
+            "Measured O2 at or above this value invalidates the lb/hr "
+            "calculation for that sample. Defaults to 19.0% -- readings "
+            "approaching the 20.9% ambient O2 produce a divergent "
+            "correction factor and are dominated by sensor noise."
+        )
+        cfg_layout.addRow(QLabel("Max valid measured O2 (%):"), self.epa_o2_max_valid_spin)
+
+        self.epa_o2_min_valid_spin = QDoubleSpinBox()
+        self.epa_o2_min_valid_spin.setRange(-1.0, 20.0)
+        self.epa_o2_min_valid_spin.setSingleStep(0.1)
+        self.epa_o2_min_valid_spin.setDecimals(2)
+        self.epa_o2_min_valid_spin.setValue(self.epa_o2_min_valid_pct)
+        self.epa_o2_min_valid_spin.setToolTip(
+            "Measured O2 below this value invalidates the lb/hr "
+            "calculation for that sample (rejects negative / failed "
+            "sensor readings)."
+        )
+        cfg_layout.addRow(QLabel("Min valid measured O2 (%):"), self.epa_o2_min_valid_spin)
 
         self.epa_nox_tag_edit = QLineEdit()
         self.epa_nox_tag_edit.setPlaceholderText("e.g. Program:MainRoutine.NOx_PPMV")
@@ -2021,11 +2115,12 @@ class MainWindow(QMainWindow):
 
         # Writeback config
         self.writeback_enabled_checkbox = QCheckBox(
-            "Enable writeback of current hour averages"
+            "Enable writeback of lb/hr averages to PLC"
         )
         self.writeback_enabled_checkbox.setToolTip(
-            "When enabled, the app writes the current-hour average (lb/hr when available) "
-            "for each mapped alias/value type back to its PLC tag at the configured interval."
+            "When enabled, the app writes the selected lb/hr average (rolling 12-hr "
+            "or current hour) for each mapped alias back to its PLC tag at the "
+            "configured interval. Rolling 12-hr values include the in-progress hour."
         )
         cfg_layout.addRow(self.writeback_enabled_checkbox)
 
@@ -2061,8 +2156,9 @@ class MainWindow(QMainWindow):
         writeback_btns.addStretch(1)
 
         writeback_help = QLabel(
-            "Select the alias, the value type (current hour avg or lb/hr), "
-            "and the PLC tag to receive the writeback."
+            "Select the alias, the lb/hr average to send (rolling 12-hr or current "
+            "hour), and the PLC tag to receive the writeback. Rolling 12-hr is the "
+            "default and includes the in-progress hour."
         )
         writeback_help.setWordWrap(True)
         writeback_help.setStyleSheet("color: #90a4ae; font-size: 11px;")
@@ -2584,14 +2680,6 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-    @staticmethod
-    def _epa_calc_tag_names() -> Dict[str, str]:
-        return {
-            "NOx": "EPA19:NOx_LBHR",
-            "CO": "EPA19:CO_LBHR",
-            "O2": "EPA19:O2_LBHR",
-        }
-
     def _resolve_tag_from_alias(self, name: str) -> str:
         if not name:
             return ""
@@ -2603,22 +2691,27 @@ class MainWindow(QMainWindow):
                 return tag
         return name
 
-    def _epa_calc_tags(self) -> set:
-        return set(self._epa_calc_tag_names().values())
+    def _epa_lbhr_capable_ppm_tags(self) -> set:
+        """Return the resolved ppm tag names for which lb/hr can be derived.
 
-    def _epa_ppm_to_lbhr_map(self) -> Dict[str, str]:
-        calc_tags = self._epa_calc_tag_names()
-        mapping: Dict[str, str] = {}
+        These are the configured NOx and CO ppm tags. O2 is intentionally
+        excluded -- it is the diluent the correction normalises against,
+        not an emission, so 'lb/hr of O2' is not a meaningful metric.
+
+        The lb/hr value for each of these tags lives in the avg_lb_hr
+        column of the row keyed by the ppm tag itself; there is no separate
+        'virtual tag' for the lb/hr value.
+        """
+        if not self.epa_enabled:
+            return set()
+        tags = set()
         nox_tag = self._resolve_tag_from_alias(self.epa_nox_tag)
         co_tag = self._resolve_tag_from_alias(self.epa_co_tag)
-        o2_tag = self._resolve_tag_from_alias(self.epa_o2_tag)
         if nox_tag:
-            mapping[nox_tag] = calc_tags["NOx"]
+            tags.add(nox_tag)
         if co_tag:
-            mapping[co_tag] = calc_tags["CO"]
-        if o2_tag:
-            mapping[o2_tag] = calc_tags["O2"]
-        return mapping
+            tags.add(co_tag)
+        return tags
 
     def _get_numeric_from_poll(self, data: Dict[str, Tuple[object, str]], tag: str) -> Optional[float]:
         if not tag:
@@ -2649,6 +2742,13 @@ class MainWindow(QMainWindow):
         return o2_pct, o2_ppmv
 
     def _ppmv_to_lb_hr(self, ppmv: float, flow_scfm: float, molecular_weight: float) -> float:
+        """Stoichiometric mass-rate from concentration, volumetric flow and MW.
+
+            lb/hr = ppm * Q_scfm * 60 * MW / (1e6 * Vm)
+
+        Q_scfm and Vm must be on the same temperature/pressure/moisture basis.
+        Vm = 385.8 SCF/lb-mol corresponds to 68 F, 14.696 psia (EPA standard).
+        """
         return (
             ppmv
             * flow_scfm
@@ -2657,9 +2757,71 @@ class MainWindow(QMainWindow):
             / (1_000_000.0 * self.EPA19_MOLAR_VOLUME_SCF)
         )
 
+    def _epa_o2_correction_factor(self, o2_pct: Optional[float]) -> Optional[float]:
+        """Return the O2 correction multiplier ((20.9 - O2_ref) / (20.9 - O2_meas)).
+
+        Behaviour:
+          * Correction disabled -> returns 1.0 (caller multiplies by 1, i.e. no-op).
+          * Correction enabled and the inputs are valid -> returns the multiplier.
+          * Correction enabled but the measurement or reference is invalid /
+            out of range -> returns None.
+
+        A None return means "lb/hr cannot be defensibly computed for this
+        sample". The caller MUST propagate the None upward instead of
+        substituting 1.0 -- silently emitting an uncorrected value when
+        correction was requested would be a compliance defect.
+
+        Validity rules:
+          * o2_pct must not be None.
+          * o2_pct must satisfy min_valid <= o2_pct < max_valid (defaults
+            0.0 and 19.0 percent). The upper bound exists because as O2
+            approaches the ambient 20.9 percent the correction ratio
+            diverges; readings near ambient are dominated by sensor noise
+            and dilution and are rejected by EPA QA procedures.
+          * o2_ref must be in [0, 20.9). A reference at or above ambient
+            has no physical meaning.
+          * Denominator (20.9 - o2_pct) must be strictly positive.
+        """
+        if not self.epa_o2_correction_enabled:
+            return 1.0
+        if o2_pct is None:
+            return None
+        try:
+            o2_meas = float(o2_pct)
+            o2_ref = float(self.epa_ref_o2_pct)
+        except (TypeError, ValueError):
+            return None
+        if o2_meas != o2_meas or o2_ref != o2_ref:  # NaN guard
+            return None
+        if o2_ref < 0.0 or o2_ref >= self.EPA19_STD_O2_PCT:
+            return None
+        if o2_meas < self.epa_o2_min_valid_pct:
+            return None
+        if o2_meas >= self.epa_o2_max_valid_pct:
+            return None
+        denom = self.EPA19_STD_O2_PCT - o2_meas
+        if denom <= 0.0:
+            return None
+        return (self.EPA19_STD_O2_PCT - o2_ref) / denom
+
     def _compute_lbhr_from_avg(
         self, tag: str, avg_lookup: Dict[str, float]
     ) -> Optional[float]:
+        """Compute period-averaged lb/hr for the given tag.
+
+        For NOx and CO the measured ppm is first scaled by the O2 correction
+        factor (see ``_epa_o2_correction_factor``) so the result represents
+        emissions normalised to the configured reference O2 level. For O2
+        itself the correction is intentionally NOT applied -- O2 is the
+        diluent that the correction is normalising against.
+
+        Returns None when EPA is disabled, when required tags are missing,
+        when the period averages are unavailable, or when O2 correction is
+        requested but cannot be computed defensibly. None is the explicit
+        signal "no valid lb/hr for this sample"; callers (rolling 12-hour
+        aggregator, CSV writers, writeback thread) skip it rather than
+        substitute a placeholder.
+        """
         if not self.epa_enabled:
             return None
 
@@ -2674,32 +2836,36 @@ class MainWindow(QMainWindow):
             return None
 
         o2_avg = avg_lookup.get(o2_tag)
-        _, o2_ppmv = self._epa_o2_values(o2_avg)
+        o2_pct, o2_ppmv = self._epa_o2_values(o2_avg)
 
         nox_tag = self._resolve_tag_from_alias(self.epa_nox_tag)
         co_tag = self._resolve_tag_from_alias(self.epa_co_tag)
-        o2_tag = self._resolve_tag_from_alias(self.epa_o2_tag)
 
         if tag == o2_tag:
+            # O2 is the diluent and is reported uncorrected.
             ppmv = o2_ppmv
             pollutant = "O2"
+            correction = 1.0
         elif tag == nox_tag:
             pollutant = "NOx"
             ppmv = tag_avg
+            correction = self._epa_o2_correction_factor(o2_pct)
         elif tag == co_tag:
             pollutant = "CO"
             ppmv = tag_avg
+            correction = self._epa_o2_correction_factor(o2_pct)
         else:
             return None
 
-        if ppmv is None:
+        if ppmv is None or correction is None:
             return None
 
         mw = self.EPA19_MOLECULAR_WEIGHTS.get(pollutant)
         if mw is None:
             return None
 
-        return self._ppmv_to_lb_hr(ppmv, flow_avg, mw)
+        corrected_ppmv = ppmv * correction
+        return self._ppmv_to_lb_hr(corrected_ppmv, flow_avg, mw)
 
     # ---------------- settings ----------------
 
@@ -2738,6 +2904,9 @@ class MainWindow(QMainWindow):
         self.minute_csv_path = os.path.join(self.log_dir, "minute_averages.csv")
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
         self.rolling_12hr_csv_path = os.path.join(self.log_dir, "rolling_12hr_averages.csv")
+        self.live_rolling_12hr_csv_path = os.path.join(
+            self.log_dir, "rolling_12hr_live.csv"
+        )
         self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
         self.system_health_path = os.path.join(self.log_dir, "system_health.json")
         self._ensure_env_events_csv()
@@ -2778,6 +2947,18 @@ class MainWindow(QMainWindow):
             self.epa_o2_units_combo.setCurrentIndex(o2_index)
         self.epa_ref_o2_pct = float(data.get("epa_ref_o2_pct", self.epa_ref_o2_pct))
         self.epa_ref_o2_spin.setValue(self.epa_ref_o2_pct)
+        self.epa_o2_correction_enabled = bool(
+            data.get("epa_o2_correction_enabled", self.epa_o2_correction_enabled)
+        )
+        self.epa_o2_correction_checkbox.setChecked(self.epa_o2_correction_enabled)
+        self.epa_o2_max_valid_pct = float(
+            data.get("epa_o2_max_valid_pct", self.epa_o2_max_valid_pct)
+        )
+        self.epa_o2_max_valid_spin.setValue(self.epa_o2_max_valid_pct)
+        self.epa_o2_min_valid_pct = float(
+            data.get("epa_o2_min_valid_pct", self.epa_o2_min_valid_pct)
+        )
+        self.epa_o2_min_valid_spin.setValue(self.epa_o2_min_valid_pct)
         self.epa_nox_tag = str(data.get("epa_nox_tag", "") or "")
         self.epa_nox_tag_edit.setText(self.epa_nox_tag)
         self.epa_co_tag = str(data.get("epa_co_tag", "") or "")
@@ -2887,6 +3068,9 @@ class MainWindow(QMainWindow):
             "epa_o2_tag": self.epa_o2_tag_edit.text().strip(),
             "epa_o2_units": self.epa_o2_units_combo.currentData(),
             "epa_ref_o2_pct": self.epa_ref_o2_spin.value(),
+            "epa_o2_correction_enabled": self.epa_o2_correction_checkbox.isChecked(),
+            "epa_o2_max_valid_pct": self.epa_o2_max_valid_spin.value(),
+            "epa_o2_min_valid_pct": self.epa_o2_min_valid_spin.value(),
             "epa_nox_tag": self.epa_nox_tag_edit.text().strip(),
             "epa_co_tag": self.epa_co_tag_edit.text().strip(),
             "production_tracking": {
@@ -2985,6 +3169,9 @@ class MainWindow(QMainWindow):
             ("epa_o2_tag", "EPA O2 tag"),
             ("epa_o2_units", "EPA O2 units"),
             ("epa_ref_o2_pct", "EPA reference O2"),
+            ("epa_o2_correction_enabled", "EPA O2 correction enabled"),
+            ("epa_o2_max_valid_pct", "EPA O2 max valid"),
+            ("epa_o2_min_valid_pct", "EPA O2 min valid"),
             ("epa_nox_tag", "EPA NOx tag"),
             ("epa_co_tag", "EPA CO tag"),
             ("production_tracking", "Production tracking"),
@@ -3026,6 +3213,9 @@ class MainWindow(QMainWindow):
             self.epa_o2_tag_edit,
             self.epa_o2_units_combo,
             self.epa_ref_o2_spin,
+            self.epa_o2_correction_checkbox,
+            self.epa_o2_max_valid_spin,
+            self.epa_o2_min_valid_spin,
             self.epa_nox_tag_edit,
             self.epa_co_tag_edit,
             self.production_product_tag_edit,
@@ -3098,6 +3288,9 @@ class MainWindow(QMainWindow):
             self.minute_csv_path = os.path.join(self.log_dir, "minute_averages.csv")
             self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
             self.rolling_12hr_csv_path = os.path.join(self.log_dir, "rolling_12hr_averages.csv")
+            self.live_rolling_12hr_csv_path = os.path.join(
+                self.log_dir, "rolling_12hr_live.csv"
+            )
             self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
             ensure_csv(
                 self.minute_csv_path,
@@ -3191,6 +3384,9 @@ class MainWindow(QMainWindow):
         self.minute_csv_path = os.path.join(self.log_dir, "minute_averages.csv")
         self.hourly_csv_path = os.path.join(self.log_dir, "hourly_averages.csv")
         self.rolling_12hr_csv_path = os.path.join(self.log_dir, "rolling_12hr_averages.csv")
+        self.live_rolling_12hr_csv_path = os.path.join(
+            self.log_dir, "rolling_12hr_live.csv"
+        )
         self.env_events_path = os.path.join(self.log_dir, "env_events.csv")
         ensure_csv(
             self.minute_csv_path,
@@ -3224,6 +3420,9 @@ class MainWindow(QMainWindow):
         self.epa_o2_tag = self.epa_o2_tag_edit.text().strip()
         self.epa_o2_units = self.epa_o2_units_combo.currentData() or "percent"
         self.epa_ref_o2_pct = self.epa_ref_o2_spin.value()
+        self.epa_o2_correction_enabled = self.epa_o2_correction_checkbox.isChecked()
+        self.epa_o2_max_valid_pct = self.epa_o2_max_valid_spin.value()
+        self.epa_o2_min_valid_pct = self.epa_o2_min_valid_spin.value()
         self.epa_nox_tag = self.epa_nox_tag_edit.text().strip()
         self.epa_co_tag = self.epa_co_tag_edit.text().strip()
 
@@ -3294,20 +3493,6 @@ class MainWindow(QMainWindow):
             tag_order.append(heartbeat_tag)
         self.tag_order = tag_order
         self.alias_map = alias_map  # keep for CSV + table
-
-        if self.epa_enabled:
-            calc_tags = self._epa_calc_tag_names()
-            for pollutant, calc_tag in calc_tags.items():
-                if pollutant == "NOx" and not self.epa_nox_tag:
-                    continue
-                if pollutant == "CO" and not self.epa_co_tag:
-                    continue
-                if pollutant == "O2" and not self.epa_o2_tag:
-                    continue
-                if calc_tag not in self.tag_order:
-                    self.tag_order.append(calc_tag)
-                self.alias_map.setdefault(calc_tag, f"{pollutant} (lb/hr)")
-                self.units_map.setdefault(calc_tag, "lb/hr")
 
         # machine name / header
         self.machine_name = self.machine_name_edit.text().strip()
@@ -3436,7 +3621,7 @@ class MainWindow(QMainWindow):
         )
         self.writeback_thread.info.connect(self.log_message)
         self.writeback_thread.error.connect(self.handle_poll_error)
-        self.writeback_thread.update_averages(self._current_hour_averages())
+        self.writeback_thread.update_value_sources(self._writeback_value_sources())
         self.writeback_thread.start()
 
     # ---------------- data handling ----------------
@@ -3601,8 +3786,12 @@ class MainWindow(QMainWindow):
                 self._hour_average_snapshot(include_partial_minute=True)
             )
 
+            self._write_live_rolling_12hr_snapshot()
+
             if self.writeback_thread and self.writeback_thread.isRunning():
-                self.writeback_thread.update_averages(self._current_hour_averages())
+                self.writeback_thread.update_value_sources(
+                    self._writeback_value_sources()
+                )
 
             self.last_update_label.setText(f"Last update: {ts.strftime('%Y-%m-%d %H:%M:%S')}")
             self._update_system_health(success_ts=ts)
@@ -3610,17 +3799,44 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log_message(f"Error handling poll data: {e}")
 
-    def _current_hour_averages(self) -> Dict[str, float]:
+    def _current_hour_lbhr_by_ppm_tag(self) -> Dict[str, float]:
+        """Live current-hour lb/hr per lb/hr-capable ppm tag.
+
+        Keys are the resolved ppm tags themselves (e.g. Stack.NOx_PPM); the
+        writeback thread looks up by this tag and reads the lb/hr value
+        directly. There is no separate 'virtual' tag for the lb/hr value --
+        same key as the ppm series, different metric chosen by value_type.
+        """
+        if not self.epa_enabled:
+            return {}
+        capable = self._epa_lbhr_capable_ppm_tags()
+        if not capable:
+            return {}
         averages = self._hour_average_snapshot(include_partial_minute=True)
-        if self.epa_enabled:
-            ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
-            if ppm_to_lbhr:
-                avg_lookup = dict(averages)
-                for ppm_tag, lbhr_tag in ppm_to_lbhr.items():
-                    lbhr_value = self._compute_lbhr_from_avg(ppm_tag, avg_lookup)
-                    if lbhr_value is not None:
-                        averages[lbhr_tag] = lbhr_value
-        return averages
+        result: Dict[str, float] = {}
+        for ppm_tag in capable:
+            lbhr_value = self._compute_lbhr_from_avg(ppm_tag, averages)
+            if lbhr_value is not None:
+                result[ppm_tag] = float(lbhr_value)
+        return result
+
+    def _writeback_value_sources(self) -> Dict[str, Dict[str, float]]:
+        """Build the per-value-type snapshot the writeback thread consumes.
+
+        Both inner dicts key by the resolved ppm tag (e.g. Stack.NOx_PPM);
+        the value_type selects which metric (current-hour lb/hr or rolling
+        12-hr lb/hr) the thread sends to the PLC for that tag.
+        """
+        current_lbhr = self._current_hour_lbhr_by_ppm_tag()
+        try:
+            rolling_lbhr = self._current_rolling_12hr_lbhr_by_ppm_tag()
+        except Exception as e:
+            self.log_message(f"Error building rolling 12-hour writeback values: {e}")
+            rolling_lbhr = {}
+        return {
+            "current_avg_lbhr": current_lbhr,
+            "rolling_12hr_avg_lbhr": rolling_lbhr,
+        }
 
     @staticmethod
     def _is_valid_number(value: Optional[float]) -> bool:
@@ -3686,14 +3902,14 @@ class MainWindow(QMainWindow):
         if not avg_lookup:
             return
 
-        ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
+        lbhr_capable = self._epa_lbhr_capable_ppm_tags()
         rows: List[List[object]] = []
 
         for tag, minute_avg in avg_lookup.items():
             acc = self.minute_accumulators.get(tag, {})
             count = int(acc.get("count", 0) or 0)
             lbhr_avg: Optional[float] = None
-            if tag in ppm_to_lbhr:
+            if tag in lbhr_capable:
                 derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
                 if derived_lbhr is not None:
                     lbhr_avg = derived_lbhr
@@ -3736,7 +3952,7 @@ class MainWindow(QMainWindow):
                 latest: Dict[str, Tuple[datetime, Optional[float], Optional[float]]] = {}
                 for row in reader:
                     tag = row.get("tag", "")
-                    if not tag or tag.startswith("EPA19:"):
+                    if not tag:
                         continue
                     window_end_str = row.get("window_end", "")
                     try:
@@ -3769,7 +3985,7 @@ class MainWindow(QMainWindow):
                 for row in reader:
                     window_end = row.get("window_end", "")
                     tag = row.get("tag", "")
-                    if not window_end or not tag or tag.startswith("EPA19:"):
+                    if not window_end or not tag:
                         continue
                     alias = row.get("alias", "") or ""
                     records[(window_end, tag)] = (
@@ -3821,8 +4037,6 @@ class MainWindow(QMainWindow):
         window_start = window_end - timedelta(hours=12)
         tag_entries: Dict[str, List[Tuple[datetime, Optional[float], Optional[float]]]] = {}
         for (hour_start_iso, tag), (_, avg, lbhr_avg, count, _) in records.items():
-            if tag.startswith("EPA19:"):
-                continue
             try:
                 hour_start = datetime.fromisoformat(hour_start_iso)
             except Exception:
@@ -3912,8 +4126,6 @@ class MainWindow(QMainWindow):
     ) -> None:
         tag_entries: Dict[str, List[Tuple[datetime, Optional[float], Optional[float]]]] = {}
         for (hour_start_iso, tag), (_, avg, lbhr_avg, count, _) in records.items():
-            if tag.startswith("EPA19:"):
-                continue
             try:
                 hour_start = datetime.fromisoformat(hour_start_iso)
             except Exception:
@@ -3990,6 +4202,225 @@ class MainWindow(QMainWindow):
         self.rolling_12hr_avg = latest_avg
         self.rolling_12hr_lbhr_avg = latest_lbhr
 
+    def _read_hourly_records(
+        self,
+    ) -> Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]]:
+        """Load every (hour_start, tag) row from hourly_averages.csv plus pending writes."""
+        records: Dict[
+            Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]
+        ] = {}
+        try:
+            if os.path.exists(self.hourly_csv_path):
+                with open(self.hourly_csv_path, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        tag = row.get("tag", "")
+                        hour_start = row.get("hour_start", "")
+                        if not tag or not hour_start:
+                            continue
+                        records[(hour_start, tag)] = (
+                            row.get("hour_end", ""),
+                            self._safe_float(row.get("avg_value")),
+                            self._safe_float(row.get("avg_lb_hr")),
+                            int(row.get("sample_count", "0") or 0),
+                            row.get("alias", "") or "",
+                        )
+        except Exception as e:
+            self.log_message(f"Error reading hourly CSV for rolling 12hr: {e}")
+        if self._pending_hourly_records:
+            records.update(self._pending_hourly_records)
+        return records
+
+    def _compute_live_rolling_12hr(
+        self,
+    ) -> Tuple[
+        Dict[str, float],
+        Dict[str, float],
+        Dict[str, int],
+        Optional[datetime],
+        Optional[datetime],
+    ]:
+        """Compute rolling 12-hour averages including the in-progress hour.
+
+        Returns (avg_by_tag, lb_avg_by_tag, hours_count_by_tag, window_start, window_end).
+        The in-progress hour is included as one entry (hour 12); it is built from
+        completed minute averages plus the current minute's partial accumulator so
+        the value is current up to the latest poll.
+        """
+        now = datetime.now()
+        current_hour_start = self.current_hour_start or hour_bucket(now)
+        # 12-hour window: 11 prior completed hours + the current in-progress hour.
+        window_start = current_hour_start - timedelta(hours=11)
+        window_end = current_hour_start + timedelta(hours=1)
+
+        records = self._read_hourly_records()
+        tag_entries: Dict[
+            str, List[Tuple[datetime, Optional[float], Optional[float]]]
+        ] = {}
+        alias_lookup: Dict[str, str] = {}
+        for (hour_start_iso, tag), (_, avg, lbhr_avg, count, alias) in records.items():
+            if count <= 0:
+                continue
+            try:
+                hour_start = datetime.fromisoformat(hour_start_iso)
+            except Exception:
+                continue
+            if hour_start < window_start or hour_start >= current_hour_start:
+                continue
+            tag_entries.setdefault(tag, []).append(
+                (hour_start, self._safe_float(avg), self._safe_float(lbhr_avg))
+            )
+            if alias and tag not in alias_lookup:
+                alias_lookup[tag] = alias
+
+        # In-progress hour: average of accumulated minute averages so far
+        # (plus the current partial minute), exactly mirroring the gauge "current
+        # hour avg" calculation used elsewhere in the app.
+        current_snapshot = self._hour_average_snapshot(include_partial_minute=True)
+        lbhr_capable = self._epa_lbhr_capable_ppm_tags()
+        current_lbhr_lookup: Dict[str, float] = {}
+        for ppm_tag in lbhr_capable:
+            lbhr_value = self._compute_lbhr_from_avg(ppm_tag, current_snapshot)
+            if lbhr_value is not None:
+                current_lbhr_lookup[ppm_tag] = lbhr_value
+
+        for tag, val in current_snapshot.items():
+            if not self._is_valid_number(val):
+                continue
+            tag_entries.setdefault(tag, []).append(
+                (current_hour_start, float(val), current_lbhr_lookup.get(tag))
+            )
+
+        avg_by_tag: Dict[str, float] = {}
+        lb_avg_by_tag: Dict[str, float] = {}
+        hours_count_by_tag: Dict[str, int] = {}
+
+        for tag, entries in tag_entries.items():
+            values = [v for _, v, _ in entries if self._is_valid_number(v)]
+            lb_values = [v for _, _, v in entries if self._is_valid_number(v)]
+            hours_count_by_tag[tag] = len(values)
+            if values:
+                avg_by_tag[tag] = sum(values) / len(values)
+            if lb_values:
+                lb_avg_by_tag[tag] = sum(lb_values) / len(lb_values)
+
+        # Derive lb/hr from the rolling averages for any EPA-derivable pollutant
+        # tag that does not already have a direct lb/hr aggregate.
+        if self.epa_enabled:
+            rolling_lookup = dict(avg_by_tag)
+            for tag in list(avg_by_tag.keys()):
+                if tag in lb_avg_by_tag:
+                    continue
+                derived = self._compute_lbhr_from_avg(tag, rolling_lookup)
+                if derived is not None:
+                    lb_avg_by_tag[tag] = derived
+
+        return (
+            avg_by_tag,
+            lb_avg_by_tag,
+            hours_count_by_tag,
+            window_start,
+            window_end,
+        )
+
+    def _current_rolling_12hr_lbhr_by_ppm_tag(self) -> Dict[str, float]:
+        """Live rolling 12-hr lb/hr per lb/hr-capable ppm tag.
+
+        Keys are the resolved ppm tags themselves (same shape as
+        _current_hour_lbhr_by_ppm_tag). The lb/hr value is the mean of the
+        per-hour lb/hr aggregates over the 12-hour window, including the
+        in-progress hour computed from the live accumulator.
+        """
+        if not self.epa_enabled:
+            return {}
+        capable = self._epa_lbhr_capable_ppm_tags()
+        if not capable:
+            return {}
+        _, lb_avg_by_tag, _, _, _ = self._compute_live_rolling_12hr()
+        result: Dict[str, float] = {}
+        for ppm_tag in capable:
+            lb_val = lb_avg_by_tag.get(ppm_tag)
+            if self._is_valid_number(lb_val):
+                result[ppm_tag] = float(lb_val)
+        return result
+
+    def _write_live_rolling_12hr_snapshot(self) -> None:
+        """Persist the live rolling 12-hr snapshot so CIPMonitor.py can display it."""
+        try:
+            (
+                avg_by_tag,
+                lb_avg_by_tag,
+                hours_count_by_tag,
+                window_start,
+                window_end,
+            ) = self._compute_live_rolling_12hr()
+        except Exception as e:
+            self.log_message(f"Error computing live rolling 12-hour snapshot: {e}")
+            return
+
+        if not avg_by_tag:
+            return
+
+        # window_end on the live snapshot is 'now' so the dashboard can recognise
+        # it as fresher than the last completed-hour record in the historical CSV.
+        live_window_end = datetime.now()
+        live_window_start = live_window_end - timedelta(hours=12)
+        ws_iso = (window_start or live_window_start).isoformat(timespec="seconds")
+        we_iso = live_window_end.isoformat(timespec="seconds")
+
+        try:
+            ensure_csv(
+                self.live_rolling_12hr_csv_path,
+                [
+                    "window_start",
+                    "window_end",
+                    "tag",
+                    "alias",
+                    "avg_value",
+                    "avg_lb_hr",
+                    "hours_count",
+                    "generated_at",
+                ],
+            )
+            if self._is_export_locked():
+                # Skip writes while an export is in progress; the next poll will
+                # rewrite the snapshot.
+                return
+            tmp_path = self.live_rolling_12hr_csv_path + ".tmp"
+            with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "window_start",
+                        "window_end",
+                        "tag",
+                        "alias",
+                        "avg_value",
+                        "avg_lb_hr",
+                        "hours_count",
+                        "generated_at",
+                    ]
+                )
+                for tag in sorted(avg_by_tag.keys()):
+                    avg = avg_by_tag.get(tag)
+                    lb_avg = lb_avg_by_tag.get(tag)
+                    alias = self.alias_map.get(tag, "")
+                    writer.writerow(
+                        [
+                            ws_iso,
+                            we_iso,
+                            tag,
+                            alias,
+                            "" if avg is None else avg,
+                            "" if lb_avg is None else lb_avg,
+                            int(hours_count_by_tag.get(tag, 0)),
+                            we_iso,
+                        ]
+                    )
+            os.replace(tmp_path, self.live_rolling_12hr_csv_path)
+        except Exception as e:
+            self.log_message(f"Error writing live rolling 12-hour snapshot: {e}")
+
     def finalize_previous_hour(self):
         """Compute averages for tags in the previous hour and write to hourly CSV."""
         if self.current_hour_start is None or not self.hour_accumulators:
@@ -4009,7 +4440,7 @@ class MainWindow(QMainWindow):
                     reader = csv.DictReader(f)
                     for row in reader:
                         tag = row.get("tag", "")
-                        if tag.startswith("EPA19:"):
+                        if not tag:
                             continue
                         key = (row["hour_start"], tag)
                         records[key] = (
@@ -4024,7 +4455,7 @@ class MainWindow(QMainWindow):
         if self._pending_hourly_records:
             records.update(self._pending_hourly_records)
 
-        ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
+        lbhr_capable = self._epa_lbhr_capable_ppm_tags()
         avg_lookup: Dict[str, float] = {}
         for tag, acc in self.hour_accumulators.items():
             if acc["count"] <= 0:
@@ -4043,7 +4474,7 @@ class MainWindow(QMainWindow):
             existing = records.get(key)
             existing_lb_hr = existing[2] if existing else None
             lbhr_avg = existing_lb_hr
-            if tag in ppm_to_lbhr:
+            if tag in lbhr_capable:
                 derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
                 if derived_lbhr is not None:
                     lbhr_avg = derived_lbhr
@@ -4150,7 +4581,7 @@ class MainWindow(QMainWindow):
                             continue
 
                         tag = row.get("tag", "")
-                        if not tag or tag.startswith("EPA19:"):
+                        if not tag:
                             continue
                         alias = str(row.get("alias", "") or "").strip()
                         if alias:
@@ -4199,8 +4630,8 @@ class MainWindow(QMainWindow):
             )
             return
 
-        ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
-        if ppm_to_lbhr:
+        lbhr_capable = self._epa_lbhr_capable_ppm_tags()
+        if lbhr_capable:
             avg_by_hour: Dict[str, Dict[str, float]] = {}
             for (hstart_iso, tag), (_, avg, _, _, _) in records.items():
                 if avg is None:
@@ -4208,7 +4639,7 @@ class MainWindow(QMainWindow):
                 avg_by_hour.setdefault(hstart_iso, {})[tag] = avg
 
             for (hstart_iso, tag), (hend_iso, avg, lbhr_avg, count, alias) in list(records.items()):
-                if tag not in ppm_to_lbhr:
+                if tag not in lbhr_capable:
                     continue
                 if lbhr_avg is None:
                     avg_lookup = avg_by_hour.get(hstart_iso, {})
@@ -4260,20 +4691,17 @@ class MainWindow(QMainWindow):
             | Rolling 12 Hr Avg | Rolling 12 Hr Avg (lb/hr) | QA Flag
         """
         if self.tag_order:
-            tags = [t for t in self.tag_order if not t.startswith("EPA19:")]
+            tags = list(self.tag_order)
         else:
             tags = sorted(
-                t for t in (
-                    set(self.current_values.keys())
-                    | set(self.last_hour_avg.keys())
-                    | set(self.current_hour_preview.keys())
-                    | set(self.rolling_12hr_avg.keys())
-                    | set(self.rolling_12hr_lbhr_avg.keys())
-                )
-                if not t.startswith("EPA19:")
+                set(self.current_values.keys())
+                | set(self.last_hour_avg.keys())
+                | set(self.current_hour_preview.keys())
+                | set(self.rolling_12hr_avg.keys())
+                | set(self.rolling_12hr_lbhr_avg.keys())
             )
 
-        ppm_to_lbhr = self._epa_ppm_to_lbhr_map()
+        lbhr_capable = self._epa_lbhr_capable_ppm_tags()
         self.table.setRowCount(len(tags))
         self.rows_summary_label.setText(f"Rows: {len(tags)}")
 
@@ -4290,10 +4718,9 @@ class MainWindow(QMainWindow):
             last_avg = self.last_hour_avg.get(tag, "")
             cur_avg = self.current_hour_preview.get(tag, "")
             roll_avg = self.rolling_12hr_avg.get(tag, "")
-            lbhr_tag = ppm_to_lbhr.get(tag)
             lbhr_last_avg = ""
             lbhr_cur_avg = ""
-            if tag in ppm_to_lbhr:
+            if tag in lbhr_capable:
                 derived_last = self._compute_lbhr_from_avg(tag, last_avg_lookup)
                 if derived_last is not None:
                     lbhr_last_avg = derived_last
@@ -4301,8 +4728,6 @@ class MainWindow(QMainWindow):
                 if derived_cur is not None:
                     lbhr_cur_avg = derived_cur
             lbhr_roll_avg = self.rolling_12hr_lbhr_avg.get(tag, "")
-            if lbhr_tag and not self._is_valid_number(lbhr_roll_avg):
-                lbhr_roll_avg = self.rolling_12hr_avg.get(lbhr_tag, "")
 
             alias = self.alias_map.get(tag, "")
 

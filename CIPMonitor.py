@@ -91,6 +91,7 @@ LOG_DIR = "logs"
 MINUTE_CSV = os.path.join(LOG_DIR, "minute_averages.csv")
 HOURLY_CSV = os.path.join(LOG_DIR, "hourly_averages.csv")
 ROLLING_12HR_CSV = os.path.join(LOG_DIR, "rolling_12hr_averages.csv")
+LIVE_ROLLING_12HR_CSV = os.path.join(LOG_DIR, "rolling_12hr_live.csv")
 RAW_CSV_PREFIX = "raw_data_"
 THRESHOLDS_JSON = os.path.join(LOG_DIR, "thresholds.json")
 SETTINGS_JSON = "settings.json"  # optional: to discover tags before any data
@@ -752,6 +753,21 @@ def _compute_total_weight(
     tag: Optional[str],
     processing_hour_starts: Optional[set] = None,
 ) -> Optional[float]:
+    """Sum hourly avg_lb_hr for a tag to get total mass (lb) over the window.
+
+    Each hour's avg_lb_hr is a mass rate; multiplying by 1 hour of duration
+    yields lb, so the simple sum of avg_lb_hr across hours equals total lb
+    for the window.
+
+    When ``processing_hour_starts`` is provided, only hours whose hour_start
+    is in that set are summed -- this restricts the total to hours when the
+    machine had any processing activity. The set must contain
+    ``pandas.Timestamp`` objects (NOT formatted strings); the hour_start
+    column on the DataFrame is also Timestamp dtype, and Timestamp-to-
+    Timestamp comparison via ``isin`` avoids the string-format mismatch
+    that previously zeroed the totals (CSV stored "T" separator, pandas
+    str() emits a space separator).
+    """
     if not tag or hourly_range is None or hourly_range.empty:
         return None
     tag_series = hourly_range.loc[hourly_range["tag"] == tag]
@@ -760,12 +776,10 @@ def _compute_total_weight(
     if processing_hour_starts is not None:
         if "hour_start" not in tag_series.columns:
             return None
-        tag_series = tag_series.loc[tag_series["hour_start"].astype(str).isin(processing_hour_starts)]
+        tag_series = tag_series.loc[tag_series["hour_start"].isin(processing_hour_starts)]
         if tag_series.empty:
             return None
     values = tag_series.get("avg_lb_hr")
-    if values is None:
-        values = tag_series.get("avg_value")
     if values is None:
         return None
     values = pd.to_numeric(values, errors="coerce").dropna()
@@ -1726,6 +1740,70 @@ def load_rolling_12hr_stats() -> pd.DataFrame:
     return df
 
 
+def load_live_rolling_12hr_stats() -> pd.DataFrame:
+    """Load the live rolling 12-hour snapshot (CIP.py overwrites this each poll).
+
+    Schema is the same as the historical rolling CSV plus a `generated_at` column.
+    Returns an empty DataFrame if the file does not exist or cannot be parsed.
+    """
+    columns = [
+        "window_start",
+        "window_end",
+        "tag",
+        "alias",
+        "avg_value",
+        "avg_lb_hr",
+        "hours_count",
+        "generated_at",
+    ]
+    if not os.path.exists(LIVE_ROLLING_12HR_CSV):
+        return pd.DataFrame(columns=columns)
+    try:
+        df = pd.read_csv(LIVE_ROLLING_12HR_CSV)
+    except Exception:
+        return pd.DataFrame(columns=columns)
+
+    if "alias" not in df.columns:
+        df["alias"] = None
+    for c in ["window_start", "window_end", "generated_at"]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+    for c in ["avg_value", "avg_lb_hr", "hours_count"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def merge_live_rolling_12hr(
+    rolling_df: pd.DataFrame, live_df: pd.DataFrame
+) -> pd.DataFrame:
+    """Combine the historical rolling 12-hr CSV with the live snapshot.
+
+    The live snapshot represents the in-progress 12-hr window (current partial
+    hour included). Where it overlaps the historical record we keep the live
+    row so the dashboard reflects the value being written to the PLC right now.
+    """
+    if live_df is None or live_df.empty:
+        return rolling_df
+    historical_cols = [
+        "window_start",
+        "window_end",
+        "tag",
+        "alias",
+        "avg_value",
+        "avg_lb_hr",
+        "hours_count",
+    ]
+    live_subset = live_df[[c for c in historical_cols if c in live_df.columns]].copy()
+    if rolling_df is None or rolling_df.empty:
+        return live_subset
+
+    combined = pd.concat([rolling_df, live_subset], ignore_index=True, sort=False)
+    if "window_end" in combined.columns:
+        combined = combined.sort_values("window_end")
+    return combined
+
+
 def load_env_events() -> pd.DataFrame:
     """Load environmental / data quality events (including DATA_GAP)."""
     if not os.path.exists(ENV_EVENTS_CSV):
@@ -2516,6 +2594,71 @@ def compute_processing_time_minutes(
     return current_hour_minutes, today_total_minutes
 
 
+# Cache for all-time processing total. Recomputing across every raw_data_*.csv
+# is O(GB) of disk I/O; the value changes slowly enough that a 5-minute TTL
+# keeps the dashboard responsive without misleading the operator.
+_ALL_TIME_PROC_CACHE: Dict[str, object] = {
+    "value_minutes": None,
+    "computed_at": 0.0,
+    "ttl_sec": 300.0,
+    "machine_state_tag": None,
+}
+
+
+def compute_all_time_processing_minutes(machine_state_tag: str) -> Optional[float]:
+    """Total processing minutes across every raw_data_*.csv in the log dir.
+
+    Cached for ``_ALL_TIME_PROC_CACHE['ttl_sec']`` seconds. Returns None if
+    no machine state tag is configured or no raw history exists. Cache is
+    invalidated when the configured machine state tag changes.
+    """
+    import time as _time
+    if not machine_state_tag:
+        return None
+
+    now_ts = _time.time()
+    cached_tag = _ALL_TIME_PROC_CACHE.get("machine_state_tag")
+    cached_val = _ALL_TIME_PROC_CACHE.get("value_minutes")
+    age = now_ts - float(_ALL_TIME_PROC_CACHE.get("computed_at", 0.0))
+    ttl = float(_ALL_TIME_PROC_CACHE.get("ttl_sec", 300.0))
+    if (
+        cached_val is not None
+        and cached_tag == machine_state_tag
+        and age < ttl
+    ):
+        return float(cached_val)
+
+    # Cache miss / stale -- recompute. max_days large enough to cover any
+    # reasonable deployment lifetime; load_raw_history filters by file date.
+    try:
+        raw_history = load_raw_history(max_days=3650)
+    except Exception:
+        return cached_val if cached_val is not None else None
+    if raw_history is None or raw_history.empty:
+        return None
+
+    if "timestamp" in raw_history.columns:
+        try:
+            ts_min = pd.to_datetime(raw_history["timestamp"], errors="coerce").min()
+            ts_max = pd.to_datetime(raw_history["timestamp"], errors="coerce").max()
+        except Exception:
+            ts_min = ts_max = None
+    else:
+        ts_min = ts_max = None
+    if pd.isna(ts_min) or pd.isna(ts_max):
+        return None
+
+    stats = compute_processing_time_range(
+        raw_history, machine_state_tag, ts_min, ts_max + timedelta(seconds=1)
+    )
+    total = float(stats.get("total_minutes", 0.0) or 0.0)
+
+    _ALL_TIME_PROC_CACHE["value_minutes"] = total
+    _ALL_TIME_PROC_CACHE["computed_at"] = now_ts
+    _ALL_TIME_PROC_CACHE["machine_state_tag"] = machine_state_tag
+    return total
+
+
 def compute_processing_time_range(
     raw_df: pd.DataFrame,
     machine_state_tag: str,
@@ -2546,7 +2689,9 @@ def compute_processing_time_range(
     Returns dict:
         total_minutes           -- precise processing minutes in range
         total_hours             -- total_minutes / 60
-        hour_starts_with_any    -- set of hour_start ISO strings (for weight filtering)
+        hour_starts_with_any    -- set of pandas.Timestamp hour-floored values
+                                   (for weight filtering; comparable directly
+                                   against the parsed hour_start column)
         capped_gap_count        -- number of gaps that hit the cap (data-gap indicator)
         sample_count            -- number of OK state samples examined
     """
@@ -2611,17 +2756,16 @@ def compute_processing_time_range(
     total_minutes = processing_seconds / 60.0
 
     # Which hours contained any processing time? Use the LATER sample's hour
-    # (i.e. the hour the gap ended in — consistent with how gaps are attributed)
+    # (i.e. the hour the gap ended in — consistent with how gaps are attributed).
+    # Stored as pandas.Timestamp objects so consumers can compare directly
+    # against the parsed-datetime hour_start columns in load_hourly_stats()
+    # without any string-format brittleness.
     hour_starts_with_any: set = set()
     if proc_mask.any():
         proc_rows = state_df.loc[proc_mask & (state_df["_dt"] > 0)]
         if not proc_rows.empty:
             hour_starts = proc_rows["timestamp"].dt.floor("h")
-            hour_starts_with_any = set(
-                hs.isoformat(timespec="seconds")
-                for hs in hour_starts.unique()
-                if pd.notna(hs)
-            )
+            hour_starts_with_any = {hs for hs in hour_starts.unique() if pd.notna(hs)}
 
     result["total_minutes"] = round(total_minutes, 2)
     result["total_hours"] = round(total_minutes / 60.0, 2)
@@ -3567,10 +3711,12 @@ def build_flow_card(
 def build_processing_time_card(
     current_hour_minutes: float,
     today_total_minutes: float,
+    all_time_total_minutes: Optional[float] = None,
 ) -> html.Div:
     """
     Build a gauge card showing processing time for the current hour.
-    Gauge runs 0–60 minutes. Footer shows today's total processing time.
+    Gauge runs 0–60 minutes. Below the gauge: today's total (prominent),
+    then all-time total across every raw_data_*.csv (secondary).
     """
     # Gauge range is fixed: 0 to 60 minutes (one full hour)
     gmin = 0
@@ -3596,13 +3742,40 @@ def build_processing_time_card(
         value_label = "—"
         value = 0
 
-    # Footer: today's total
+    # Today total (prominent)
     has_today = isinstance(today_total_minutes, (int, float)) and today_total_minutes == today_total_minutes
     if has_today:
-        total_hrs = today_total_minutes / 60.0
-        footer_text = f"Today total: {today_total_minutes:.1f} min ({total_hrs:.1f} hrs)"
+        today_hrs = today_total_minutes / 60.0
+        today_text = f"Today: {today_hrs:.2f} hrs ({today_total_minutes:.1f} min)"
     else:
-        footer_text = "Today total: no data"
+        today_text = "Today: no data"
+
+    # All-time total (secondary)
+    has_all_time = (
+        isinstance(all_time_total_minutes, (int, float))
+        and all_time_total_minutes == all_time_total_minutes
+    )
+    if has_all_time:
+        all_time_hrs = all_time_total_minutes / 60.0
+        all_time_text = f"All time: {all_time_hrs:.2f} hrs"
+    else:
+        all_time_text = "All time: no data"
+
+    today_style = {
+        "fontSize": "14px",
+        "fontWeight": "600",
+        "color": COLOR_TEXT_PRIMARY,
+        "borderTop": f"1px solid {COLOR_BORDER}",
+        "paddingTop": "8px",
+        "marginTop": "2px",
+        "textAlign": "center",
+    }
+    all_time_style = {
+        "fontSize": "11px",
+        "color": COLOR_TEXT_MUTED,
+        "paddingTop": "4px",
+        "textAlign": "center",
+    }
 
     card_style = {
         **CARD_STYLE,
@@ -3633,7 +3806,8 @@ def build_processing_time_card(
                     ),
                 ],
             ),
-            html.Div(footer_text, style=CARD_FOOTER_STYLE),
+            html.Div(today_text, style=today_style),
+            html.Div(all_time_text, style=all_time_style),
         ],
     )
 
@@ -5272,18 +5446,20 @@ def update_dashboard(n):
         raw_df = load_latest_raw_df()
         hourly_df = load_hourly_stats()
         rolling_df = load_rolling_12hr_stats()
+        live_rolling_df = load_live_rolling_12hr_stats()
+        rolling_combined_df = merge_live_rolling_12hr(rolling_df, live_rolling_df)
         thresholds = load_thresholds()
         config_version = compute_config_version_text()
         alias_map = build_alias_lookup(
             raw_df,
             hourly_df,
-            rolling_df,
+            rolling_combined_df,
             load_alias_map_from_settings(),
         )
 
         _, _, last_ts = extract_raw_stats(raw_df)
         last_full_hour_stats = extract_last_full_hour(hourly_df)
-        rolling_12hr_stats = extract_latest_rolling_12hr(rolling_df)
+        rolling_12hr_stats = extract_latest_rolling_12hr(rolling_combined_df)
 
         epa_settings = load_epa_settings()
         current_hour_lb_hr = {
@@ -5340,8 +5516,9 @@ def update_dashboard(n):
             current_hr_proc, today_proc = compute_processing_time_minutes(
                 raw_df, machine_state_tag
             )
+            all_time_proc = compute_all_time_processing_minutes(machine_state_tag)
             cards.append(
-                build_processing_time_card(current_hr_proc, today_proc)
+                build_processing_time_card(current_hr_proc, today_proc, all_time_proc)
             )
             processing_is_running = (
                 isinstance(current_hr_proc, (int, float))

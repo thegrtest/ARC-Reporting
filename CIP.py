@@ -4076,10 +4076,14 @@ class MainWindow(QMainWindow):
             count_by_tag[tag] = hours_count
 
         avg_lookup = {k: v for k, v in avg_by_tag.items() if v is not None}
+        lbhr_capable = self._epa_lbhr_capable_ppm_tags()
 
         for tag, avg_val in avg_by_tag.items():
             lb_avg = lb_avg_by_tag.get(tag)
-            if lb_avg is None:
+            # Only derive lb/hr for lb/hr-capable tags (NOx, CO). O2 and Flow
+            # would otherwise pick up the legacy "mass rate of diluent"
+            # value, which is not a meaningful emission metric.
+            if lb_avg is None and tag in lbhr_capable:
                 derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
                 if derived_lbhr is not None:
                     lb_avg = derived_lbhr
@@ -4142,6 +4146,7 @@ class MainWindow(QMainWindow):
         latest_avg: Dict[str, float] = {}
         latest_lbhr: Dict[str, float] = {}
         alias_lookup = {tag: alias for (_, tag), (_, _, _, _, alias) in records.items() if alias}
+        lbhr_capable = self._epa_lbhr_capable_ppm_tags()
 
         for tag, entries in tag_entries.items():
             entries.sort(key=lambda item: item[0])
@@ -4162,7 +4167,10 @@ class MainWindow(QMainWindow):
                     continue
                 avg_val = sum(values) / hours_count
                 lb_avg = sum(lb_values) / len(lb_values) if lb_values else None
-                if lb_avg is None:
+                # Only derive lb/hr for lb/hr-capable tags (NOx/CO). O2 and
+                # Flow rows must keep avg_lb_hr empty -- O2 is the diluent,
+                # not an emission.
+                if lb_avg is None and tag in lbhr_capable:
                     avg_lookup = {tag: avg_val}
                     flow_tag = self._resolve_tag_from_alias(self.epa_flow_tag)
                     flow_avg = self._rolling_avg_for_tag(
@@ -4304,12 +4312,18 @@ class MainWindow(QMainWindow):
             if lb_values:
                 lb_avg_by_tag[tag] = sum(lb_values) / len(lb_values)
 
-        # Derive lb/hr from the rolling averages for any EPA-derivable pollutant
-        # tag that does not already have a direct lb/hr aggregate.
-        if self.epa_enabled:
+        # Derive lb/hr from the rolling averages for any lb/hr-capable
+        # pollutant tag (NOx/CO) that does not already have a direct lb/hr
+        # aggregate. Restricting to lbhr_capable matches the in-progress hour
+        # logic above and prevents the legacy "lb/hr of O2" value (O2 is the
+        # diluent, not an emission) from leaking into the snapshot CSV or the
+        # dashboard.
+        if lbhr_capable:
             rolling_lookup = dict(avg_by_tag)
-            for tag in list(avg_by_tag.keys()):
+            for tag in lbhr_capable:
                 if tag in lb_avg_by_tag:
+                    continue
+                if tag not in avg_by_tag:
                     continue
                 derived = self._compute_lbhr_from_avg(tag, rolling_lookup)
                 if derived is not None:
@@ -4360,6 +4374,22 @@ class MainWindow(QMainWindow):
 
         if not avg_by_tag:
             return
+
+        # Mirror the live values into the in-memory dicts the desktop dashboard
+        # table reads from. Without this update the table would display the
+        # last completed-hour value (set only by _update_rolling_12hr_from_records
+        # at hour rollover) while the writeback thread sends the live value
+        # including the in-progress hour -- the two would drift throughout
+        # every hour and diverge from the live CSV snapshot CIPMonitor.py
+        # consumes. Keeping these dicts in sync ensures the desktop table,
+        # the live snapshot CSV, the PLC writeback value, and CIPMonitor.py's
+        # gauge cards all show the same number.
+        self.rolling_12hr_avg = {
+            tag: float(v) for tag, v in avg_by_tag.items() if self._is_valid_number(v)
+        }
+        self.rolling_12hr_lbhr_avg = {
+            tag: float(v) for tag, v in lb_avg_by_tag.items() if self._is_valid_number(v)
+        }
 
         # window_end on the live snapshot is 'now' so the dashboard can recognise
         # it as fresher than the last completed-hour record in the historical CSV.

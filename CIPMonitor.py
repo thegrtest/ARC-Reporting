@@ -147,6 +147,25 @@ ROLLING_AVG_HEADERS = [
     "hours_count",
 ]
 
+# EPA Method 19 constants used by the manual-calculation worksheet export.
+EPA19_NOX_MOLECULAR_WEIGHT = 46.0   # NOx as NO2 (lb/lb-mol)
+EPA19_MOLAR_VOLUME_DSCF = 385.8     # SCF/lb-mol at 68 F, 14.696 psia
+NOX_CALC_HEADERS = [
+    "period_start",
+    "period_end",
+    "nox_tag",
+    "nox_alias",
+    "nox_ppm",
+    "flow_tag",
+    "flow_alias",
+    "flow_dscfm",
+    "mw_no2_lb_per_lbmol",
+    "molar_volume_dscf_per_lbmol",
+    "calc_formula",
+    "nox_lb_per_hr",
+    "sample_count",
+]
+
 REFRESH_MS = 5000  # dashboard refresh interval (ms)
 
 # Default regulatory permit limits (lb/hr) for CEMS pollutants.
@@ -549,6 +568,214 @@ def build_raw_time_range_export_payload(range_key: str):
     if not os.path.exists(output_path):
         return None
     return dcc.send_file(output_path, filename=f"{range_key}_raw_data.csv")
+
+
+def _resolve_nox_and_flow_tags(alias_map: Dict[str, str]) -> Tuple[str, str]:
+    """Return (nox_tag, flow_tag) using EPA settings first, then alias patterns."""
+    epa_settings = load_epa_settings()
+    nox_tag = str(epa_settings.get("epa_nox_tag", "") or "")
+    flow_tag = str(epa_settings.get("epa_flow_tag", "") or "")
+
+    if not nox_tag or not flow_tag:
+        nox_pattern = [re.compile(r"\bnox\b|no[_\s-]?x", re.IGNORECASE)]
+        flow_pattern = [re.compile(r"\bflow\b|dscfm|scfm", re.IGNORECASE)]
+        synthetic = pd.DataFrame({"tag": list(alias_map.keys())})
+        if not nox_tag:
+            nox_tag = _find_tag_by_patterns(synthetic, alias_map, nox_pattern)
+        if not flow_tag:
+            flow_tag = _find_tag_by_patterns(synthetic, alias_map, flow_pattern)
+    return nox_tag, flow_tag
+
+
+def _nox_calc_lb_per_hr(nox_ppm: Optional[float], flow_dscfm: Optional[float]) -> Optional[float]:
+    if nox_ppm is None or flow_dscfm is None:
+        return None
+    try:
+        return (
+            float(nox_ppm)
+            * float(flow_dscfm)
+            * 60.0
+            * EPA19_NOX_MOLECULAR_WEIGHT
+            / (1_000_000.0 * EPA19_MOLAR_VOLUME_DSCF)
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_nox_calc_rows_from_aggregated(
+    source_path: str,
+    start_col: str,
+    end_col: str,
+    count_col: str,
+    nox_tag: str,
+    flow_tag: str,
+    alias_map: Dict[str, str],
+    start: datetime,
+    end: datetime,
+) -> pd.DataFrame:
+    if not os.path.exists(source_path):
+        return pd.DataFrame(columns=NOX_CALC_HEADERS)
+
+    df = pd.read_csv(source_path)
+    if df.empty or "tag" not in df.columns:
+        return pd.DataFrame(columns=NOX_CALC_HEADERS)
+
+    df[end_col] = pd.to_datetime(df.get(end_col), errors="coerce")
+    df[start_col] = pd.to_datetime(df.get(start_col), errors="coerce")
+    df = _filter_time_range(df, end_col, start, end)
+    if df.empty:
+        return pd.DataFrame(columns=NOX_CALC_HEADERS)
+
+    nox_df = df.loc[df["tag"] == nox_tag, [start_col, end_col, "avg_value", count_col]].copy()
+    flow_df = df.loc[df["tag"] == flow_tag, [end_col, "avg_value"]].copy()
+    nox_df = nox_df.rename(columns={"avg_value": "nox_ppm", count_col: "sample_count"})
+    flow_df = flow_df.rename(columns={"avg_value": "flow_dscfm"})
+
+    merged = nox_df.merge(flow_df, on=end_col, how="left")
+    if merged.empty:
+        return pd.DataFrame(columns=NOX_CALC_HEADERS)
+
+    nox_alias = alias_map.get(nox_tag, "") if nox_tag else ""
+    flow_alias = alias_map.get(flow_tag, "") if flow_tag else ""
+
+    merged["nox_lb_per_hr"] = [
+        _nox_calc_lb_per_hr(p, f) for p, f in zip(merged["nox_ppm"], merged["flow_dscfm"])
+    ]
+    merged["nox_tag"] = nox_tag
+    merged["nox_alias"] = nox_alias
+    merged["flow_tag"] = flow_tag
+    merged["flow_alias"] = flow_alias
+    merged["mw_no2_lb_per_lbmol"] = EPA19_NOX_MOLECULAR_WEIGHT
+    merged["molar_volume_dscf_per_lbmol"] = EPA19_MOLAR_VOLUME_DSCF
+    merged["calc_formula"] = "nox_ppm * flow_dscfm * 60 * 46.0 / (1e6 * 385.8)"
+    merged = merged.rename(columns={start_col: "period_start", end_col: "period_end"})
+    merged = merged.sort_values("period_end")
+    return merged.reindex(columns=NOX_CALC_HEADERS)
+
+
+def _build_nox_calc_rows_from_raw(
+    nox_tag: str,
+    flow_tag: str,
+    alias_map: Dict[str, str],
+    start: datetime,
+    end: datetime,
+) -> pd.DataFrame:
+    source_paths = _get_raw_daily_paths_for_range(start, end)
+    if not source_paths:
+        return pd.DataFrame(columns=NOX_CALC_HEADERS)
+
+    frames: List[pd.DataFrame] = []
+    for path in source_paths:
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+        if df.empty or "tag" not in df.columns or "timestamp" not in df.columns:
+            continue
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame(columns=NOX_CALC_HEADERS)
+
+    raw = pd.concat(frames, ignore_index=True)
+    raw["timestamp"] = pd.to_datetime(raw["timestamp"], errors="coerce")
+    raw = _filter_time_range(raw, "timestamp", start, end)
+    if raw.empty:
+        return pd.DataFrame(columns=NOX_CALC_HEADERS)
+
+    if "status" in raw.columns:
+        raw = raw.loc[raw["status"].astype(str).str.lower() == "success"]
+
+    nox_rows = raw.loc[raw["tag"] == nox_tag, ["timestamp", "value"]].rename(columns={"value": "nox_ppm"})
+    flow_rows = raw.loc[raw["tag"] == flow_tag, ["timestamp", "value"]].rename(columns={"value": "flow_dscfm"})
+    if nox_rows.empty:
+        return pd.DataFrame(columns=NOX_CALC_HEADERS)
+
+    nox_rows["nox_ppm"] = pd.to_numeric(nox_rows["nox_ppm"], errors="coerce")
+    flow_rows["flow_dscfm"] = pd.to_numeric(flow_rows["flow_dscfm"], errors="coerce")
+
+    # Pair each NOx sample with the most recent flow sample at-or-before its timestamp.
+    nox_rows = nox_rows.sort_values("timestamp")
+    flow_rows = flow_rows.sort_values("timestamp")
+    merged = pd.merge_asof(nox_rows, flow_rows, on="timestamp", direction="backward")
+
+    merged["nox_lb_per_hr"] = [
+        _nox_calc_lb_per_hr(p, f) for p, f in zip(merged["nox_ppm"], merged["flow_dscfm"])
+    ]
+    merged["period_start"] = merged["timestamp"]
+    merged["period_end"] = merged["timestamp"]
+    merged["nox_tag"] = nox_tag
+    merged["nox_alias"] = alias_map.get(nox_tag, "") if nox_tag else ""
+    merged["flow_tag"] = flow_tag
+    merged["flow_alias"] = alias_map.get(flow_tag, "") if flow_tag else ""
+    merged["mw_no2_lb_per_lbmol"] = EPA19_NOX_MOLECULAR_WEIGHT
+    merged["molar_volume_dscf_per_lbmol"] = EPA19_MOLAR_VOLUME_DSCF
+    merged["calc_formula"] = "nox_ppm * flow_dscfm * 60 * 46.0 / (1e6 * 385.8)"
+    merged["sample_count"] = 1
+    return merged.reindex(columns=NOX_CALC_HEADERS)
+
+
+def build_nox_manual_calc_payload(granularity: str, range_key: str):
+    """Build a NOx-only worksheet (ppm + flow + computed lb/hr) as CSV.
+
+    granularity: "raw" | "minute" | "hourly". Raw pairs each NOx sample
+    with the most recent flow sample (asof backward merge); minute/hourly
+    use the corresponding aggregated CSV and join on the period end.
+    """
+    _, start, end = _get_report_range(range_key)
+    alias_map = load_alias_map_from_settings()
+    nox_tag, flow_tag = _resolve_nox_and_flow_tags(alias_map)
+    if not nox_tag or not flow_tag:
+        return None
+
+    _write_export_lock()
+    try:
+        if granularity == "raw":
+            rows = _build_nox_calc_rows_from_raw(
+                nox_tag, flow_tag, alias_map, start, end
+            )
+        elif granularity == "minute":
+            rows = _build_nox_calc_rows_from_aggregated(
+                MINUTE_CSV,
+                "minute_start",
+                "minute_end",
+                "sample_count",
+                nox_tag,
+                flow_tag,
+                alias_map,
+                start,
+                end,
+            )
+        elif granularity == "hourly":
+            rows = _build_nox_calc_rows_from_aggregated(
+                HOURLY_CSV,
+                "hour_start",
+                "hour_end",
+                "sample_count",
+                nox_tag,
+                flow_tag,
+                alias_map,
+                start,
+                end,
+            )
+        else:
+            return None
+
+        if rows is None or rows.empty:
+            return None
+
+        ensure_dir(EXPORT_TMP_DIR)
+        output_name = f"{range_key}_nox_manual_calc_{granularity}.csv"
+        output_path = os.path.join(
+            EXPORT_TMP_DIR,
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}_{output_name}",
+        )
+        rows.to_csv(output_path, index=False)
+    finally:
+        _clear_export_lock()
+
+    if not os.path.exists(output_path):
+        return None
+    return dcc.send_file(output_path, filename=output_name)
 
 
 def build_export_payload(path: str, headers: List[str], filename: str):
@@ -4532,6 +4759,9 @@ app.layout = html.Div(
         dcc.Download(id="export-range-minute-download"),
         dcc.Download(id="export-range-hourly-download"),
         dcc.Download(id="export-range-rolling-download"),
+        dcc.Download(id="export-nox-calc-raw-download"),
+        dcc.Download(id="export-nox-calc-minute-download"),
+        dcc.Download(id="export-nox-calc-hourly-download"),
         dcc.Download(id="report-today-download"),
         dcc.Download(id="report-week-download"),
         dcc.Download(id="report-month-download"),
@@ -4823,6 +5053,56 @@ app.layout = html.Div(
                                         dcc.Loading(
                                             children=html.Div(
                                                 id="export-range-status",
+                                                style={
+                                                    "marginTop": "8px",
+                                                    "fontSize": "11px",
+                                                    "color": COLOR_TEXT_MUTED,
+                                                },
+                                            ),
+                                        ),
+                                    ],
+                                ),
+                                html.Div(
+                                    style=CARD_STYLE,
+                                    children=[
+                                        html.Div(
+                                            "NOx Manual Calculation Worksheet (CSV)",
+                                            style=EXPORT_SECTION_TITLE_STYLE,
+                                        ),
+                                        html.Div(
+                                            "NOx-only export with ppm and gas flow on the same row "
+                                            "for manual EPA Method 19 verification. Includes the "
+                                            "MW (46.0), molar volume (385.8 dscf/lb-mol), and the "
+                                            "computed lb/hr alongside the inputs. Uses the "
+                                            "time-range selected above.",
+                                            style=EXPORT_SECTION_HELP_STYLE,
+                                        ),
+                                        html.Div(
+                                            style=EXPORT_BUTTON_ROW_STYLE,
+                                            children=[
+                                                html.Button(
+                                                    "Raw (per sample)",
+                                                    id="export-nox-calc-raw-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "Minute Averages",
+                                                    id="export-nox-calc-minute-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                                html.Button(
+                                                    "Hourly Averages",
+                                                    id="export-nox-calc-hourly-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                            ],
+                                        ),
+                                        dcc.Loading(
+                                            children=html.Div(
+                                                id="export-nox-calc-status",
                                                 style={
                                                     "marginTop": "8px",
                                                     "fontSize": "11px",
@@ -5152,6 +5432,68 @@ def export_time_range_data_exports(
             f"Rolling 12 hour export requested for {selected_range}. Preparing your download now.",
         )
     return no_update, no_update, no_update, no_update, no_update
+
+
+@app.callback(
+    Output("export-nox-calc-raw-download", "data"),
+    Output("export-nox-calc-minute-download", "data"),
+    Output("export-nox-calc-hourly-download", "data"),
+    Output("export-nox-calc-status", "children"),
+    Input("export-nox-calc-raw-btn", "n_clicks"),
+    Input("export-nox-calc-minute-btn", "n_clicks"),
+    Input("export-nox-calc-hourly-btn", "n_clicks"),
+    State("export-range-dropdown", "value"),
+    prevent_initial_call=True,
+)
+def export_nox_manual_calc(_raw_clicks, _minute_clicks, _hourly_clicks, range_key):
+    selected_range = range_key or "month"
+    trigger = ctx.triggered_id
+    if trigger == "export-nox-calc-raw-btn":
+        payload = build_nox_manual_calc_payload("raw", selected_range)
+        if payload is None:
+            return (
+                no_update,
+                no_update,
+                no_update,
+                f"No NOx samples found for {selected_range}, or NOx/flow tags are not configured.",
+            )
+        return (
+            payload,
+            no_update,
+            no_update,
+            f"NOx manual-calc (raw) export requested for {selected_range}. Preparing your download now.",
+        )
+    if trigger == "export-nox-calc-minute-btn":
+        payload = build_nox_manual_calc_payload("minute", selected_range)
+        if payload is None:
+            return (
+                no_update,
+                no_update,
+                no_update,
+                f"No NOx minute averages found for {selected_range}, or NOx/flow tags are not configured.",
+            )
+        return (
+            no_update,
+            payload,
+            no_update,
+            f"NOx manual-calc (minute) export requested for {selected_range}. Preparing your download now.",
+        )
+    if trigger == "export-nox-calc-hourly-btn":
+        payload = build_nox_manual_calc_payload("hourly", selected_range)
+        if payload is None:
+            return (
+                no_update,
+                no_update,
+                no_update,
+                f"No NOx hourly averages found for {selected_range}, or NOx/flow tags are not configured.",
+            )
+        return (
+            no_update,
+            no_update,
+            payload,
+            f"NOx manual-calc (hourly) export requested for {selected_range}. Preparing your download now.",
+        )
+    return no_update, no_update, no_update, no_update
 
 
 @app.callback(

@@ -2205,8 +2205,16 @@ class MainWindow(QMainWindow):
         self.calc_btn = QPushButton("Current Hour Avg")
         self.calc_btn.setObjectName("secondaryButton")
 
-        self.rebuild_btn = QPushButton("Rebuild Hourly CSV")
+        self.rebuild_btn = QPushButton("Rebuild Averages from Raw")
         self.rebuild_btn.setObjectName("secondaryButton")
+        self.rebuild_btn.setToolTip(
+            "Recompute minute_averages.csv, hourly_averages.csv, and "
+            "rolling_12hr_averages.csv from the raw_data_*.csv files. "
+            "Every cached avg_lb_hr value is overwritten using the "
+            "current simplified EPA Method 19 formula, so a re-run "
+            "retires any historical rows that were logged under the "
+            "older double-O2-correction formula."
+        )
 
         controls_layout.addWidget(self.start_btn)
         controls_layout.addWidget(self.stop_btn)
@@ -3987,18 +3995,18 @@ class MainWindow(QMainWindow):
                     if window_start <= entry[0] < window_end
                 ]
                 values = [val for _, val, _ in window_entries if self._is_valid_number(val)]
-                lb_values = [
-                    val for _, _, val in window_entries if self._is_valid_number(val)
-                ]
                 hours_count = len(values)
                 if hours_count <= 0:
                     continue
                 avg_val = sum(values) / hours_count
-                lb_avg = sum(lb_values) / len(lb_values) if lb_values else None
-                # Only derive lb/hr for lb/hr-capable tags (NOx/CO). O2 and
-                # Flow rows must keep avg_lb_hr empty -- O2 is the diluent,
-                # not an emission.
-                if lb_avg is None and tag in lbhr_capable:
+                lb_avg: Optional[float] = None
+                # For lb/hr-capable tags (NOx, CO) always derive the
+                # rolling 12-hr lb/hr fresh from the rolling ppm and flow
+                # averages instead of averaging cached per-hour values --
+                # cached values may have been written under the obsolete
+                # double-O2-correction formula. O2 and flow rows leave
+                # avg_lb_hr empty (O2 is the diluent, not an emission).
+                if tag in lbhr_capable:
                     avg_lookup = {tag: avg_val}
                     flow_tag = self._resolve_tag_from_alias(self.epa_flow_tag)
                     flow_avg = self._rolling_avg_for_tag(
@@ -4009,15 +4017,6 @@ class MainWindow(QMainWindow):
                     )
                     if flow_avg is not None:
                         avg_lookup[flow_tag] = flow_avg
-                    o2_tag = self._resolve_tag_from_alias(self.epa_o2_tag)
-                    o2_avg = self._rolling_avg_for_tag(
-                        tag_entries,
-                        o2_tag,
-                        window_start,
-                        window_end,
-                    )
-                    if o2_avg is not None:
-                        avg_lookup[o2_tag] = o2_avg
                     derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
                     if derived_lbhr is not None:
                         lb_avg = derived_lbhr
@@ -4383,9 +4382,20 @@ class MainWindow(QMainWindow):
         self.log_message("Computed current hour averages (display only).")
 
     def rebuild_hourly_from_raw(self):
-        """
-        Recompute all hourly averages from all raw_data_YYYY-MM-DD.csv
-        files in the log directory and rewrite hourly_averages.csv.
+        """Recompute minute, hourly, and rolling 12-hr averages from raw CSVs.
+
+        Re-derives every cached lb/hr value using the current simplified
+        EPA Method 19 formula (``_compute_lbhr_from_avg``) so historical
+        rows that were written under the obsolete double-O2-correction
+        formula get overwritten with correct mass rates. The rebuild
+        unconditionally replaces any existing avg_lb_hr value -- it does
+        not preserve the cached column -- so a re-run is the canonical
+        way to retire stale lb/hr numbers from disk.
+
+        Rebuilds three files in order: minute_averages.csv,
+        hourly_averages.csv, then rolling_12hr_averages.csv (via
+        ``_rebuild_rolling_12hr_from_records`` against the fresh hourly
+        records).
         """
         if not os.path.isdir(self.log_dir):
             QMessageBox.warning(
@@ -4416,9 +4426,14 @@ class MainWindow(QMainWindow):
             return
 
         self.log_message(
-            f"Rebuilding hourly averages from {len(raw_files)} raw data file(s)..."
+            f"Rebuilding minute, hourly, and rolling 12-hr averages "
+            f"from {len(raw_files)} raw data file(s)..."
         )
         records: Dict[
+            Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]
+        ] = {}
+        # (minute_start_iso, tag) -> (minute_end_iso, avg_value, avg_lb_hr, count, alias)
+        minute_records: Dict[
             Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]
         ] = {}
 
@@ -4461,12 +4476,26 @@ class MainWindow(QMainWindow):
                         acc["sum"] += val
                         acc["count"] += 1
 
+            # Per-minute averages keyed by minute_start_iso, used to
+            # populate minute_records and feed the hourly rollup.
+            minute_avg_by_minute: Dict[str, Dict[str, float]] = {}
+
             hour_buckets: Dict[Tuple[datetime, str], Dict[str, float]] = {}
             for (mstart, tag), acc in minute_buckets.items():
                 if acc["count"] <= 0:
                     continue
                 minute_avg = acc["sum"] / acc["count"]
                 minute_avg = self._apply_minute_cap(tag, minute_avg)
+
+                mstart_iso = mstart.isoformat(timespec="seconds")
+                mend_iso = (mstart + timedelta(minutes=1)).isoformat(timespec="seconds")
+                alias = alias_by_tag.get(tag, "") or self.alias_map.get(tag, "")
+                # avg_lb_hr filled below once all per-minute averages exist.
+                minute_records[(mstart_iso, tag)] = (
+                    mend_iso, minute_avg, None, int(acc["count"]), alias,
+                )
+                minute_avg_by_minute.setdefault(mstart_iso, {})[tag] = minute_avg
+
                 hstart = hour_bucket(mstart)
                 hour_key = (hstart, tag)
                 hour_acc = hour_buckets.setdefault(hour_key, {"sum": 0.0, "count": 0})
@@ -4489,29 +4518,61 @@ class MainWindow(QMainWindow):
             return
 
         lbhr_capable = self._epa_lbhr_capable_ppm_tags()
+
+        # Always overwrite avg_lb_hr -- never preserve cached values, so
+        # a rebuild is guaranteed to retire any historical rows that were
+        # logged under the obsolete double-O2-correction formula.
         if lbhr_capable:
+            # Per-minute lb/hr (uses the per-minute ppm + flow averages).
+            for (mstart_iso, tag), (mend_iso, mavg, _, count, alias) in list(minute_records.items()):
+                if tag not in lbhr_capable:
+                    continue
+                avg_lookup = minute_avg_by_minute.get(mstart_iso, {})
+                derived = self._compute_lbhr_from_avg(tag, avg_lookup)
+                minute_records[(mstart_iso, tag)] = (mend_iso, mavg, derived, count, alias)
+
+            # Per-hour lb/hr (uses the per-hour ppm + flow averages).
             avg_by_hour: Dict[str, Dict[str, float]] = {}
             for (hstart_iso, tag), (_, avg, _, _, _) in records.items():
                 if avg is None:
                     continue
                 avg_by_hour.setdefault(hstart_iso, {})[tag] = avg
 
-            for (hstart_iso, tag), (hend_iso, avg, lbhr_avg, count, alias) in list(records.items()):
+            for (hstart_iso, tag), (hend_iso, avg, _, count, alias) in list(records.items()):
                 if tag not in lbhr_capable:
                     continue
-                if lbhr_avg is None:
-                    avg_lookup = avg_by_hour.get(hstart_iso, {})
-                    derived = self._compute_lbhr_from_avg(tag, avg_lookup)
-                    if derived is not None:
-                        lbhr_avg = derived
-                records[(hstart_iso, tag)] = (hend_iso, avg, lbhr_avg, count, alias)
+                avg_lookup = avg_by_hour.get(hstart_iso, {})
+                derived = self._compute_lbhr_from_avg(tag, avg_lookup)
+                records[(hstart_iso, tag)] = (hend_iso, avg, derived, count, alias)
 
         try:
+            self._wait_for_export_unlock("hourly average rebuild")
+            ensure_csv(
+                self.minute_csv_path,
+                ["minute_start", "minute_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
+            )
+            with open(self.minute_csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    ["minute_start", "minute_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"]
+                )
+                for (ms, tag), (me, mavg, lbhr_avg, cnt, alias) in sorted(minute_records.items()):
+                    writer.writerow(
+                        [
+                            ms,
+                            me,
+                            tag,
+                            alias,
+                            "" if mavg is None else mavg,
+                            "" if lbhr_avg is None else lbhr_avg,
+                            cnt,
+                        ]
+                    )
+
             ensure_csv(
                 self.hourly_csv_path,
                 ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
             )
-            self._wait_for_export_unlock("hourly average rebuild")
             with open(self.hourly_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(
@@ -4531,12 +4592,13 @@ class MainWindow(QMainWindow):
                     )
             self._rebuild_rolling_12hr_from_records(records)
             self.log_message(
-                f"Rebuilt hourly averages for {len(records)} (hour, tag) pairs."
+                f"Rebuilt {len(minute_records)} minute and {len(records)} hourly "
+                f"(period, tag) pairs and refreshed rolling 12-hr averages."
             )
         except Exception as e:
-            self.log_message(f"Error writing rebuilt hourly CSV: {e}")
+            self.log_message(f"Error writing rebuilt CSVs: {e}")
             QMessageBox.critical(
-                self, "Error", f"Failed to write rebuilt hourly CSV:\n{e}"
+                self, "Error", f"Failed to write rebuilt CSVs:\n{e}"
             )
 
     # ---------------- dashboard rendering ----------------

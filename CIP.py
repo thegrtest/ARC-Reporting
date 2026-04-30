@@ -901,24 +901,11 @@ class MainWindow(QMainWindow):
         "new_value",
         "reason",
     ]
-    EPA19_STD_O2_PCT = 20.9              # ambient O2 (% dry, by volume)
     EPA19_MOLAR_VOLUME_SCF = 385.8        # SCF/lb-mol at 68 F, 14.696 psia (EPA std)
     EPA19_MOLECULAR_WEIGHTS = {
         "NOx": 46.0,  # as NO2
         "CO": 28.01,
-        "O2": 32.0,
     }
-    # Pollutants to which the O2 correction is applied. O2 itself is the
-    # diluent and must NEVER be O2-corrected.
-    EPA19_O2_CORRECTABLE_POLLUTANTS = {"NOx", "CO"}
-    # Default validity bounds for the measured O2 used in the correction
-    # ratio (20.9 - O2_ref) / (20.9 - O2_meas). Values above the upper bound
-    # mean the source is essentially diluted to ambient air -- any rate
-    # computed from such a measurement is dominated by sensor noise and is
-    # not defensible. The lower bound rejects negative / clearly broken
-    # sensor readings. These are user-overridable in settings.json.
-    EPA19_DEFAULT_O2_MAX_VALID_PCT = 19.0
-    EPA19_DEFAULT_O2_MIN_VALID_PCT = 0.0
     WRITEBACK_VALUE_OPTIONS = [
         ("Rolling 12 Hr Avg (lb/hr)", "rolling_12hr_avg_lbhr"),
         ("Current Hour Avg (lb/hr)", "current_avg_lbhr"),
@@ -1001,10 +988,6 @@ class MainWindow(QMainWindow):
         self.epa_flow_tag = ""
         self.epa_o2_tag = ""
         self.epa_o2_units = "percent"
-        self.epa_ref_o2_pct = 7.0
-        self.epa_o2_correction_enabled = True
-        self.epa_o2_max_valid_pct = self.EPA19_DEFAULT_O2_MAX_VALID_PCT
-        self.epa_o2_min_valid_pct = self.EPA19_DEFAULT_O2_MIN_VALID_PCT
         self.epa_nox_tag = ""
         self.epa_co_tag = ""
         self.production_product_tag = ""
@@ -1951,7 +1934,10 @@ class MainWindow(QMainWindow):
 
         self.epa_enabled_checkbox = QCheckBox("Enable EPA Method 19 conversions")
         self.epa_enabled_checkbox.setToolTip(
-            "Calculates lb/hr from PPMV using EPA Method 19 with a dry standard flow rate."
+            "Calculates lb/hr from PPMV using EPA Method 19 with a dry standard "
+            "flow rate. The CEMS is expected to provide ppm already corrected "
+            "to the permit reference O2 and on a dry basis -- no additional "
+            "O2 correction or wet/dry conversion is applied here."
         )
         cfg_layout.addRow(self.epa_enabled_checkbox)
 
@@ -1961,62 +1947,12 @@ class MainWindow(QMainWindow):
 
         self.epa_o2_tag_edit = QLineEdit()
         self.epa_o2_tag_edit.setPlaceholderText("e.g. Program:MainRoutine.O2_PV")
-        cfg_layout.addRow(QLabel("O2 Tag (for correction):"), self.epa_o2_tag_edit)
+        cfg_layout.addRow(QLabel("O2 Tag (display only):"), self.epa_o2_tag_edit)
 
         self.epa_o2_units_combo = QComboBox()
         self.epa_o2_units_combo.addItem("% O2", "percent")
         self.epa_o2_units_combo.addItem("PPMV", "ppmv")
         cfg_layout.addRow(QLabel("O2 Units:"), self.epa_o2_units_combo)
-
-        self.epa_o2_correction_checkbox = QCheckBox(
-            "Apply O2 correction to NOx/CO ppm"
-        )
-        self.epa_o2_correction_checkbox.setToolTip(
-            "When enabled, NOx and CO ppm are scaled by "
-            "(20.9 - Reference O2) / (20.9 - Measured O2) before lb/hr is "
-            "computed. Required for permits expressed at a reference O2 "
-            "(e.g. 7% O2 dry). When disabled, lb/hr is the raw uncorrected "
-            "mass rate."
-        )
-        self.epa_o2_correction_checkbox.setChecked(self.epa_o2_correction_enabled)
-        cfg_layout.addRow(self.epa_o2_correction_checkbox)
-
-        self.epa_ref_o2_spin = QDoubleSpinBox()
-        self.epa_ref_o2_spin.setRange(0.0, 20.89)
-        self.epa_ref_o2_spin.setSingleStep(0.1)
-        self.epa_ref_o2_spin.setDecimals(2)
-        self.epa_ref_o2_spin.setValue(self.epa_ref_o2_pct)
-        self.epa_ref_o2_spin.setToolTip(
-            "Reference O2 percent for the correction. Common values: 7% "
-            "(RCRA HW incinerators, MSW combustors), 3% (industrial "
-            "boilers), 15% (combustion turbines)."
-        )
-        cfg_layout.addRow(QLabel("Reference O2 (%):"), self.epa_ref_o2_spin)
-
-        self.epa_o2_max_valid_spin = QDoubleSpinBox()
-        self.epa_o2_max_valid_spin.setRange(0.1, 20.89)
-        self.epa_o2_max_valid_spin.setSingleStep(0.1)
-        self.epa_o2_max_valid_spin.setDecimals(2)
-        self.epa_o2_max_valid_spin.setValue(self.epa_o2_max_valid_pct)
-        self.epa_o2_max_valid_spin.setToolTip(
-            "Measured O2 at or above this value invalidates the lb/hr "
-            "calculation for that sample. Defaults to 19.0% -- readings "
-            "approaching the 20.9% ambient O2 produce a divergent "
-            "correction factor and are dominated by sensor noise."
-        )
-        cfg_layout.addRow(QLabel("Max valid measured O2 (%):"), self.epa_o2_max_valid_spin)
-
-        self.epa_o2_min_valid_spin = QDoubleSpinBox()
-        self.epa_o2_min_valid_spin.setRange(-1.0, 20.0)
-        self.epa_o2_min_valid_spin.setSingleStep(0.1)
-        self.epa_o2_min_valid_spin.setDecimals(2)
-        self.epa_o2_min_valid_spin.setValue(self.epa_o2_min_valid_pct)
-        self.epa_o2_min_valid_spin.setToolTip(
-            "Measured O2 below this value invalidates the lb/hr "
-            "calculation for that sample (rejects negative / failed "
-            "sensor readings)."
-        )
-        cfg_layout.addRow(QLabel("Min valid measured O2 (%):"), self.epa_o2_min_valid_spin)
 
         self.epa_nox_tag_edit = QLineEdit()
         self.epa_nox_tag_edit.setPlaceholderText("e.g. Program:MainRoutine.NOx_PPMV")
@@ -2730,17 +2666,6 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-    def _epa_o2_values(self, raw_o2: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
-        if raw_o2 is None:
-            return None, None
-        if self.epa_o2_units == "ppmv":
-            o2_ppmv = raw_o2
-            o2_pct = raw_o2 / 10000.0
-        else:
-            o2_pct = raw_o2
-            o2_ppmv = raw_o2 * 10000.0
-        return o2_pct, o2_ppmv
-
     def _ppmv_to_lb_hr(self, ppmv: float, flow_scfm: float, molecular_weight: float) -> float:
         """Stoichiometric mass-rate from concentration, volumetric flow and MW.
 
@@ -2757,77 +2682,30 @@ class MainWindow(QMainWindow):
             / (1_000_000.0 * self.EPA19_MOLAR_VOLUME_SCF)
         )
 
-    def _epa_o2_correction_factor(self, o2_pct: Optional[float]) -> Optional[float]:
-        """Return the O2 correction multiplier ((20.9 - O2_ref) / (20.9 - O2_meas)).
-
-        Behaviour:
-          * Correction disabled -> returns 1.0 (caller multiplies by 1, i.e. no-op).
-          * Correction enabled and the inputs are valid -> returns the multiplier.
-          * Correction enabled but the measurement or reference is invalid /
-            out of range -> returns None.
-
-        A None return means "lb/hr cannot be defensibly computed for this
-        sample". The caller MUST propagate the None upward instead of
-        substituting 1.0 -- silently emitting an uncorrected value when
-        correction was requested would be a compliance defect.
-
-        Validity rules:
-          * o2_pct must not be None.
-          * o2_pct must satisfy min_valid <= o2_pct < max_valid (defaults
-            0.0 and 19.0 percent). The upper bound exists because as O2
-            approaches the ambient 20.9 percent the correction ratio
-            diverges; readings near ambient are dominated by sensor noise
-            and dilution and are rejected by EPA QA procedures.
-          * o2_ref must be in [0, 20.9). A reference at or above ambient
-            has no physical meaning.
-          * Denominator (20.9 - o2_pct) must be strictly positive.
-        """
-        if not self.epa_o2_correction_enabled:
-            return 1.0
-        if o2_pct is None:
-            return None
-        try:
-            o2_meas = float(o2_pct)
-            o2_ref = float(self.epa_ref_o2_pct)
-        except (TypeError, ValueError):
-            return None
-        if o2_meas != o2_meas or o2_ref != o2_ref:  # NaN guard
-            return None
-        if o2_ref < 0.0 or o2_ref >= self.EPA19_STD_O2_PCT:
-            return None
-        if o2_meas < self.epa_o2_min_valid_pct:
-            return None
-        if o2_meas >= self.epa_o2_max_valid_pct:
-            return None
-        denom = self.EPA19_STD_O2_PCT - o2_meas
-        if denom <= 0.0:
-            return None
-        return (self.EPA19_STD_O2_PCT - o2_ref) / denom
-
     def _compute_lbhr_from_avg(
         self, tag: str, avg_lookup: Dict[str, float]
     ) -> Optional[float]:
         """Compute period-averaged lb/hr for the given tag.
 
-        For NOx and CO the measured ppm is first scaled by the O2 correction
-        factor (see ``_epa_o2_correction_factor``) so the result represents
-        emissions normalised to the configured reference O2 level. For O2
-        itself the correction is intentionally NOT applied -- O2 is the
-        diluent that the correction is normalising against.
+        The CEMS already delivers ppm on a dry basis and corrected to the
+        permit reference O2, and the flow tag is already a dry standard
+        flow rate. The conversion here is the bare EPA Method 19
+        stoichiometric step:
+
+            lb/hr = ppm * Q_dscfm * 60 * MW / (1e6 * 385.8)
+
+        No additional O2 correction or wet-to-dry conversion is applied --
+        applying one again would double-correct values the CEMS has
+        already normalised.
 
         Returns None when EPA is disabled, when required tags are missing,
-        when the period averages are unavailable, or when O2 correction is
-        requested but cannot be computed defensibly. None is the explicit
-        signal "no valid lb/hr for this sample"; callers (rolling 12-hour
-        aggregator, CSV writers, writeback thread) skip it rather than
-        substitute a placeholder.
+        or when the period averages are unavailable.
         """
         if not self.epa_enabled:
             return None
 
         flow_tag = self._resolve_tag_from_alias(self.epa_flow_tag)
-        o2_tag = self._resolve_tag_from_alias(self.epa_o2_tag)
-        if not (flow_tag and o2_tag):
+        if not flow_tag:
             return None
 
         flow_avg = avg_lookup.get(flow_tag)
@@ -2835,37 +2713,21 @@ class MainWindow(QMainWindow):
         if flow_avg is None or tag_avg is None:
             return None
 
-        o2_avg = avg_lookup.get(o2_tag)
-        o2_pct, o2_ppmv = self._epa_o2_values(o2_avg)
-
         nox_tag = self._resolve_tag_from_alias(self.epa_nox_tag)
         co_tag = self._resolve_tag_from_alias(self.epa_co_tag)
 
-        if tag == o2_tag:
-            # O2 is the diluent and is reported uncorrected.
-            ppmv = o2_ppmv
-            pollutant = "O2"
-            correction = 1.0
-        elif tag == nox_tag:
+        if tag == nox_tag:
             pollutant = "NOx"
-            ppmv = tag_avg
-            correction = self._epa_o2_correction_factor(o2_pct)
         elif tag == co_tag:
             pollutant = "CO"
-            ppmv = tag_avg
-            correction = self._epa_o2_correction_factor(o2_pct)
         else:
-            return None
-
-        if ppmv is None or correction is None:
             return None
 
         mw = self.EPA19_MOLECULAR_WEIGHTS.get(pollutant)
         if mw is None:
             return None
 
-        corrected_ppmv = ppmv * correction
-        return self._ppmv_to_lb_hr(corrected_ppmv, flow_avg, mw)
+        return self._ppmv_to_lb_hr(tag_avg, flow_avg, mw)
 
     # ---------------- settings ----------------
 
@@ -2945,20 +2807,6 @@ class MainWindow(QMainWindow):
         o2_index = self.epa_o2_units_combo.findData(self.epa_o2_units)
         if o2_index >= 0:
             self.epa_o2_units_combo.setCurrentIndex(o2_index)
-        self.epa_ref_o2_pct = float(data.get("epa_ref_o2_pct", self.epa_ref_o2_pct))
-        self.epa_ref_o2_spin.setValue(self.epa_ref_o2_pct)
-        self.epa_o2_correction_enabled = bool(
-            data.get("epa_o2_correction_enabled", self.epa_o2_correction_enabled)
-        )
-        self.epa_o2_correction_checkbox.setChecked(self.epa_o2_correction_enabled)
-        self.epa_o2_max_valid_pct = float(
-            data.get("epa_o2_max_valid_pct", self.epa_o2_max_valid_pct)
-        )
-        self.epa_o2_max_valid_spin.setValue(self.epa_o2_max_valid_pct)
-        self.epa_o2_min_valid_pct = float(
-            data.get("epa_o2_min_valid_pct", self.epa_o2_min_valid_pct)
-        )
-        self.epa_o2_min_valid_spin.setValue(self.epa_o2_min_valid_pct)
         self.epa_nox_tag = str(data.get("epa_nox_tag", "") or "")
         self.epa_nox_tag_edit.setText(self.epa_nox_tag)
         self.epa_co_tag = str(data.get("epa_co_tag", "") or "")
@@ -3067,10 +2915,6 @@ class MainWindow(QMainWindow):
             "epa_flow_tag": self.epa_flow_tag_edit.text().strip(),
             "epa_o2_tag": self.epa_o2_tag_edit.text().strip(),
             "epa_o2_units": self.epa_o2_units_combo.currentData(),
-            "epa_ref_o2_pct": self.epa_ref_o2_spin.value(),
-            "epa_o2_correction_enabled": self.epa_o2_correction_checkbox.isChecked(),
-            "epa_o2_max_valid_pct": self.epa_o2_max_valid_spin.value(),
-            "epa_o2_min_valid_pct": self.epa_o2_min_valid_spin.value(),
             "epa_nox_tag": self.epa_nox_tag_edit.text().strip(),
             "epa_co_tag": self.epa_co_tag_edit.text().strip(),
             "production_tracking": {
@@ -3168,10 +3012,6 @@ class MainWindow(QMainWindow):
             ("epa_flow_tag", "EPA flow tag"),
             ("epa_o2_tag", "EPA O2 tag"),
             ("epa_o2_units", "EPA O2 units"),
-            ("epa_ref_o2_pct", "EPA reference O2"),
-            ("epa_o2_correction_enabled", "EPA O2 correction enabled"),
-            ("epa_o2_max_valid_pct", "EPA O2 max valid"),
-            ("epa_o2_min_valid_pct", "EPA O2 min valid"),
             ("epa_nox_tag", "EPA NOx tag"),
             ("epa_co_tag", "EPA CO tag"),
             ("production_tracking", "Production tracking"),
@@ -3212,10 +3052,6 @@ class MainWindow(QMainWindow):
             self.epa_flow_tag_edit,
             self.epa_o2_tag_edit,
             self.epa_o2_units_combo,
-            self.epa_ref_o2_spin,
-            self.epa_o2_correction_checkbox,
-            self.epa_o2_max_valid_spin,
-            self.epa_o2_min_valid_spin,
             self.epa_nox_tag_edit,
             self.epa_co_tag_edit,
             self.production_product_tag_edit,
@@ -3419,10 +3255,6 @@ class MainWindow(QMainWindow):
         self.epa_flow_tag = self.epa_flow_tag_edit.text().strip()
         self.epa_o2_tag = self.epa_o2_tag_edit.text().strip()
         self.epa_o2_units = self.epa_o2_units_combo.currentData() or "percent"
-        self.epa_ref_o2_pct = self.epa_ref_o2_spin.value()
-        self.epa_o2_correction_enabled = self.epa_o2_correction_checkbox.isChecked()
-        self.epa_o2_max_valid_pct = self.epa_o2_max_valid_spin.value()
-        self.epa_o2_min_valid_pct = self.epa_o2_min_valid_spin.value()
         self.epa_nox_tag = self.epa_nox_tag_edit.text().strip()
         self.epa_co_tag = self.epa_co_tag_edit.text().strip()
 
@@ -3476,13 +3308,9 @@ class MainWindow(QMainWindow):
                 self.log_message(
                     "EPA Method 19 is enabled, but no air flow tag is configured."
                 )
-            if not self.epa_o2_tag:
+            if not (self.epa_nox_tag or self.epa_co_tag):
                 self.log_message(
-                    "EPA Method 19 is enabled, but no O2 correction tag is configured."
-                )
-            if not (self.epa_nox_tag or self.epa_co_tag or self.epa_o2_tag):
-                self.log_message(
-                    "EPA Method 19 is enabled, but no NOx/CO/O2 pollutant tags are configured."
+                    "EPA Method 19 is enabled, but no NOx/CO pollutant tags are configured."
                 )
 
         # stable ordering for the dashboard

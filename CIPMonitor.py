@@ -149,7 +149,18 @@ ROLLING_AVG_HEADERS = [
 
 # EPA Method 19 constants used by the manual-calculation worksheet export.
 EPA19_NOX_MOLECULAR_WEIGHT = 46.0   # NOx as NO2 (lb/lb-mol)
+EPA19_CO_MOLECULAR_WEIGHT = 28.01   # CO (lb/lb-mol)
 EPA19_MOLAR_VOLUME_DSCF = 385.8     # SCF/lb-mol at 68 F, 14.696 psia
+EMISSION_TOTALS_HEADERS = [
+    "pollutant",
+    "period_label",
+    "period_start",
+    "period_end",
+    "total_lb",
+    "hours_with_data",
+    "avg_lb_per_hr",
+    "computation_basis",
+]
 NOX_CALC_HEADERS = [
     "period_start",
     "period_end",
@@ -778,6 +789,145 @@ def build_nox_manual_calc_payload(granularity: str, range_key: str):
     return dcc.send_file(output_path, filename=output_name)
 
 
+def _resolve_pollutant_and_flow_tags(
+    alias_map: Dict[str, str],
+) -> Tuple[str, str, str]:
+    """Return (nox_tag, co_tag, flow_tag) from EPA settings with regex fallback."""
+    epa_settings = load_epa_settings()
+    nox_tag = str(epa_settings.get("epa_nox_tag", "") or "")
+    co_tag = str(epa_settings.get("epa_co_tag", "") or "")
+    flow_tag = str(epa_settings.get("epa_flow_tag", "") or "")
+
+    if not nox_tag or not co_tag or not flow_tag:
+        nox_pattern = [re.compile(r"\bnox\b|no[_\s-]?x", re.IGNORECASE)]
+        co_pattern = [re.compile(r"\bco\b", re.IGNORECASE)]
+        flow_pattern = [re.compile(r"\bflow\b|dscfm|scfm", re.IGNORECASE)]
+        synthetic = pd.DataFrame({"tag": list(alias_map.keys())})
+        if not nox_tag:
+            nox_tag = _find_tag_by_patterns(synthetic, alias_map, nox_pattern)
+        if not co_tag:
+            co_tag = _find_tag_by_patterns(synthetic, alias_map, co_pattern)
+        if not flow_tag:
+            flow_tag = _find_tag_by_patterns(synthetic, alias_map, flow_pattern)
+    return nox_tag, co_tag, flow_tag
+
+
+def _emission_totals_row(
+    pollutant: str,
+    period_label: str,
+    period_start: datetime,
+    period_end: datetime,
+    pollutant_tag: str,
+    flow_tag: str,
+    pollutant_mw: float,
+    hourly_df: pd.DataFrame,
+) -> Dict[str, object]:
+    """Compute one totals row for a (pollutant, period) pair.
+
+    Sums the per-hour lb/hr (recomputed from ppm * flow) over the period.
+    No processing-state gating is applied -- this is the full emitted mass
+    in any hour where the CEMS produced both ppm and flow data, which is
+    what permit annual rollups care about.
+    """
+    period_window = _filter_time_range(hourly_df, "hour_end", period_start, period_end)
+    rates = _hourly_lb_hr_recomputed(period_window, pollutant_tag, flow_tag, pollutant_mw)
+    if rates.empty:
+        total_lb = 0.0
+        hours_with_data = 0
+    else:
+        total_lb = float(rates["lb_hr"].sum())
+        hours_with_data = int(rates.shape[0])
+    avg_lb_hr = (total_lb / hours_with_data) if hours_with_data else 0.0
+    return {
+        "pollutant": pollutant,
+        "period_label": period_label,
+        "period_start": period_start.isoformat(timespec="seconds"),
+        "period_end": period_end.isoformat(timespec="seconds"),
+        "total_lb": round(total_lb, 4),
+        "hours_with_data": hours_with_data,
+        "avg_lb_per_hr": round(avg_lb_hr, 6),
+        "computation_basis": (
+            "Sum of recomputed hourly lb/hr "
+            "(ppm * dscfm * 60 * MW / (1e6 * 385.8))"
+        ),
+    }
+
+
+def build_emission_totals_payload(range_key: str):
+    """Emission totals CSV: selected range, calendar YTD, and trailing 12 months.
+
+    For each pollutant (NOx, CO) emits three rows so a permit reviewer can
+    see the requested window plus the two annual rollups in one file.
+    Totals come from the simplified EPA Method 19 formula and are computed
+    fresh from each hour's ppm and flow averages, not from the cached
+    avg_lb_hr column on disk.
+    """
+    range_label, range_start, range_end = _get_report_range(range_key)
+    alias_map = load_alias_map_from_settings()
+    nox_tag, co_tag, flow_tag = _resolve_pollutant_and_flow_tags(alias_map)
+    if not flow_tag or not (nox_tag or co_tag):
+        return None
+
+    hourly_df = load_hourly_stats()
+    if hourly_df is None or hourly_df.empty:
+        return None
+
+    now = datetime.now()
+    ytd_start = datetime(now.year, 1, 1)
+    ytd_end = now
+    trailing_start = now - timedelta(days=365)
+    trailing_end = now
+
+    periods: List[Tuple[str, datetime, datetime]] = [
+        (f"Selected Range ({range_label})", range_start, range_end),
+        (f"Year to Date {now.year}", ytd_start, ytd_end),
+        ("Trailing 12 Months", trailing_start, trailing_end),
+    ]
+
+    rows: List[Dict[str, object]] = []
+    pollutants: List[Tuple[str, str, float]] = []
+    if nox_tag:
+        pollutants.append(("NOx", nox_tag, EPA19_NOX_MOLECULAR_WEIGHT))
+    if co_tag:
+        pollutants.append(("CO", co_tag, EPA19_CO_MOLECULAR_WEIGHT))
+
+    for pollutant_name, pollutant_tag, mw in pollutants:
+        for label, p_start, p_end in periods:
+            rows.append(
+                _emission_totals_row(
+                    pollutant_name,
+                    label,
+                    p_start,
+                    p_end,
+                    pollutant_tag,
+                    flow_tag,
+                    mw,
+                    hourly_df,
+                )
+            )
+
+    if not rows:
+        return None
+
+    out_df = pd.DataFrame(rows, columns=EMISSION_TOTALS_HEADERS)
+
+    ensure_dir(EXPORT_TMP_DIR)
+    output_name = f"{range_key}_emission_totals.csv"
+    output_path = os.path.join(
+        EXPORT_TMP_DIR,
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}_{output_name}",
+    )
+    _write_export_lock()
+    try:
+        out_df.to_csv(output_path, index=False)
+    finally:
+        _clear_export_lock()
+
+    if not os.path.exists(output_path):
+        return None
+    return dcc.send_file(output_path, filename=output_name)
+
+
 def build_export_payload(path: str, headers: List[str], filename: str):
     ensure_export_csv(path, headers)
     if not os.path.exists(path):
@@ -975,44 +1125,87 @@ def _compute_avg_flow(hourly_range: pd.DataFrame, flow_tag: Optional[str]) -> Op
     return float(values.mean())
 
 
+def _hourly_lb_hr_recomputed(
+    hourly_range: pd.DataFrame,
+    pollutant_tag: Optional[str],
+    flow_tag: Optional[str],
+    pollutant_mw: float,
+) -> pd.DataFrame:
+    """Per-hour lb/hr recomputed from ppm * flow, joined on hour_start.
+
+    Rebuilds the EPA Method 19 mass rate from the underlying averages
+    rather than trusting the cached avg_lb_hr column, so historical rows
+    that were logged with the obsolete double-O2-correction formula
+    contribute correct mass to range totals.
+
+        lb/hr = ppm * Q_dscfm * 60 * MW / (1e6 * 385.8)
+
+    Returns an empty DataFrame when inputs are missing.
+    """
+    if (
+        not pollutant_tag
+        or not flow_tag
+        or hourly_range is None
+        or hourly_range.empty
+        or "tag" not in hourly_range.columns
+        or "hour_start" not in hourly_range.columns
+    ):
+        return pd.DataFrame(columns=["hour_start", "lb_hr"])
+
+    pollutant_rows = hourly_range.loc[
+        hourly_range["tag"] == pollutant_tag, ["hour_start", "avg_value"]
+    ].rename(columns={"avg_value": "ppm"})
+    flow_rows = hourly_range.loc[
+        hourly_range["tag"] == flow_tag, ["hour_start", "avg_value"]
+    ].rename(columns={"avg_value": "flow_dscfm"})
+    if pollutant_rows.empty or flow_rows.empty:
+        return pd.DataFrame(columns=["hour_start", "lb_hr"])
+
+    merged = pollutant_rows.merge(flow_rows, on="hour_start", how="inner")
+    merged["ppm"] = pd.to_numeric(merged["ppm"], errors="coerce")
+    merged["flow_dscfm"] = pd.to_numeric(merged["flow_dscfm"], errors="coerce")
+    merged = merged.dropna(subset=["ppm", "flow_dscfm"])
+    if merged.empty:
+        return pd.DataFrame(columns=["hour_start", "lb_hr"])
+
+    merged["lb_hr"] = (
+        merged["ppm"]
+        * merged["flow_dscfm"]
+        * 60.0
+        * pollutant_mw
+        / (1_000_000.0 * EPA19_MOLAR_VOLUME_DSCF)
+    )
+    return merged[["hour_start", "lb_hr"]]
+
+
 def _compute_total_weight(
     hourly_range: pd.DataFrame,
-    tag: Optional[str],
+    pollutant_tag: Optional[str],
+    flow_tag: Optional[str],
+    pollutant_mw: float,
     processing_hour_starts: Optional[set] = None,
 ) -> Optional[float]:
-    """Sum hourly avg_lb_hr for a tag to get total mass (lb) over the window.
+    """Sum recomputed per-hour lb/hr to get total mass (lb) over the window.
 
-    Each hour's avg_lb_hr is a mass rate; multiplying by 1 hour of duration
-    yields lb, so the simple sum of avg_lb_hr across hours equals total lb
-    for the window.
+    Each hour contributes ``lb/hr * 1 hour = lb``. The per-hour rate is
+    recomputed from the hour's ppm and flow averages using the simplified
+    EPA Method 19 formula (CEMS supplies O2-corrected, dry-basis values),
+    so totals are correct even when the cached avg_lb_hr column on disk
+    came from an older formula.
 
-    When ``processing_hour_starts`` is provided, only hours whose hour_start
-    is in that set are summed -- this restricts the total to hours when the
-    machine had any processing activity. The set must contain
-    ``pandas.Timestamp`` objects (NOT formatted strings); the hour_start
-    column on the DataFrame is also Timestamp dtype, and Timestamp-to-
-    Timestamp comparison via ``isin`` avoids the string-format mismatch
-    that previously zeroed the totals (CSV stored "T" separator, pandas
-    str() emits a space separator).
+    When ``processing_hour_starts`` is provided, only hours whose
+    hour_start is in that set are summed -- restricting the total to
+    hours when the machine had any processing activity. The set must
+    contain ``pandas.Timestamp`` objects.
     """
-    if not tag or hourly_range is None or hourly_range.empty:
-        return None
-    tag_series = hourly_range.loc[hourly_range["tag"] == tag]
-    if tag_series.empty:
+    rates = _hourly_lb_hr_recomputed(hourly_range, pollutant_tag, flow_tag, pollutant_mw)
+    if rates.empty:
         return None
     if processing_hour_starts is not None:
-        if "hour_start" not in tag_series.columns:
+        rates = rates.loc[rates["hour_start"].isin(processing_hour_starts)]
+        if rates.empty:
             return None
-        tag_series = tag_series.loc[tag_series["hour_start"].isin(processing_hour_starts)]
-        if tag_series.empty:
-            return None
-    values = tag_series.get("avg_lb_hr")
-    if values is None:
-        return None
-    values = pd.to_numeric(values, errors="coerce").dropna()
-    if values.empty:
-        return None
-    return float(values.sum())
+    return float(rates["lb_hr"].sum())
 
 
 # ============================================================================
@@ -1115,8 +1308,12 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
     if weight_run_stats:
         weight_run_stats["weight_units"] = feed_settings.get("weight_units", "")
 
-    co_weight = _compute_total_weight(hourly_range, co_tag, processing_hour_starts)
-    nox_weight = _compute_total_weight(hourly_range, nox_tag, processing_hour_starts)
+    co_weight = _compute_total_weight(
+        hourly_range, co_tag, flow_tag, EPA19_CO_MOLECULAR_WEIGHT, processing_hour_starts
+    )
+    nox_weight = _compute_total_weight(
+        hourly_range, nox_tag, flow_tag, EPA19_NOX_MOLECULAR_WEIGHT, processing_hour_starts
+    )
 
     # CEMS uptime for the reporting period
     cems_tags = [t for t in [co_tag, nox_tag, o2_tag] if t]
@@ -1417,8 +1614,12 @@ def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
         hours_processed_precise = float(processing_stats.get("total_hours", 0.0))
         capped_gaps = int(processing_stats.get("capped_gap_count", 0))
 
-        co_weight = _compute_total_weight(hourly_range, co_tag, processing_hour_starts)
-        nox_weight = _compute_total_weight(hourly_range, nox_tag, processing_hour_starts)
+        co_weight = _compute_total_weight(
+            hourly_range, co_tag, flow_tag, EPA19_CO_MOLECULAR_WEIGHT, processing_hour_starts
+        )
+        nox_weight = _compute_total_weight(
+            hourly_range, nox_tag, flow_tag, EPA19_NOX_MOLECULAR_WEIGHT, processing_hour_starts
+        )
 
         hours_text = f"{hours_processed_precise:.2f}"
         if capped_gaps > 0:
@@ -4762,6 +4963,7 @@ app.layout = html.Div(
         dcc.Download(id="export-nox-calc-raw-download"),
         dcc.Download(id="export-nox-calc-minute-download"),
         dcc.Download(id="export-nox-calc-hourly-download"),
+        dcc.Download(id="export-emission-totals-download"),
         dcc.Download(id="report-today-download"),
         dcc.Download(id="report-week-download"),
         dcc.Download(id="report-month-download"),
@@ -5103,6 +5305,46 @@ app.layout = html.Div(
                                         dcc.Loading(
                                             children=html.Div(
                                                 id="export-nox-calc-status",
+                                                style={
+                                                    "marginTop": "8px",
+                                                    "fontSize": "11px",
+                                                    "color": COLOR_TEXT_MUTED,
+                                                },
+                                            ),
+                                        ),
+                                    ],
+                                ),
+                                html.Div(
+                                    style=CARD_STYLE,
+                                    children=[
+                                        html.Div(
+                                            "Emission Totals (CSV)",
+                                            style=EXPORT_SECTION_TITLE_STYLE,
+                                        ),
+                                        html.Div(
+                                            "NOx and CO totals in lb for the selected time range, "
+                                            "calendar year-to-date, and trailing 12 months. "
+                                            "Each total is recomputed from the per-hour ppm and "
+                                            "flow averages using the simplified EPA Method 19 "
+                                            "formula, so historical hours that were logged with "
+                                            "the older double-O2-correction formula contribute "
+                                            "the correct mass.",
+                                            style=EXPORT_SECTION_HELP_STYLE,
+                                        ),
+                                        html.Div(
+                                            style=EXPORT_BUTTON_ROW_STYLE,
+                                            children=[
+                                                html.Button(
+                                                    "Emission Totals",
+                                                    id="export-emission-totals-btn",
+                                                    n_clicks=0,
+                                                    style=EXPORT_BUTTON_STYLE,
+                                                ),
+                                            ],
+                                        ),
+                                        dcc.Loading(
+                                            children=html.Div(
+                                                id="export-emission-totals-status",
                                                 style={
                                                     "marginTop": "8px",
                                                     "fontSize": "11px",
@@ -5494,6 +5736,27 @@ def export_nox_manual_calc(_raw_clicks, _minute_clicks, _hourly_clicks, range_ke
             f"NOx manual-calc (hourly) export requested for {selected_range}. Preparing your download now.",
         )
     return no_update, no_update, no_update, no_update
+
+
+@app.callback(
+    Output("export-emission-totals-download", "data"),
+    Output("export-emission-totals-status", "children"),
+    Input("export-emission-totals-btn", "n_clicks"),
+    State("export-range-dropdown", "value"),
+    prevent_initial_call=True,
+)
+def export_emission_totals(_clicks, range_key):
+    selected_range = range_key or "month"
+    payload = build_emission_totals_payload(selected_range)
+    if payload is None:
+        return (
+            no_update,
+            f"No emission data found for {selected_range}, or NOx/CO/flow tags are not configured.",
+        )
+    return (
+        payload,
+        f"Emission totals export requested for {selected_range} (with YTD and trailing 12 months). Preparing your download now.",
+    )
 
 
 @app.callback(

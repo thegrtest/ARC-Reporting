@@ -1321,6 +1321,9 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
     uptime_pct = uptime.get("uptime_pct", 0.0)
     op_hours = uptime.get("operating_hours", 0)
     valid_hours = uptime.get("valid_cems_hours", 0)
+    total_report_hours = float(uptime.get("total_hours", 0)) or (
+        (end - start).total_seconds() / 3600.0
+    )
 
     R = _RPT  # shorthand
 
@@ -1333,8 +1336,12 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
         # ---- Page 1: Rolling 12-hr chart + summary table ----
         fig = plt.figure(figsize=(11, 8.5))
         fig.patch.set_facecolor(R["bg"])
-        gs = fig.add_gridspec(3, 1, height_ratios=[0.18, 0.55, 0.27])
-        fig.subplots_adjust(right=0.78)
+        gs = fig.add_gridspec(
+            3, 1,
+            height_ratios=[0.18, 0.55, 0.27],
+            left=0.07, right=0.78, top=0.95, bottom=0.06,
+            hspace=0.45,
+        )
 
         ax_title = fig.add_subplot(gs[0, 0])
         ax_title.axis("off")
@@ -1396,12 +1403,32 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
         ax_table = fig.add_subplot(gs[2, 0])
         ax_table.axis("off")
 
-        uptime_text = f"{uptime_pct:.1f}% ({valid_hours}/{op_hours} operating hrs)" if op_hours > 0 else "N/A"
+        report_avail_pct = (
+            (valid_hours / total_report_hours * 100.0)
+            if total_report_hours > 0 else 0.0
+        )
+        if total_report_hours > 0:
+            uptime_text = (
+                f"{report_avail_pct:.1f}% of report "
+                f"({valid_hours}/{int(round(total_report_hours))} hrs)"
+            )
+            if op_hours > 0:
+                uptime_text += f"; {uptime_pct:.1f}% of operating"
+        else:
+            uptime_text = "N/A"
+
         hours_processed_precise = float(processing_stats.get("total_hours", 0.0))
         capped_gaps = int(processing_stats.get("capped_gap_count", 0))
-        hours_text = f"{hours_processed_precise:.2f}"
+        proc_pct = (
+            (hours_processed_precise / total_report_hours * 100.0)
+            if total_report_hours > 0 else 0.0
+        )
+        hours_text = (
+            f"{hours_processed_precise:.2f} / {total_report_hours:.2f} hrs "
+            f"({proc_pct:.1f}%)"
+        )
         if capped_gaps > 0:
-            hours_text += f"  (note: {capped_gaps} polling gap(s) capped)"
+            hours_text += f"  ({capped_gaps} gap(s) capped)"
 
         summary_rows = [
             [f"Average Flow Rate ({flow_label})", f"{flow_avg:.2f}" if flow_avg is not None else "N/A"],
@@ -1433,7 +1460,6 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
                 cell.set_facecolor(R["alt_row"])
                 cell.set_edgecolor(R["border"])
 
-        fig.tight_layout()
         pdf.savefig(fig)
         plt.close(fig)
 
@@ -1479,12 +1505,19 @@ def _add_hourly_chart_page(
         plot_specs.append(("O2", o2_tag, "avg_value", "%", R["bar_o2"]))
 
     n_plots = max(len(plot_specs), 1)
-    plot_height = 0.85 / n_plots
-    plot_gap = 0.03
+    # Reserve room at top for the title block and at the bottom so rotated
+    # x-tick labels are never clipped by the page margin.
+    top_reserve = 0.10
+    bottom_reserve = 0.08
+    plot_gap = 0.04
+    usable = 1.0 - top_reserve - bottom_reserve
+    per_plot = (usable - (n_plots - 1) * plot_gap) / n_plots
 
     for idx, (name, tag, value_col, unit, color) in enumerate(plot_specs):
-        bottom = 0.92 - (idx + 1) * (plot_height + plot_gap) + plot_gap
-        ax = fig.add_axes([0.08, bottom, 0.86, plot_height - plot_gap])
+        bottom = (
+            1.0 - top_reserve - (idx + 1) * per_plot - idx * plot_gap
+        )
+        ax = fig.add_axes([0.08, bottom, 0.86, per_plot])
         ax.set_facecolor(R["panel"])
         ax.grid(True, axis="y", linestyle="--", color=R["grid"], alpha=0.5)
 
@@ -1595,13 +1628,20 @@ def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
                     fontsize=10, color=R["muted"])
 
         # --- Left: CEMS uptime + operations stats ---
-        ax_stats = fig.add_axes([0.05, 0.42, 0.42, 0.48])
+        ax_stats = fig.add_axes([0.05, 0.40, 0.42, 0.46])
         ax_stats.axis("off")
 
         op_hrs = int(uptime.get("operating_hours", 0))
         valid_hrs = int(uptime.get("valid_cems_hours", 0))
         missing_hrs = int(uptime.get("missing_hours", 0))
         uptime_pct = float(uptime.get("uptime_pct", 0))
+        total_report_hours = float(uptime.get("total_hours", 0)) or (
+            (end - start).total_seconds() / 3600.0
+        )
+        report_avail_pct = (
+            (valid_hrs / total_report_hours * 100.0)
+            if total_report_hours > 0 else 0.0
+        )
         flow_avg = _compute_avg_flow(hourly_range, flow_tag)
 
         # Precise processing-time calculation from raw data (sub-minute granularity)
@@ -1621,7 +1661,14 @@ def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
             hourly_range, nox_tag, flow_tag, EPA19_NOX_MOLECULAR_WEIGHT, processing_hour_starts
         )
 
-        hours_text = f"{hours_processed_precise:.2f}"
+        proc_pct = (
+            (hours_processed_precise / total_report_hours * 100.0)
+            if total_report_hours > 0 else 0.0
+        )
+        hours_text = (
+            f"{hours_processed_precise:.2f} / {total_report_hours:.2f} hrs "
+            f"({proc_pct:.1f}%)"
+        )
         if capped_gaps > 0:
             hours_text += f" ({capped_gaps} capped)"
 
@@ -1634,8 +1681,18 @@ def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
 
         flow_label = _display_name(flow_tag, alias_map, "Flow")
 
+        if total_report_hours > 0:
+            cems_avail_text = (
+                f"{report_avail_pct:.1f}% of report "
+                f"({valid_hrs}/{int(round(total_report_hours))} hrs)"
+            )
+        else:
+            cems_avail_text = "N/A"
+        operating_pct_text = f"{uptime_pct:.1f}%" if op_hrs > 0 else "N/A"
+
         stats_rows = [
-            ["CEMS Availability", f"{uptime_pct:.1f}%" if op_hrs > 0 else "N/A"],
+            ["CEMS Availability (report)", cems_avail_text],
+            ["CEMS Availability (operating)", operating_pct_text],
             ["Hours Processed", hours_text],
             ["Valid CEMS Hours", f"{valid_hrs}"],
             ["Missing CEMS Hours", f"{missing_hrs}"],
@@ -1668,7 +1725,7 @@ def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
                 cell.set_edgecolor(R["border"])
 
         # --- Right: Hourly data table (last 24 rows) ---
-        ax_data = fig.add_axes([0.52, 0.42, 0.46, 0.48])
+        ax_data = fig.add_axes([0.52, 0.40, 0.46, 0.46])
         ax_data.axis("off")
         ax_data.set_title("Hourly Averages (most recent)", fontsize=11,
                           color=R["text"], loc="left", pad=8)
@@ -1728,8 +1785,9 @@ def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
         ax_footer.axis("off")
         ax_footer.text(
             0.0, 0.8,
-            "CEMS Data Availability = hours with valid CEMS data / total operating hours. "
-            "Regulatory requirement is typically 90% or greater.",
+            "CEMS Data Availability (report) = valid CEMS hours / total report hours; "
+            "(operating) = valid CEMS hours / operating hours. "
+            "Regulatory requirement is typically 90% or greater of operating time.",
             fontsize=8.5, color=R["subtle"], style="italic",
         )
         ax_footer.text(
@@ -1805,6 +1863,13 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
     uptime_pct = float(uptime.get("uptime_pct", 0))
     op_hrs = int(uptime.get("operating_hours", 0))
     valid_hrs = int(uptime.get("valid_cems_hours", 0))
+    total_report_hours = float(uptime.get("total_hours", 0)) or (
+        (end - start).total_seconds() / 3600.0
+    )
+    report_avail_pct = (
+        (valid_hrs / total_report_hours * 100.0)
+        if total_report_hours > 0 else 0.0
+    )
 
     R = _RPT
 
@@ -1816,7 +1881,12 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
     with PdfPages(report_path) as pdf:
         fig = plt.figure(figsize=(11, 8.5))
         fig.patch.set_facecolor(R["bg"])
-        gs = fig.add_gridspec(3, 1, height_ratios=[0.2, 0.4, 0.4])
+        gs = fig.add_gridspec(
+            3, 1,
+            height_ratios=[0.18, 0.42, 0.40],
+            left=0.06, right=0.96, top=0.95, bottom=0.05,
+            hspace=0.55,
+        )
 
         ax_title = fig.add_subplot(gs[0, 0])
         ax_title.axis("off")
@@ -1833,7 +1903,15 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
         ax_summary = fig.add_subplot(gs[1, 0])
         ax_summary.axis("off")
 
-        uptime_text = f"{uptime_pct:.1f}% ({valid_hrs}/{op_hrs} operating hrs)" if op_hrs > 0 else "N/A"
+        if total_report_hours > 0:
+            uptime_text = (
+                f"{report_avail_pct:.1f}% of report "
+                f"({valid_hrs}/{int(round(total_report_hours))} hrs)"
+            )
+            if op_hrs > 0:
+                uptime_text += f"; {uptime_pct:.1f}% of operating"
+        else:
+            uptime_text = "N/A"
         summary_rows = [
             ["Exceedance events", str(exceed_count)],
             ["Exceedance duration", f"{exceed_minutes:.1f} min"],
@@ -1923,7 +2001,6 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
                     cell.set_facecolor(R["alt_row"])
                     cell.set_edgecolor(R["border"])
 
-        fig.tight_layout()
         pdf.savefig(fig)
         plt.close(fig)
 
@@ -3457,8 +3534,9 @@ def compute_gauge_range(
     Compute (low, high, gauge_min, gauge_max) for a tag.
     - If thresholds exist, use them (and swap if low/high reversed).
     - Otherwise derive a reasonable range from sample values or fall back to [0, 1].
-    - If regulatory limits are provided, the gauge range is extended so the
-      permit limit is always visible on the scale (with a small buffer beyond).
+    - The gauge max is set sensibly above the highest defined threshold so the
+      red (exceedance) band is clearly visible — 20% headroom above a permit
+      limit, or 25% above an operational limit when no permit limit exists.
     Gauge min/max are rounded to 2 decimals to avoid messy tick labels.
     """
     values = [v for v in sample_values if v == v]
@@ -3487,13 +3565,104 @@ def compute_gauge_range(
         low, high = 0.0, 1.0
         gmin, gmax = 0.0, 1.0
 
-    # Extend gauge range to always show regulatory limits with 10% buffer
-    if regulatory_high is not None and regulatory_high > gmax:
-        gmax = round(regulatory_high * 1.1, 2)
-    if regulatory_low is not None and regulatory_low < gmin:
-        gmin = round(regulatory_low * 0.9, 2) if regulatory_low > 0 else round(regulatory_low - abs(regulatory_low) * 0.1, 2)
+    # Ensure the gauge max sits sensibly above the highest threshold so the
+    # red exceedance band has visible space. Prefer 20% above a permit limit,
+    # otherwise 25% above an operational high.
+    if regulatory_high is not None:
+        gmax = max(gmax, round(regulatory_high * 1.2, 2))
+    elif high is not None:
+        gmax = max(gmax, round(high * 1.25, 2))
+
+    # Likewise on the low side, give the red band room below a low limit.
+    if regulatory_low is not None:
+        if regulatory_low > 0:
+            gmin = min(gmin, round(regulatory_low * 0.8, 2))
+        else:
+            gmin = min(gmin, round(regulatory_low - abs(regulatory_low) * 0.2, 2))
+
+    # If everything is non-negative (a common case for CEMS / flow), don't
+    # let the gauge dip into negatives — operators read 0 as the floor.
+    if (regulatory_low is None or regulatory_low >= 0) and (low is None or low >= 0):
+        gmin = max(gmin, 0.0)
+
+    if gmax <= gmin:
+        gmax = gmin + 1.0
 
     return low, high, gmin, gmax
+
+
+def compute_gauge_zones(
+    gmin: float,
+    gmax: float,
+    low_oper: Optional[float],
+    high_oper: Optional[float],
+    low_limit: Optional[float],
+    high_limit: Optional[float],
+    yellow_margin_pct: float = 15.0,
+) -> Dict[str, object]:
+    """Build a dash_daq.Gauge `color` dict with green / yellow / red zones.
+
+    Logic (upper-bound focus, which matches CEMS reporting):
+        - red:    [highest threshold, gmax]
+        - yellow: between operational and regulatory limits, OR within
+                  ``yellow_margin_pct`` of the threshold when only one is set
+        - green:  everything below yellow
+
+    For two-sided ranges (flow with low+high), the high side drives the
+    primary zones since that is the user-visible compliance concern. The
+    low side, if present, narrows the green band's lower bound.
+
+    Returns a dict suitable for ``daq.Gauge(color=...)``. If no usable
+    thresholds are present, returns a single-color (green) range so the
+    gauge still renders cleanly.
+    """
+    high_oper_f = _to_float(high_oper)
+    high_limit_f = _to_float(high_limit)
+    low_oper_f = _to_float(low_oper)
+    low_limit_f = _to_float(low_limit)
+
+    margin = max(0.0, min(yellow_margin_pct, 50.0)) / 100.0
+
+    # Determine the upper red/yellow boundaries.
+    if high_oper_f is not None and high_limit_f is not None:
+        yellow_lo = min(high_oper_f, high_limit_f)
+        red_lo = max(high_oper_f, high_limit_f)
+    elif high_limit_f is not None:
+        yellow_lo = high_limit_f * (1.0 - margin) if high_limit_f >= 0 else high_limit_f * (1.0 + margin)
+        red_lo = high_limit_f
+    elif high_oper_f is not None:
+        yellow_lo = high_oper_f * (1.0 - margin) if high_oper_f >= 0 else high_oper_f * (1.0 + margin)
+        red_lo = high_oper_f
+    else:
+        # No upper bound — render full green.
+        return {
+            "gradient": False,
+            "ranges": {COLOR_GOOD: [gmin, gmax]},
+        }
+
+    # Clamp boundaries inside [gmin, gmax] and keep monotonic.
+    green_lo = gmin
+    # If a low limit exists, the green band starts just above it.
+    if low_oper_f is not None:
+        green_lo = max(green_lo, low_oper_f)
+    elif low_limit_f is not None:
+        green_lo = max(green_lo, low_limit_f)
+
+    yellow_lo = max(min(yellow_lo, gmax), green_lo)
+    red_lo = max(min(red_lo, gmax), yellow_lo)
+
+    ranges: Dict[str, List[float]] = {}
+    if yellow_lo > green_lo:
+        ranges[COLOR_GOOD] = [round(green_lo, 4), round(yellow_lo, 4)]
+    if red_lo > yellow_lo:
+        ranges[COLOR_WARNING] = [round(yellow_lo, 4), round(red_lo, 4)]
+    if gmax > red_lo:
+        ranges[COLOR_BAD] = [round(red_lo, 4), round(gmax, 4)]
+
+    if not ranges:
+        ranges[COLOR_GOOD] = [round(gmin, 4), round(gmax, 4)]
+
+    return {"gradient": False, "ranges": ranges}
 
 
 # ============================================================================
@@ -3969,9 +4138,12 @@ def build_cems_card(
     high_for_class = high_oper if high_oper is not None else high_eff
 
     status = classify_value(value, low_for_class, high_for_class)
-    color = status_color(status)
-
-    value_label = f"{value:.2f}" if value == value else "—"
+    border_color = status_color(status)
+    zone_color = compute_gauge_zones(
+        gmin, gmax,
+        low_oper=low_oper, high_oper=high_oper,
+        low_limit=low_limit, high_limit=high_limit,
+    )
 
     if (
         rolling_avg == rolling_avg
@@ -4004,7 +4176,7 @@ def build_cems_card(
 
     card_style = {
         **CARD_STYLE,
-        "borderTop": f"3px solid {color}",
+        "borderTop": f"3px solid {border_color}",
     }
 
     return html.Div(
@@ -4021,8 +4193,8 @@ def build_cems_card(
                         max=gmax,
                         value=value if value == value else gmin,
                         showCurrentValue=True,
-                        color=color,
-                        label=f"Current {units_label.upper()}: {value_label}",
+                        color=zone_color,
+                        label={"label": f"Current hour ({units_label})", "style": {"fontSize": "12px"}},
                         size=220,
                         units=units_label,
                     ),
@@ -4070,12 +4242,12 @@ def build_flow_card(
     high_for_class = high_oper if high_oper is not None else high_eff
 
     status = classify_value(value, low_for_class, high_for_class)
-    color = status_color(status)
-
-    if value == value:
-        value_label = f"{value:.2f}"
-    else:
-        value_label = "—"
+    border_color = status_color(status)
+    zone_color = compute_gauge_zones(
+        gmin, gmax,
+        low_oper=low_oper, high_oper=high_oper,
+        low_limit=low_limit, high_limit=high_limit,
+    )
 
     if (
         rolling_avg == rolling_avg
@@ -4107,7 +4279,7 @@ def build_flow_card(
 
     card_style = {
         **CARD_STYLE,
-        "borderTop": f"3px solid {color}",
+        "borderTop": f"3px solid {border_color}",
     }
 
     return html.Div(
@@ -4124,8 +4296,8 @@ def build_flow_card(
                         max=gmax,
                         value=value if value == value else gmin,
                         showCurrentValue=True,
-                        color=color,
-                        label=f"Current hourly avg: {value_label}",
+                        color=zone_color,
+                        label={"label": "Current hourly avg", "style": {"fontSize": "12px"}},
                         size=220,
                         units=units_label,
                     ),
@@ -4146,27 +4318,34 @@ def build_processing_time_card(
     Gauge runs 0–60 minutes. Below the gauge: today's total (prominent),
     then all-time total across every raw_data_*.csv (secondary).
     """
-    # Gauge range is fixed: 0 to 60 minutes (one full hour)
+    # Gauge range is fixed: 0 to 60 minutes (one full hour). The full red /
+    # yellow / green bands give an at-a-glance read of how much of the hour
+    # was spent processing.
     gmin = 0
     gmax = 60
+    zone_color = {
+        "gradient": False,
+        "ranges": {
+            COLOR_BAD: [0, 15],       # very little processing this hour
+            COLOR_WARNING: [15, 45],  # partial hour
+            COLOR_GOOD: [45, 60],     # most of the hour
+        },
+    }
 
     value = current_hour_minutes
     has_value = isinstance(value, (int, float)) and value == value
 
     if has_value:
         value = min(max(value, 0), 60)
-        # Color based on how much of the hour was processing
         if value >= 45:
-            color = COLOR_GOOD
+            border_color = COLOR_GOOD
         elif value >= 15:
-            color = COLOR_WARNING
-        elif value > 0:
-            color = "#fb923c"   # orange — light
+            border_color = COLOR_WARNING
         else:
-            color = COLOR_TEXT_SUBTLE  # gray — none
+            border_color = COLOR_BAD
         value_label = f"{value:.1f}"
     else:
-        color = COLOR_TEXT_SUBTLE
+        border_color = COLOR_TEXT_SUBTLE
         value_label = "—"
         value = 0
 
@@ -4207,7 +4386,7 @@ def build_processing_time_card(
 
     card_style = {
         **CARD_STYLE,
-        "borderTop": f"3px solid {color}",
+        "borderTop": f"3px solid {border_color}",
     }
 
     return html.Div(
@@ -4227,8 +4406,8 @@ def build_processing_time_card(
                         max=gmax,
                         value=value,
                         showCurrentValue=True,
-                        color=color,
-                        label=f"Current hour: {value_label} min",
+                        color=zone_color,
+                        label={"label": "Minutes this hour", "style": {"fontSize": "12px"}},
                         size=220,
                         units="min",
                     ),

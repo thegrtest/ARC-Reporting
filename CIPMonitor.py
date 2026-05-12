@@ -1321,9 +1321,6 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
     uptime_pct = uptime.get("uptime_pct", 0.0)
     op_hours = uptime.get("operating_hours", 0)
     valid_hours = uptime.get("valid_cems_hours", 0)
-    total_report_hours = float(uptime.get("total_hours", 0)) or (
-        (end - start).total_seconds() / 3600.0
-    )
 
     R = _RPT  # shorthand
 
@@ -1403,32 +1400,21 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
         ax_table = fig.add_subplot(gs[2, 0])
         ax_table.axis("off")
 
-        report_avail_pct = (
-            (valid_hours / total_report_hours * 100.0)
-            if total_report_hours > 0 else 0.0
-        )
-        if total_report_hours > 0:
-            uptime_text = (
-                f"{report_avail_pct:.1f}% of report "
-                f"({valid_hours}/{int(round(total_report_hours))} hrs)"
-            )
-            if op_hours > 0:
-                uptime_text += f"; {uptime_pct:.1f}% of operating"
-        else:
-            uptime_text = "N/A"
-
         hours_processed_precise = float(processing_stats.get("total_hours", 0.0))
         capped_gaps = int(processing_stats.get("capped_gap_count", 0))
-        proc_pct = (
-            (hours_processed_precise / total_report_hours * 100.0)
-            if total_report_hours > 0 else 0.0
-        )
-        hours_text = (
-            f"{hours_processed_precise:.2f} / {total_report_hours:.2f} hrs "
-            f"({proc_pct:.1f}%)"
-        )
+        hours_text = f"{hours_processed_precise:.2f} hrs"
         if capped_gaps > 0:
             hours_text += f"  ({capped_gaps} gap(s) capped)"
+
+        # CEMS Data Availability = share of kiln processing time that produced
+        # valid CEMS data. Denominator is processing (operating) hours so the
+        # number directly answers "how much of the kiln run did we monitor?"
+        if op_hours > 0:
+            uptime_text = (
+                f"{uptime_pct:.1f}% ({valid_hours}/{op_hours} processing hrs)"
+            )
+        else:
+            uptime_text = "N/A"
 
         summary_rows = [
             [f"Average Flow Rate ({flow_label})", f"{flow_avg:.2f}" if flow_avg is not None else "N/A"],
@@ -1635,13 +1621,6 @@ def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
         valid_hrs = int(uptime.get("valid_cems_hours", 0))
         missing_hrs = int(uptime.get("missing_hours", 0))
         uptime_pct = float(uptime.get("uptime_pct", 0))
-        total_report_hours = float(uptime.get("total_hours", 0)) or (
-            (end - start).total_seconds() / 3600.0
-        )
-        report_avail_pct = (
-            (valid_hrs / total_report_hours * 100.0)
-            if total_report_hours > 0 else 0.0
-        )
         flow_avg = _compute_avg_flow(hourly_range, flow_tag)
 
         # Precise processing-time calculation from raw data (sub-minute granularity)
@@ -1661,14 +1640,7 @@ def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
             hourly_range, nox_tag, flow_tag, EPA19_NOX_MOLECULAR_WEIGHT, processing_hour_starts
         )
 
-        proc_pct = (
-            (hours_processed_precise / total_report_hours * 100.0)
-            if total_report_hours > 0 else 0.0
-        )
-        hours_text = (
-            f"{hours_processed_precise:.2f} / {total_report_hours:.2f} hrs "
-            f"({proc_pct:.1f}%)"
-        )
+        hours_text = f"{hours_processed_precise:.2f} hrs"
         if capped_gaps > 0:
             hours_text += f" ({capped_gaps} capped)"
 
@@ -1681,19 +1653,16 @@ def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
 
         flow_label = _display_name(flow_tag, alias_map, "Flow")
 
-        if total_report_hours > 0:
+        if op_hrs > 0:
             cems_avail_text = (
-                f"{report_avail_pct:.1f}% of report "
-                f"({valid_hrs}/{int(round(total_report_hours))} hrs)"
+                f"{uptime_pct:.1f}% ({valid_hrs}/{op_hrs} processing hrs)"
             )
         else:
             cems_avail_text = "N/A"
-        operating_pct_text = f"{uptime_pct:.1f}%" if op_hrs > 0 else "N/A"
 
         stats_rows = [
-            ["CEMS Availability (report)", cems_avail_text],
-            ["CEMS Availability (operating)", operating_pct_text],
             ["Hours Processed", hours_text],
+            ["CEMS Data Availability", cems_avail_text],
             ["Valid CEMS Hours", f"{valid_hrs}"],
             ["Missing CEMS Hours", f"{missing_hrs}"],
             ["", ""],
@@ -1785,9 +1754,10 @@ def generate_daily_ops_pdf(range_key: str) -> Optional[str]:
         ax_footer.axis("off")
         ax_footer.text(
             0.0, 0.8,
-            "CEMS Data Availability (report) = valid CEMS hours / total report hours; "
-            "(operating) = valid CEMS hours / operating hours. "
-            "Regulatory requirement is typically 90% or greater of operating time.",
+            "Hours Processed = total time the kiln was in processing state. "
+            "CEMS Data Availability = valid CEMS hours / processing hours "
+            "(i.e. how much of the kiln run we were able to monitor). "
+            "Regulatory requirement is typically 90% or greater.",
             fontsize=8.5, color=R["subtle"], style="italic",
         )
         ax_footer.text(
@@ -1863,13 +1833,6 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
     uptime_pct = float(uptime.get("uptime_pct", 0))
     op_hrs = int(uptime.get("operating_hours", 0))
     valid_hrs = int(uptime.get("valid_cems_hours", 0))
-    total_report_hours = float(uptime.get("total_hours", 0)) or (
-        (end - start).total_seconds() / 3600.0
-    )
-    report_avail_pct = (
-        (valid_hrs / total_report_hours * 100.0)
-        if total_report_hours > 0 else 0.0
-    )
 
     R = _RPT
 
@@ -1903,13 +1866,10 @@ def generate_incident_report_pdf(range_key: str) -> Optional[str]:
         ax_summary = fig.add_subplot(gs[1, 0])
         ax_summary.axis("off")
 
-        if total_report_hours > 0:
+        if op_hrs > 0:
             uptime_text = (
-                f"{report_avail_pct:.1f}% of report "
-                f"({valid_hrs}/{int(round(total_report_hours))} hrs)"
+                f"{uptime_pct:.1f}% ({valid_hrs}/{op_hrs} processing hrs)"
             )
-            if op_hrs > 0:
-                uptime_text += f"; {uptime_pct:.1f}% of operating"
         else:
             uptime_text = "N/A"
         summary_rows = [

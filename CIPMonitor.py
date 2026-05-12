@@ -1357,6 +1357,9 @@ def generate_report_pdf(range_key: str) -> Optional[str]:
         ax_chart.set_facecolor(R["panel"])
         ax_chart.grid(True, linestyle="--", color=R["grid"], alpha=0.6)
         ax_chart.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%m-%d\n%H:%M"))
+        # Match the chart x-axis to the reported window so the visible
+        # range equals the exported window even with sparse data.
+        ax_chart.set_xlim(start, end)
 
         lines = []
         labels = []
@@ -1491,11 +1494,14 @@ def _add_hourly_chart_page(
         plot_specs.append(("O2", o2_tag, "avg_value", "%", R["bar_o2"]))
 
     n_plots = max(len(plot_specs), 1)
-    # Reserve room at top for the title block and at the bottom so rotated
-    # x-tick labels are never clipped by the page margin.
-    top_reserve = 0.10
+    # Layout: leave a clear top band below the page title (so each plot's
+    # set_title doesn't crash into the date stamp), enough bottom margin
+    # for rotated x-tick labels, and a wide enough inter-plot gap that the
+    # tick labels of one plot never collide with the title of the plot
+    # below it.
+    top_reserve = 0.14
     bottom_reserve = 0.08
-    plot_gap = 0.04
+    plot_gap = 0.10
     usable = 1.0 - top_reserve - bottom_reserve
     per_plot = (usable - (n_plots - 1) * plot_gap) / n_plots
 
@@ -1507,13 +1513,18 @@ def _add_hourly_chart_page(
         ax.set_facecolor(R["panel"])
         ax.grid(True, axis="y", linestyle="--", color=R["grid"], alpha=0.5)
 
+        # Pin the x-axis to the reported window so the chart visually
+        # matches the exported time range even when data is missing at
+        # the head or tail of the period.
+        ax.set_xlim(start, end)
+
         tag_data = hourly_range.loc[hourly_range["tag"] == tag].copy() if not hourly_range.empty else pd.DataFrame()
 
         if tag_data.empty or value_col not in tag_data.columns:
             ax.text(0.5, 0.5, f"No hourly data for {_display_name(tag, alias_map, name)}",
                     ha="center", va="center", fontsize=10, color=R["muted"], transform=ax.transAxes)
             ax.set_title(f"{name} ({_display_name(tag, alias_map, name)})",
-                         fontsize=11, color=R["text"], loc="left")
+                         fontsize=10, color=R["text"], loc="left", pad=4)
             continue
 
         tag_data = tag_data.sort_values("hour_start")
@@ -1523,7 +1534,7 @@ def _add_hourly_chart_page(
         ax.bar(hours, values, width=timedelta(hours=0.8), color=color, alpha=0.85, edgecolor="none")
         ax.set_ylabel(unit, fontsize=9, color=R["text"])
         ax.set_title(f"{name} Hourly Average ({_display_name(tag, alias_map, name)})",
-                     fontsize=11, color=R["text"], loc="left")
+                     fontsize=10, color=R["text"], loc="left", pad=4)
         ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%m-%d %H:%M"))
         ax.tick_params(axis="x", labelsize=7, rotation=30)
         ax.tick_params(axis="y", labelsize=8)

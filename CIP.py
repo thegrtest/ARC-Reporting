@@ -103,6 +103,15 @@ MACHINE_STATE_MAP = {
     4: "Shutdown",
 }
 
+# QA flags whose samples are still valid measurements and MUST be included in
+# averages / emission totals. OUT_OF_RANGE means a real, numeric reading that
+# merely exceeded an operational/regulatory threshold -- excluding it would drop
+# exactly the highest-emission data from the averages this system reports, which
+# is the opposite of what a compliance monitor must do. The raw row keeps its
+# OUT_OF_RANGE flag for exceedance detection regardless. PLC_ERROR / MISSING /
+# SUSPECT / STALE are genuinely bad/unreliable and stay excluded.
+ACCUMULATABLE_QA_FLAGS = frozenset({"OK", "OUT_OF_RANGE", "MANUAL_CORRECTION"})
+
 
 # ------------------- helpers -------------------
 
@@ -901,7 +910,7 @@ class MainWindow(QMainWindow):
         "new_value",
         "reason",
     ]
-    EPA19_MOLAR_VOLUME_SCF = 385.8        # SCF/lb-mol at 68 F, 14.696 psia (EPA std)
+    EPA19_MOLAR_VOLUME_SCF = 385.3        # SCF/lb-mol at 68 F, 14.696 psia (EPA std)
     EPA19_MOLECULAR_WEIGHTS = {
         "NOx": 46.0,  # as NO2
         "CO": 28.01,
@@ -975,6 +984,16 @@ class MainWindow(QMainWindow):
         self.stale_intervals_threshold = 5
         self.gap_threshold_minutes = 5
         self.moving_tags: List[str] = []
+        # Environmental data-availability (data-capture) standard for rolling
+        # averages. An hour is only a "valid hour" -- eligible to be averaged
+        # into a rolling window -- if it captured data for at least
+        # min_hour_data_capture_fraction of the hour (CEMS rules commonly use
+        # 75%). Hours below this are excluded entirely rather than being
+        # averaged in as if they were full hours, so a sparse/under-sampled
+        # hour can never dilute or skew a rolling average. The in-progress hour
+        # is judged against the minutes that have actually elapsed so far.
+        self.expected_minutes_per_hour = 60
+        self.min_hour_data_capture_fraction = 0.75
         self.thresholds: Dict[str, Dict[str, object]] = {}
         self.thresholds_table: Optional[QTableWidget] = None
         self.thresholds_sync_btn: Optional[QPushButton] = None
@@ -1432,23 +1451,23 @@ class MainWindow(QMainWindow):
                     self.hourly_csv_path,
                     ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
                 )
-                with open(self.hourly_csv_path, "w", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(
-                        ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"]
-                    )
-                    for (hs, tag), (he, avg, lbhr_avg, cnt, alias) in sorted(records.items()):
-                        writer.writerow(
-                            [
-                                hs,
-                                he,
-                                tag,
-                                alias,
-                                "" if avg is None else avg,
-                                "" if lbhr_avg is None else lbhr_avg,
-                                cnt,
-                            ]
-                        )
+                rows = [
+                    [
+                        hs,
+                        he,
+                        tag,
+                        alias,
+                        "" if avg is None else avg,
+                        "" if lbhr_avg is None else lbhr_avg,
+                        cnt,
+                    ]
+                    for (hs, tag), (he, avg, lbhr_avg, cnt, alias) in sorted(records.items())
+                ]
+                self._atomic_write_csv(
+                    self.hourly_csv_path,
+                    ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
+                    rows,
+                )
                 for hour_end in hour_ends:
                     self._update_rolling_12hr_from_records(records, hour_end)
             except Exception as e:
@@ -2680,7 +2699,7 @@ class MainWindow(QMainWindow):
             lb/hr = ppm * Q_scfm * 60 * MW / (1e6 * Vm)
 
         Q_scfm and Vm must be on the same temperature/pressure/moisture basis.
-        Vm = 385.8 SCF/lb-mol corresponds to 68 F, 14.696 psia (EPA standard).
+        Vm = 385.3 SCF/lb-mol corresponds to 68 F, 14.696 psia (EPA standard).
         """
         return (
             ppmv
@@ -2700,7 +2719,7 @@ class MainWindow(QMainWindow):
         flow rate. The conversion here is the bare EPA Method 19
         stoichiometric step:
 
-            lb/hr = ppm * Q_dscfm * 60 * MW / (1e6 * 385.8)
+            lb/hr = ppm * Q_dscfm * 60 * MW / (1e6 * 385.3)
 
         No additional O2 correction or wet-to-dry conversion is applied --
         applying one again would double-correct values the CEMS has
@@ -3538,6 +3557,245 @@ class MainWindow(QMainWindow):
 
         return "OK"
 
+    def _warm_start_hour_accumulators(self, hour_start: datetime) -> None:
+        """Rebuild in-memory hour accumulators for an in-progress hour from the
+        persisted raw samples on disk.
+
+        Without this, starting/restarting the poller mid-hour zeroes the hour's
+        accumulators (see the reset in start_polling and finalize_previous_hour,
+        which builds the hourly average from these in-memory accumulators). The
+        finalized hourly value would then reflect only post-restart samples, and
+        the live rolling-12h in-progress hour would dip and re-climb -- a "hard
+        reset" of the current hour on every restart.
+
+        We reconstruct only COMPLETED minutes (minute_start < the current
+        minute). The current, still-accumulating minute keeps filling
+        minute_accumulators live, so nothing is double-counted when it later
+        rolls into the hour. In normal (no-restart) operation this is a no-op
+        because hour_accumulators is already populated and current_hour_start
+        does not transition through None.
+        """
+        self.hour_accumulators.clear()
+        try:
+            now = datetime.now()
+            current_minute_start = now.replace(second=0, microsecond=0)
+            if current_minute_start <= hour_start:
+                return  # nothing completed yet in this hour
+            path = self._raw_path_for_date(hour_start.date())
+            if not path or not os.path.exists(path):
+                return
+            # tag -> minute_start -> list of accumulatable sample values.
+            # Mirror the live accumulation gate (ACCUMULATABLE_QA_FLAGS): include
+            # OK plus valid-but-over-limit (OUT_OF_RANGE) and MANUAL_CORRECTION
+            # samples. Filtering to qa_flag == "OK" here would drop exactly the
+            # highest-emission readings when reconstructing a restarted hour and
+            # understate the finalized hourly and rolling-12hr compliance numbers.
+            per_minute: Dict[str, Dict[datetime, List[float]]] = {}
+            with open(path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if str(row.get("qa_flag", "")).upper() not in ACCUMULATABLE_QA_FLAGS:
+                        continue
+                    tag = row.get("tag", "")
+                    if not tag:
+                        continue
+                    try:
+                        ts = datetime.fromisoformat(row.get("timestamp", ""))
+                    except Exception:
+                        continue
+                    if ts < hour_start or ts >= current_minute_start:
+                        continue
+                    num = self._safe_float(row.get("value"))
+                    if not self._is_valid_number(num):
+                        continue
+                    minute = ts.replace(second=0, microsecond=0)
+                    per_minute.setdefault(tag, {}).setdefault(minute, []).append(float(num))
+            for tag, minutes in per_minute.items():
+                acc = self.hour_accumulators.setdefault(tag, {"sum": 0.0, "count": 0})
+                for _minute, vals in minutes.items():
+                    if vals:
+                        # Per-minute average, then the same PS-4B CO span cap the
+                        # live path applies in _minute_average, so the warm-started
+                        # hour matches what live accumulation would have produced.
+                        minute_avg = self._apply_minute_cap(tag, sum(vals) / len(vals))
+                        acc["sum"] += minute_avg
+                        acc["count"] += 1
+            if per_minute:
+                self.log_message(
+                    f"Warm-started hour accumulators for "
+                    f"{hour_start.isoformat(timespec='minutes')} from persisted raw "
+                    f"data ({len(per_minute)} tag(s)) -- no reset of the in-progress hour."
+                )
+        except Exception as e:
+            self.log_message(f"Warm-start of hour accumulators failed: {e}")
+
+    def _recover_completed_hours_from_raw(self, current_hour_start: datetime) -> None:
+        """Finalize completed hours present in raw data but missing from
+        hourly_averages.csv.
+
+        On a normal hour transition finalize_previous_hour writes the just-ended
+        hour. But if the poller stops mid-hour and restarts in a LATER hour, that
+        previous hour is never finalized and would be silently missing from
+        hourly_averages.csv -- and therefore from the 12-hr rolling window. This
+        rebuilds any such completed hour (hour_start < current_hour_start) from
+        raw, mirroring live accumulation exactly: per-minute average (with the
+        PS-4B CO span cap), the ACCUMULATABLE_QA_FLAGS gate, status == success,
+        and the lb/hr derivation. Existing finalized hours are never modified --
+        only missing ones are added. Bounded to a recent lookback for speed; a
+        longer outage should be repaired with the full 'Rebuild hourly from raw'.
+        """
+        try:
+            if not self.hourly_csv_path:
+                return
+            lookback_days = 2
+
+            # Existing finalized records: (hour_start_iso, tag) -> record tuple.
+            # We preserve every existing hour untouched and only add missing ones.
+            records: Dict[
+                Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]
+            ] = {}
+            existing_hour_starts: set = set()
+            if os.path.exists(self.hourly_csv_path):
+                with open(self.hourly_csv_path, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        tag = row.get("tag", "")
+                        hs = row.get("hour_start", "")
+                        if not tag or not hs:
+                            continue
+                        existing_hour_starts.add(hs)
+                        records[(hs, tag)] = (
+                            row.get("hour_end", ""),
+                            self._safe_float(row.get("avg_value")),
+                            self._safe_float(row.get("avg_lb_hr")),
+                            int(row.get("sample_count", "0") or 0),
+                            row.get("alias", "") or "",
+                        )
+
+            # Accumulate raw -> (hour, tag) -> minute_start -> sample values, over
+            # the bounded lookback, for COMPLETED hours only (strictly before the
+            # current in-progress hour) that are not already finalized on disk.
+            earliest_hour = current_hour_start - timedelta(days=lookback_days)
+            per_hour_minute: Dict[
+                Tuple[datetime, str], Dict[datetime, List[float]]
+            ] = {}
+            alias_by_tag: Dict[str, str] = {}
+            for offset in range(lookback_days + 1):
+                d = (current_hour_start - timedelta(days=offset)).date()
+                path = self._raw_path_for_date(d)
+                open_func = open
+                if path and os.path.exists(path):
+                    open_func = open
+                else:
+                    gz = f"{path}.gz" if path else None
+                    if gz and os.path.exists(gz):
+                        path = gz
+                        open_func = gzip.open
+                    else:
+                        continue
+                with open_func(path, "rt", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        try:
+                            ts = datetime.fromisoformat(row.get("timestamp", ""))
+                        except Exception:
+                            continue
+                        hstart = hour_bucket(ts)
+                        if hstart >= current_hour_start or hstart < earliest_hour:
+                            continue
+                        if hstart.isoformat(timespec="seconds") in existing_hour_starts:
+                            continue  # already finalized; never touch it
+                        if str(row.get("status", "")).lower() != "success":
+                            continue
+                        if str(row.get("qa_flag", "")).upper() not in ACCUMULATABLE_QA_FLAGS:
+                            continue
+                        tag = row.get("tag", "")
+                        if not tag:
+                            continue
+                        num = self._safe_float(row.get("value"))
+                        if not self._is_valid_number(num):
+                            continue
+                        alias = str(row.get("alias", "") or "").strip()
+                        if alias:
+                            alias_by_tag[tag] = alias
+                        minute = ts.replace(second=0, microsecond=0)
+                        per_hour_minute.setdefault((hstart, tag), {}).setdefault(
+                            minute, []
+                        ).append(float(num))
+
+            if not per_hour_minute:
+                return
+
+            # Build hour accumulators (minute-average -> hour), grouped by hour so
+            # lb/hr is derived from each hour's own mean ppm and mean flow.
+            hours: Dict[datetime, Dict[str, Dict[str, float]]] = {}
+            for (hstart, tag), minutes in per_hour_minute.items():
+                hour_acc = hours.setdefault(hstart, {})
+                acc = hour_acc.setdefault(tag, {"sum": 0.0, "count": 0})
+                for _minute, vals in minutes.items():
+                    if vals:
+                        acc["sum"] += self._apply_minute_cap(tag, sum(vals) / len(vals))
+                        acc["count"] += 1
+
+            lbhr_capable = self._epa_lbhr_capable_ppm_tags()
+            recovered = 0
+            for hstart, tag_accs in hours.items():
+                avg_lookup: Dict[str, float] = {}
+                for tag, acc in tag_accs.items():
+                    if acc["count"] > 0:
+                        avg_lookup[tag] = acc["sum"] / acc["count"]
+                if not avg_lookup:
+                    continue
+                hstart_iso = hstart.isoformat(timespec="seconds")
+                hend_iso = (hstart + timedelta(hours=1)).isoformat(timespec="seconds")
+                for tag, acc in tag_accs.items():
+                    if acc["count"] <= 0:
+                        continue
+                    avg = avg_lookup[tag]
+                    lbhr_avg: Optional[float] = None
+                    if tag in lbhr_capable:
+                        derived = self._compute_lbhr_from_avg(tag, avg_lookup)
+                        if derived is not None:
+                            lbhr_avg = derived
+                    alias = alias_by_tag.get(tag, "") or self.alias_map.get(tag, "")
+                    records[(hstart_iso, tag)] = (
+                        hend_iso, avg, lbhr_avg, int(acc["count"]), alias,
+                    )
+                recovered += 1
+
+            if recovered <= 0:
+                return
+
+            rows = [
+                [
+                    hs,
+                    he,
+                    tag,
+                    alias,
+                    "" if avg is None else avg,
+                    "" if lbhr_avg is None else lbhr_avg,
+                    cnt,
+                ]
+                for (hs, tag), (he, avg, lbhr_avg, cnt, alias) in sorted(records.items())
+            ]
+            self._atomic_write_csv(
+                self.hourly_csv_path,
+                ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
+                rows,
+            )
+            # Refresh the persisted rolling 12-hr file from the now-complete
+            # hourly records, ending at the latest finalized hour.
+            latest_hour_end = max(
+                datetime.fromisoformat(hs) for (hs, _t) in records.keys()
+            ) + timedelta(hours=1)
+            self._update_rolling_12hr_from_records(records, latest_hour_end)
+            self.log_message(
+                f"Startup recovery: finalized {recovered} completed hour(s) from "
+                f"raw that were missing from hourly_averages.csv."
+            )
+        except Exception as e:
+            self.log_message(f"Startup recovery of unfinalized hours failed: {e}")
+
     def handle_poll_data(self, ts_iso: str, data: Dict[str, Tuple[object, str]]):
         """
         Called from background thread with new readings.
@@ -3566,7 +3824,17 @@ class MainWindow(QMainWindow):
                 self.minute_accumulators.clear()
 
             if self.current_hour_start is None:
+                # First poll (startup/restart). Two-step recovery so a restart
+                # cannot punch a hole in the 12-hr window:
+                #   1. Finalize any COMPLETED hours that have raw data but were
+                #      never written to hourly_averages.csv (e.g. the hour that
+                #      was in progress when the poller last stopped, if we restart
+                #      in a later hour).
+                #   2. Warm-start the now-current in-progress hour from raw,
+                #      instead of starting it from zero.
+                self._recover_completed_hours_from_raw(hour_start)
                 self.current_hour_start = hour_start
+                self._warm_start_hour_accumulators(hour_start)
             elif hour_start != self.current_hour_start:
                 self.finalize_previous_hour()
                 self.current_hour_start = hour_start
@@ -3597,7 +3865,7 @@ class MainWindow(QMainWindow):
                     alias = self.alias_map.get(tag, "")
                     rows.append([ts_iso, date_str, time_str, tag, alias, val, status, qa_flag])
 
-                    if qa_flag == "OK":
+                    if qa_flag in ACCUMULATABLE_QA_FLAGS:
                         self._check_gap_event(tag, ts)
                         num_val = self._safe_float(val)
                         if self._is_valid_number(num_val):
@@ -3679,13 +3947,20 @@ class MainWindow(QMainWindow):
         return isinstance(value, (int, float)) and value == value
 
     def _ppm_cap_tags(self) -> set:
+        # The 3,000 -> 10,000 ppmv span substitution is the CO CEMS requirement
+        # of EPA Performance Specification 4B (permit 1272-AOP-R1 SC#185): when a
+        # CO one-minute average is at or above the 3,000 ppmv span, it must be
+        # recorded as 10,000 ppmv for the rolling-average calculation. It applies
+        # to the CO CEMS ONLY -- it has no regulatory basis for NOx, so the NOx
+        # channel is never capped (a true high NOx reading is carried through).
         tags = [
-            self._resolve_tag_from_alias(self.epa_nox_tag),
             self._resolve_tag_from_alias(self.epa_co_tag),
         ]
         return {tag for tag in tags if tag}
 
     def _apply_minute_cap(self, tag: str, avg: float) -> float:
+        # PS-4B / SC#185 CO span substitution: clamp an over-span CO minute
+        # average to the 10,000 ppmv plateau used for the rolling average.
         if tag in self._ppm_cap_tags() and avg > 3000:
             return 10000.0
         return avg
@@ -3835,6 +4110,24 @@ class MainWindow(QMainWindow):
             self.log_message(f"Error reading rolling 12-hour CSV: {e}")
         return records
 
+    def _atomic_write_csv(self, path: str, header: List[object], rows: List[List[object]]) -> None:
+        """Write header + rows to ``path`` atomically (temp file + os.replace).
+
+        A plain ``open(path, "w")`` truncates the existing file to zero before
+        the first byte is written, so a crash / power loss / disk-full mid-write
+        leaves the file empty or partial -- destroying the entire history, not
+        just the row being updated. For the hourly and rolling CSVs that also
+        punches holes into every downstream rolling-average window. Writing to a
+        sibling ``.tmp`` and then ``os.replace`` makes the swap all-or-nothing:
+        readers always see either the old complete file or the new complete one.
+        """
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerows(rows)
+        os.replace(tmp_path, path)
+
     def _write_rolling_12hr_records(
         self,
         records: Dict[Tuple[str, str], Tuple[str, Optional[float], Optional[float], int, str]],
@@ -3845,25 +4138,62 @@ class MainWindow(QMainWindow):
                 ["window_start", "window_end", "tag", "alias", "avg_value", "avg_lb_hr", "hours_count"],
             )
             self._wait_for_export_unlock("rolling 12-hour")
-            with open(self.rolling_12hr_csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(
-                    ["window_start", "window_end", "tag", "alias", "avg_value", "avg_lb_hr", "hours_count"]
-                )
-                for (window_end, tag), (window_start, avg, lbhr_avg, count, alias) in sorted(records.items()):
-                    writer.writerow(
-                        [
-                            window_start,
-                            window_end,
-                            tag,
-                            alias,
-                            "" if avg is None else avg,
-                            "" if lbhr_avg is None else lbhr_avg,
-                            count,
-                        ]
-                    )
+            rows = [
+                [
+                    window_start,
+                    window_end,
+                    tag,
+                    alias,
+                    "" if avg is None else avg,
+                    "" if lbhr_avg is None else lbhr_avg,
+                    count,
+                ]
+                for (window_end, tag), (window_start, avg, lbhr_avg, count, alias) in sorted(records.items())
+            ]
+            self._atomic_write_csv(
+                self.rolling_12hr_csv_path,
+                ["window_start", "window_end", "tag", "alias", "avg_value", "avg_lb_hr", "hours_count"],
+                rows,
+            )
         except Exception as e:
             self.log_message(f"Error writing rolling 12-hour CSV: {e}")
+
+    def _required_valid_minutes(self, hour_start: datetime, reference_now: Optional[datetime] = None) -> int:
+        """Minutes of captured data an hour needs to count as a valid hour.
+
+        Completed hours require ``min_hour_data_capture_fraction`` of the full
+        hour. The in-progress hour is held to the same fraction of the minutes
+        that have actually elapsed within it, so a live hour with a polling gap
+        is excluded instead of entering the average under-sampled.
+        """
+        now = reference_now or datetime.now()
+        current_hour_start = hour_bucket(now)
+        if hour_start >= current_hour_start:
+            elapsed_min = int((now - hour_start).total_seconds() // 60)
+            expected = max(1, min(self.expected_minutes_per_hour, elapsed_min))
+        else:
+            expected = self.expected_minutes_per_hour
+        required = int(self.min_hour_data_capture_fraction * expected)
+        # round up: 75% of 60 -> 45, 75% of 7 -> 6 (5.25 rounded up)
+        if required < self.min_hour_data_capture_fraction * expected:
+            required += 1
+        return max(1, required)
+
+    def _hour_data_is_valid(
+        self,
+        minute_count: object,
+        hour_start: datetime,
+        reference_now: Optional[datetime] = None,
+    ) -> bool:
+        """True if an hour captured enough data to be averaged into a rolling
+        window (CEMS-style data-availability rule). See ``expected_minutes_per_hour``."""
+        try:
+            count = int(minute_count or 0)
+        except Exception:
+            count = 0
+        if count <= 0:
+            return False
+        return count >= self._required_valid_minutes(hour_start, reference_now)
 
     def _update_rolling_12hr_from_records(
         self,
@@ -3877,7 +4207,9 @@ class MainWindow(QMainWindow):
                 hour_start = datetime.fromisoformat(hour_start_iso)
             except Exception:
                 continue
-            if count <= 0:
+            # Data-availability rule: skip hours that did not capture enough
+            # data to be a valid hour, so sparse hours never enter the average.
+            if not self._hour_data_is_valid(count, hour_start):
                 continue
             tag_entries.setdefault(str(tag), []).append(
                 (hour_start, self._safe_float(avg), self._safe_float(lbhr_avg))
@@ -3916,14 +4248,24 @@ class MainWindow(QMainWindow):
 
         for tag, avg_val in avg_by_tag.items():
             lb_avg = lb_avg_by_tag.get(tag)
-            # Only derive lb/hr for lb/hr-capable tags (NOx, CO). O2 and Flow
-            # would otherwise pick up the legacy "mass rate of diluent"
-            # value, which is not a meaningful emission metric.
-            if lb_avg is None and tag in lbhr_capable:
+            # Permit SC#140 defines the 12-hr average as the arithmetic mean of
+            # the one-minute CONCENTRATIONS, then converted to lb/hr. So for
+            # lb/hr-capable tags (NOx, CO) always derive the rolling lb/hr fresh
+            # from the 12-hr mean ppm and mean flow rather than averaging the
+            # cached per-hour lb/hr values: averaging per-hour lb/hr is NOT
+            # equivalent when flow varies hour to hour, and this must match the
+            # rebuild and live-snapshot paths so the persisted CSV and the value
+            # written to the PLC agree. O2 and Flow are not lb/hr-capable.
+            if tag in lbhr_capable:
                 derived_lbhr = self._compute_lbhr_from_avg(tag, avg_lookup)
                 if derived_lbhr is not None:
                     lb_avg = derived_lbhr
                     lb_avg_by_tag[tag] = lb_avg
+                else:
+                    # No flow (or ppm) for the window -> no defensible lb/hr.
+                    # Leave it empty rather than fall back to a stale cached mean.
+                    lb_avg = None
+                    lb_avg_by_tag[tag] = None
 
             alias = alias_lookup.get(tag, "") or self.alias_map.get(tag, "")
             rolling_records[(window_end_iso, tag)] = (
@@ -3970,7 +4312,9 @@ class MainWindow(QMainWindow):
                 hour_start = datetime.fromisoformat(hour_start_iso)
             except Exception:
                 continue
-            if count <= 0:
+            # Data-availability rule: exclude hours below the data-capture
+            # threshold so a sparse hour can't enter any rolling window.
+            if not self._hour_data_is_valid(count, hour_start):
                 continue
             tag_entries.setdefault(str(tag), []).append(
                 (hour_start, self._safe_float(avg), self._safe_float(lbhr_avg))
@@ -4094,13 +4438,15 @@ class MainWindow(QMainWindow):
         ] = {}
         alias_lookup: Dict[str, str] = {}
         for (hour_start_iso, tag), (_, avg, lbhr_avg, count, alias) in records.items():
-            if count <= 0:
-                continue
             try:
                 hour_start = datetime.fromisoformat(hour_start_iso)
             except Exception:
                 continue
             if hour_start < window_start or hour_start >= current_hour_start:
+                continue
+            # Data-availability rule: only completed hours with enough captured
+            # data count toward the rolling window.
+            if not self._hour_data_is_valid(count, hour_start):
                 continue
             tag_entries.setdefault(tag, []).append(
                 (hour_start, self._safe_float(avg), self._safe_float(lbhr_avg))
@@ -4122,6 +4468,17 @@ class MainWindow(QMainWindow):
         for tag, val in current_snapshot.items():
             if not self._is_valid_number(val):
                 continue
+            # Minutes of data captured in the in-progress hour so far: completed
+            # minutes rolled into the hour accumulator, plus the current partial
+            # minute (which is included in current_snapshot). The data-capture
+            # rule is applied against minutes elapsed, so a live hour with a
+            # polling gap is excluded rather than entering the average sparse.
+            inprogress_minutes = int(self.hour_accumulators.get(tag, {}).get("count", 0) or 0)
+            current_minute = self.minute_accumulators.get(tag, {})
+            if int(current_minute.get("count", 0) or 0) > 0:
+                inprogress_minutes += 1
+            if not self._hour_data_is_valid(inprogress_minutes, current_hour_start):
+                continue
             tag_entries.setdefault(tag, []).append(
                 (current_hour_start, float(val), current_lbhr_lookup.get(tag))
             )
@@ -4136,7 +4493,12 @@ class MainWindow(QMainWindow):
             hours_count_by_tag[tag] = len(values)
             if values:
                 avg_by_tag[tag] = sum(values) / len(values)
-            if lb_values:
+            # For lb/hr-capable tags (NOx, CO) the rolling lb/hr is derived fresh
+            # from the 12-hr mean ppm and mean flow below (permit SC#140), so do
+            # not seed it here from the averaged cached per-hour lb/hr -- that
+            # would disagree with the persisted-CSV and rebuild paths when flow
+            # varies. Non-capable tags keep their averaged value (if any).
+            if lb_values and tag not in lbhr_capable:
                 lb_avg_by_tag[tag] = sum(lb_values) / len(lb_values)
 
         # Derive lb/hr from the rolling averages for any lb/hr-capable
@@ -4351,23 +4713,23 @@ class MainWindow(QMainWindow):
                     self._pending_hour_end_queue.append(hour_end)
                 return
 
-            with open(self.hourly_csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(
-                    ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"]
-                )
-                for (hs, tag), (he, avg, lbhr_avg, cnt, alias) in sorted(records.items()):
-                    writer.writerow(
-                        [
-                            hs,
-                            he,
-                            tag,
-                            alias,
-                            "" if avg is None else avg,
-                            "" if lbhr_avg is None else lbhr_avg,
-                            cnt,
-                        ]
-                    )
+            rows = [
+                [
+                    hs,
+                    he,
+                    tag,
+                    alias,
+                    "" if avg is None else avg,
+                    "" if lbhr_avg is None else lbhr_avg,
+                    cnt,
+                ]
+                for (hs, tag), (he, avg, lbhr_avg, cnt, alias) in sorted(records.items())
+            ]
+            self._atomic_write_csv(
+                self.hourly_csv_path,
+                ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
+                rows,
+            )
             self._update_rolling_12hr_from_records(records, hour_end)
             self.log_message(
                 f"Hourly averages upserted for hour starting {hour_start_iso}."
@@ -4465,7 +4827,9 @@ class MainWindow(QMainWindow):
                             val = float(row.get("value", ""))
                         except Exception:
                             continue
-                        if qa_flag and qa_flag != "OK":
+                        # Include valid-but-over-limit (OUT_OF_RANGE) samples in
+                        # rebuilt averages, mirroring the live accumulation gate.
+                        if qa_flag and qa_flag not in ACCUMULATABLE_QA_FLAGS:
                             continue
                         if status != "success":
                             continue
@@ -4551,45 +4915,45 @@ class MainWindow(QMainWindow):
                 self.minute_csv_path,
                 ["minute_start", "minute_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
             )
-            with open(self.minute_csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(
-                    ["minute_start", "minute_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"]
-                )
-                for (ms, tag), (me, mavg, lbhr_avg, cnt, alias) in sorted(minute_records.items()):
-                    writer.writerow(
-                        [
-                            ms,
-                            me,
-                            tag,
-                            alias,
-                            "" if mavg is None else mavg,
-                            "" if lbhr_avg is None else lbhr_avg,
-                            cnt,
-                        ]
-                    )
+            minute_rows = [
+                [
+                    ms,
+                    me,
+                    tag,
+                    alias,
+                    "" if mavg is None else mavg,
+                    "" if lbhr_avg is None else lbhr_avg,
+                    cnt,
+                ]
+                for (ms, tag), (me, mavg, lbhr_avg, cnt, alias) in sorted(minute_records.items())
+            ]
+            self._atomic_write_csv(
+                self.minute_csv_path,
+                ["minute_start", "minute_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
+                minute_rows,
+            )
 
             ensure_csv(
                 self.hourly_csv_path,
                 ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
             )
-            with open(self.hourly_csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(
-                    ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"]
-                )
-                for (hs, tag), (he, avg, lbhr_avg, cnt, alias) in sorted(records.items()):
-                    writer.writerow(
-                        [
-                            hs,
-                            he,
-                            tag,
-                            alias,
-                            "" if avg is None else avg,
-                            "" if lbhr_avg is None else lbhr_avg,
-                            cnt,
-                        ]
-                    )
+            hourly_rows = [
+                [
+                    hs,
+                    he,
+                    tag,
+                    alias,
+                    "" if avg is None else avg,
+                    "" if lbhr_avg is None else lbhr_avg,
+                    cnt,
+                ]
+                for (hs, tag), (he, avg, lbhr_avg, cnt, alias) in sorted(records.items())
+            ]
+            self._atomic_write_csv(
+                self.hourly_csv_path,
+                ["hour_start", "hour_end", "tag", "alias", "avg_value", "avg_lb_hr", "sample_count"],
+                hourly_rows,
+            )
             self._rebuild_rolling_12hr_from_records(records)
             self.log_message(
                 f"Rebuilt {len(minute_records)} minute and {len(records)} hourly "

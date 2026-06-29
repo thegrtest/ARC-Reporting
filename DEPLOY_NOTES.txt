@@ -1,0 +1,92 @@
+KILN3 CODE UPDATE — drop-over package
+=====================================
+
+CONTENTS (code files + compliance alignment doc):
+  - CIP.py                    (collector / poller)
+  - CIPMonitor.py             (dashboard + PDF reports + CLI tools)
+  - COMPLIANCE_ALIGNMENT.md   (permit limits vs. app config — for compliance defense)
+
+HOW TO DEPLOY
+  1. Stop the running CIP poller and the CIPMonitor dashboard.
+  2. Copy CIP.py and CIPMonitor.py over the existing files in the deployment folder.
+  3. Apply the thresholds.json changes described in the THRESHOLDS section below.
+  4. Restart.
+
+DO NOT COPY / DO NOT OVERWRITE (these live in the deployment and hold your data):
+  - logs/            (raw_data_*.csv[.gz], hourly_averages.csv, minute_averages.csv,
+                      rolling_12hr_averages.csv, rolling_12hr_live.csv, backups/, etc.)
+  - settings.json
+  - icons (*.ico), launch.bat, requirements.txt   (unchanged — keep existing)
+
+No dependency changes — requirements.txt is unchanged, so no pip install is needed.
+Both files are self-contained (no new local modules; they do not import each other).
+
+
+THRESHOLDS (logs/thresholds.json — apply these changes to your deployed file)
+===========
+Add the following limits derived from Permit 1272-AOP-R1:
+
+  "RotaryKilnData[4]"  — add:  "low_limit": 1700    (Afterburner Temp ≥1700°F, SC#139)
+  "RotaryKilnData[10]" — add:  "high_limit": 1200   (Throughput ≤1200 lb/hr, SC#136)
+  "EPA19:NOx_LBHR"     — add:  "high_limit": 10.2,  "alias": "NOx (lb/hr)"  (SC#130, 12-hr avg)
+  "EPA19:CO_LBHR"      — add:  "high_limit": 1.6,   "alias": "CO (lb/hr)"   (SC#130)
+
+These activate gauge yellow/red zones, exceedance detection, and compliance % reporting.
+
+See COMPLIANCE_ALIGNMENT.md for:
+  - Full permit limit table (all SN-31B conditions)
+  - CEMS configuration questions to answer with integrator before adding ppmv limits
+  - Confirmed alignments between permit requirements and app implementation
+
+
+WHAT CHANGED
+  CIP.py
+    - Warm-start the in-progress hour from persisted raw on restart (no hard reset).
+    - Atomic writes (.tmp + os.replace) for hourly / minute / rolling CSVs.
+    - Rolling averages use CEMS data-availability rule (hours below 75% data
+      capture are excluded; no sparse hour can skew the average).
+    - Over-limit-but-valid (OUT_OF_RANGE) samples are included in averages
+      (flag is kept for exceedance detection).
+    - EPA molar volume corrected 385.8 -> 385.3.
+
+  CIP.py — collector hardening (2026-06-29, see COMPLIANCE_ALIGNMENT.md section 7):
+    - Warm-start now keeps OUT_OF_RANGE/MANUAL_CORRECTION (highest-emission)
+      samples on restart instead of dropping them, matching live collection,
+      and applies the same CO span cap per minute.
+    - Rolling 12-hr lb/hr (NOx/CO) unified across all three code paths to the
+      permit-literal method (SC#140): 12-hr mean concentration -> convert to
+      lb/hr. The persisted CSV, the value written to the PLC, and any rebuild
+      now agree for the same window.
+    - Restart spanning an hour boundary now recovers the unfinalized completed
+      hour from raw on startup (additive-only, 2-day bounded, fault-isolated),
+      so it no longer leaves a hole in the 12-hr window.
+    - The 3,000->10,000 ppmv one-minute span substitution (EPA PS-4B / SC#185)
+      is now scoped to the CO CEMS only; NOx is carried through uncapped.
+
+  CIPMonitor.py
+    - Reports and raw export now read compressed .csv.gz history (was last 7 days only).
+    - All-time processing gauge computed from hourly_averages.csv.
+    - Operational Summary: CEMS Availability rows removed; Hours Processed shows
+      processed hours only (no "/ total"); range membership filtered half-open
+      [start, end) on hour_start.
+    - 24h / 30d "within limits" computed from real history (vectorized; sub-second
+      when limits not configured, 0.17s when limits are active across 31 days).
+    - "Today" processing aligned with the report calculation (qa_flag + gap clip).
+    - No-data CEMS / flow gauges show grey "no data" instead of a 0.0 reading.
+    - Negative draft/pressure readings no longer clip to 0 on gauges.
+    - EPA molar volume corrected 385.8 -> 385.3.
+    - Raw lookback distance fixed for all-time / prev_month report generation
+      (was using window length instead of distance from today to window start —
+      caused 0 processing minutes on historical range reports).
+    - Full CLI: python CIPMonitor.py report|export|readable|metrics|verify|all <range>
+      Ranges: today, week, month, prev_month, all_time
+
+
+CLI TOOL QUICK REFERENCE
+  python CIPMonitor.py metrics all_time           # print all key metrics
+  python CIPMonitor.py verify all_time            # cross-check report vs. raw data
+  python CIPMonitor.py report compliance month    # generate compliance PDF
+  python CIPMonitor.py report ops prev_month      # generate ops summary PDF
+  python CIPMonitor.py export raw all_time        # raw samples CSV
+  python CIPMonitor.py readable day week          # wide pivot Excel with lb/hr columns
+  python CIPMonitor.py all month                  # generate all reports + exports for month

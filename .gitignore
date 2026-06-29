@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# --- Operational data and local machine config: never publish ---
+logs/
+settings.json
+*.csv
+*.tmp
+CIP2.py

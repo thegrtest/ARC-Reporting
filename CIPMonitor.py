@@ -7168,10 +7168,16 @@ def _verify_range(range_key: str, tolerance: float = 0.01) -> Dict[str, object]:
     cmp("nox_total_weight_lb", m["nox_total_weight_lb"], weight_independent(m["tags"]["nox"], EPA19_NOX_MOLECULAR_WEIGHT))
 
     # --- operating hours (hourly state avg in [2.5,3.5]) ---
+    # For an empty range there are genuinely 0 operating hours; return 0 (not
+    # None) when the state tag is configured so this matches the report's 0
+    # rather than false-failing on an empty window.
     op_ind = None
-    if mst and hr is not None and not hr.empty:
-        sv = pd.to_numeric(hr.loc[hr["tag"] == mst, "avg_value"], errors="coerce")
-        op_ind = int(((sv >= 2.5) & (sv <= 3.5)).sum())
+    if mst:
+        if hr is not None and not hr.empty:
+            sv = pd.to_numeric(hr.loc[hr["tag"] == mst, "avg_value"], errors="coerce")
+            op_ind = int(((sv >= 2.5) & (sv <= 3.5)).sum())
+        else:
+            op_ind = 0
     cmp("operating_hours", m["uptime"]["operating_hours"], op_ind, abstol=0.5)
 
     passed = all(c["pass"] for c in checks)

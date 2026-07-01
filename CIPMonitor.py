@@ -6799,6 +6799,302 @@ def cli_generate_report(rtype: str, range_key: str, out_dir: str) -> Optional[st
     return dest
 
 
+# ---------------------------------------------------------------------------
+#  Performance-test run blocks (arbitrary time windows) + CO ppmvd @ 7% O2
+# ---------------------------------------------------------------------------
+
+def _rnd(x, n: int = 4):
+    """Round to n places, mapping NaN/invalid to None (JSON/CSV friendly)."""
+    if x is None:
+        return None
+    try:
+        xf = float(x)
+        return round(xf, n) if xf == xf else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _correct_to_ref_o2(conc, o2_pct, ref_o2: float = 7.0, ambient_o2: float = 20.9):
+    """Correct a dry-basis concentration to a reference O2 %.
+
+    C_ref = C_meas * (ambient_o2 - ref_o2) / (ambient_o2 - O2_meas)
+
+    This is the standard EPA diluent correction (40 CFR 60 App. A / Subpart EEE
+    uses 7% O2 for the CO/HC standards). Requires the concentration and O2 to be
+    on a DRY basis. Returns None if O2 is missing or >= ambient (no valid
+    combustion dilution / division by zero).
+    """
+    try:
+        c = float(conc)
+        o = float(o2_pct)
+    except (TypeError, ValueError):
+        return None
+    if c != c or o != o:  # NaN guard
+        return None
+    denom = ambient_o2 - o
+    if denom <= 0:
+        return None
+    return c * (ambient_o2 - ref_o2) / denom
+
+
+def _ppm_flow_to_lbhr(ppm, flow, mw):
+    """EPA Method 19 mass rate: ppm * flow_dscfm * 60 * MW / (1e6 * Vm)."""
+    if ppm is None or flow is None:
+        return None
+    try:
+        return float(ppm) * float(flow) * 60.0 * float(mw) / (1_000_000.0 * EPA19_MOLAR_VOLUME_DSCF)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_raw_between(start: datetime, end: datetime) -> pd.DataFrame:
+    """Concatenated raw samples in [start, end), across the daily files it spans.
+
+    Mirrors _load_raw_range_df but for arbitrary (start, end) rather than a named
+    range. Handles both raw_data_*.csv and .csv.gz (pandas infers compression).
+    """
+    paths = _get_raw_daily_paths_for_range(start, end)
+    frames: List[pd.DataFrame] = []
+    for path in paths:
+        try:
+            df = pd.read_csv(path)
+            for col in RAW_DATA_HEADERS:
+                if col not in df.columns:
+                    df[col] = None
+            frames.append(df.reindex(columns=RAW_DATA_HEADERS))
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame(columns=RAW_DATA_HEADERS)
+    df = pd.concat(frames, ignore_index=True)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    return _filter_time_range(df, "timestamp", start, end)
+
+
+def _parse_run_windows(file_path: Optional[str], windows_str: Optional[str]) -> List[Tuple[str, datetime, datetime]]:
+    """Parse run windows from a CSV file and/or an inline string.
+
+    CSV file: needs 'start' and 'stop' (or 'end') columns; optional 'run'/'label'.
+    Inline:   'start,stop[,label]; start,stop; ...' (datetimes have no commas).
+    Datetimes are parsed permissively (ISO, 'YYYY-MM-DD HH:MM', 'M/D/YYYY HH:MM').
+    """
+    rows: List[Tuple[str, datetime, datetime]] = []
+    if file_path:
+        wdf = pd.read_csv(file_path)
+        cols = {str(c).lower().strip(): c for c in wdf.columns}
+        scol = cols.get("start") or cols.get("start_time") or cols.get("begin")
+        ecol = cols.get("stop") or cols.get("end") or cols.get("end_time") or cols.get("finish")
+        lcol = cols.get("run") or cols.get("label") or cols.get("name")
+        if not scol or not ecol:
+            raise ValueError("windows file needs 'start' and 'stop' (or 'end') columns")
+        for i, r in wdf.iterrows():
+            s = pd.to_datetime(r[scol], errors="coerce")
+            e = pd.to_datetime(r[ecol], errors="coerce")
+            if pd.isna(s) or pd.isna(e):
+                continue
+            lbl = str(r[lcol]) if (lcol and pd.notna(r.get(lcol))) else f"run{len(rows) + 1}"
+            rows.append((lbl, s.to_pydatetime(), e.to_pydatetime()))
+    if windows_str:
+        for part in (p for p in windows_str.split(";") if p.strip()):
+            bits = [b.strip() for b in part.split(",")]
+            if len(bits) < 2:
+                continue
+            s = pd.to_datetime(bits[0], errors="coerce")
+            e = pd.to_datetime(bits[1], errors="coerce")
+            if pd.isna(s) or pd.isna(e):
+                continue
+            lbl = bits[2] if len(bits) >= 3 and bits[2] else f"run{len(rows) + 1}"
+            rows.append((str(lbl), s.to_pydatetime(), e.to_pydatetime()))
+    return rows
+
+
+RUN_BLOCK_COLUMNS = [
+    "run", "start", "stop", "duration_min",
+    "O2_pct", "CO_ppmvd_raw", "CO_ppmvd_7pctO2", "CO_ppmvd_7pctO2_runavg",
+    "NOx_ppm", "CO_lbhr", "NOx_lbhr", "flow_dscfm",
+    "CO_samples", "minutes_with_data", "capture_pct",
+]
+
+
+def compute_run_blocks(
+    windows: List[Tuple[str, datetime, datetime]],
+    ref_o2: float = 7.0,
+    ambient_o2: float = 20.9,
+    co_already_corrected: bool = False,
+) -> pd.DataFrame:
+    """Average each run window and derive the compliance-relevant metrics.
+
+    Per window [start, stop): block-average O2, CO, NOx, and flow over all valid
+    samples (qa_flag in OK/OUT_OF_RANGE/MANUAL_CORRECTION); derive CO/NOx lb/hr by
+    EPA Method 19 from the block averages; and compute CO ppmvd @ ref O2 two ways:
+      - CO_ppmvd_7pctO2:        correct each 1-minute CO value by that minute's O2,
+                                then average the corrected minutes (EEE/CEMS method).
+      - CO_ppmvd_7pctO2_runavg: correct the run-average CO by the run-average O2.
+    If co_already_corrected is set, the CO channel is treated as already at ref O2
+    and the corrected columns equal the measured CO.
+    """
+    epa = load_epa_settings()
+    o2_tag = str(epa.get("epa_o2_tag", "") or "")
+    co_tag = str(epa.get("epa_co_tag", "") or "")
+    nox_tag = str(epa.get("epa_nox_tag", "") or "")
+    flow_tag = str(epa.get("epa_flow_tag", "") or "")
+    accept = {"OK", "OUT_OF_RANGE", "MANUAL_CORRECTION"}
+
+    out_rows: List[Dict[str, object]] = []
+    for (label, start, stop) in windows:
+        dur_min = (stop - start).total_seconds() / 60.0
+        base: Dict[str, object] = {
+            "run": label,
+            "start": start.isoformat(sep=" ", timespec="seconds"),
+            "stop": stop.isoformat(sep=" ", timespec="seconds"),
+            "duration_min": round(dur_min, 3),
+        }
+        raw = _load_raw_between(start, stop)
+        if raw is None or raw.empty:
+            out_rows.append({**base, **{k: None for k in RUN_BLOCK_COLUMNS if k not in base},
+                             "CO_samples": 0, "minutes_with_data": 0, "capture_pct": 0.0})
+            continue
+
+        r = raw.copy()
+        if "qa_flag" in r.columns:
+            r = r[r["qa_flag"].astype(str).str.upper().isin(accept)]
+        r["v"] = pd.to_numeric(r["value"], errors="coerce")
+        r = r.dropna(subset=["v", "timestamp"])
+        if r.empty:
+            out_rows.append({**base, **{k: None for k in RUN_BLOCK_COLUMNS if k not in base},
+                             "CO_samples": 0, "minutes_with_data": 0, "capture_pct": 0.0})
+            continue
+        r["minute"] = r["timestamp"].dt.floor("min")
+
+        def tag_mean(tag: str):
+            if not tag:
+                return None
+            vv = r.loc[r["tag"] == tag, "v"]
+            return float(vv.mean()) if not vv.empty else None
+
+        def tag_minute_means(tag: str) -> pd.Series:
+            if not tag:
+                return pd.Series(dtype=float)
+            return r.loc[r["tag"] == tag].groupby("minute")["v"].mean()
+
+        o2_avg = tag_mean(o2_tag)
+        co_avg = tag_mean(co_tag)
+        nox_avg = tag_mean(nox_tag)
+        flow_avg = tag_mean(flow_tag)
+
+        # CO @ ref O2 — minute-corrected then averaged (EEE-consistent)
+        co7_minute = None
+        if co_already_corrected:
+            co7_minute = co_avg
+        else:
+            co_min = tag_minute_means(co_tag)
+            o2_min = tag_minute_means(o2_tag)
+            if not co_min.empty and not o2_min.empty:
+                joined = pd.DataFrame({"co": co_min, "o2": o2_min}).dropna()
+                if not joined.empty:
+                    corr = [
+                        _correct_to_ref_o2(c, o, ref_o2, ambient_o2)
+                        for c, o in zip(joined["co"], joined["o2"])
+                    ]
+                    corr = [c for c in corr if c is not None]
+                    if corr:
+                        co7_minute = sum(corr) / len(corr)
+
+        # CO @ ref O2 — run-average corrected (secondary, for comparison)
+        co7_runavg = co_avg if co_already_corrected else _correct_to_ref_o2(co_avg, o2_avg, ref_o2, ambient_o2)
+
+        # The 7% O2 correction is only meaningful under combustion conditions
+        # (run-average O2 below ambient). If the window's average O2 is at/above
+        # ambient there is no net dilution, and the per-minute correction becomes
+        # numerically unstable near the 1/(ambient - O2) singularity -- so suppress
+        # both corrected values rather than emit noise-amplified numbers. Real test
+        # runs (O2 well below ambient) are unaffected.
+        if not co_already_corrected and (o2_avg is None or o2_avg >= ambient_o2):
+            co7_minute = None
+            co7_runavg = None
+
+        co_lbhr = _ppm_flow_to_lbhr(co_avg, flow_avg, EPA19_CO_MOLECULAR_WEIGHT)
+        nox_lbhr = _ppm_flow_to_lbhr(nox_avg, flow_avg, EPA19_NOX_MOLECULAR_WEIGHT)
+
+        co_samples = int((r["tag"] == co_tag).sum()) if co_tag else 0
+        minutes_with_data = int(tag_minute_means(co_tag).shape[0]) if co_tag else 0
+        capture = round(minutes_with_data / dur_min * 100.0, 1) if dur_min > 0 else None
+
+        out_rows.append({
+            **base,
+            "O2_pct": _rnd(o2_avg),
+            "CO_ppmvd_raw": _rnd(co_avg),
+            "CO_ppmvd_7pctO2": _rnd(co7_minute),
+            "CO_ppmvd_7pctO2_runavg": _rnd(co7_runavg),
+            "NOx_ppm": _rnd(nox_avg),
+            "CO_lbhr": _rnd(co_lbhr),
+            "NOx_lbhr": _rnd(nox_lbhr),
+            "flow_dscfm": _rnd(flow_avg),
+            "CO_samples": co_samples,
+            "minutes_with_data": minutes_with_data,
+            "capture_pct": capture,
+        })
+
+    return pd.DataFrame(out_rows, columns=RUN_BLOCK_COLUMNS)
+
+
+def cli_run_blocks(
+    file_path: Optional[str],
+    windows_str: Optional[str],
+    ref_o2: float,
+    ambient_o2: float,
+    co_already_corrected: bool,
+    fmt: str,
+    out_dir: str,
+) -> Optional[List[str]]:
+    """Compute per-run averages for arbitrary test windows and write CSV/XLSX."""
+    ensure_dir(out_dir)
+    windows = _parse_run_windows(file_path, windows_str)
+    if not windows:
+        print("[runblocks] no valid windows (use --file <csv> or --windows 'start,stop; ...')")
+        return None
+    df = compute_run_blocks(windows, ref_o2, ambient_o2, co_already_corrected)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    meta = {
+        "ref_o2_pct": ref_o2,
+        "ambient_o2_pct": ambient_o2,
+        "co_basis_assumed": "dry",
+        "co_already_corrected": co_already_corrected,
+        "co_7pctO2_method": "correct each 1-minute value by that minute's O2, then average over the run",
+        "correction_formula": f"C_ref = C * ({ambient_o2} - {ref_o2}) / ({ambient_o2} - O2)",
+        "lbhr_formula": f"ppm * flow_dscfm * 60 * MW / (1e6 * {EPA19_MOLAR_VOLUME_DSCF})",
+        "nox_mw": EPA19_NOX_MOLECULAR_WEIGHT,
+        "co_mw": EPA19_CO_MOLECULAR_WEIGHT,
+        "window_convention": "[start, stop) half-open",
+        "o2_tag": str(load_epa_settings().get("epa_o2_tag", "")),
+        "co_tag": str(load_epa_settings().get("epa_co_tag", "")),
+        "nox_tag": str(load_epa_settings().get("epa_nox_tag", "")),
+        "flow_tag": str(load_epa_settings().get("epa_flow_tag", "")),
+    }
+    outputs: List[str] = []
+    if fmt in ("csv", "both"):
+        out = os.path.join(out_dir, f"runblocks_{stamp}.csv")
+        with open(out, "w", encoding="utf-8", newline="") as f:
+            f.write("# SN-31B performance-test run blocks\n")
+            for k, v in meta.items():
+                f.write(f"# {k}: {v}\n")
+            df.to_csv(f, index=False)
+        outputs.append(out)
+    if fmt in ("xlsx", "both"):
+        out = os.path.join(out_dir, f"runblocks_{stamp}.xlsx")
+        with pd.ExcelWriter(out, engine="openpyxl") as xw:
+            df.to_excel(xw, sheet_name="Runs", index=False)
+            mdf = pd.DataFrame([(k, str(v)) for k, v in meta.items()], columns=["Field", "Value"])
+            mdf.to_excel(xw, sheet_name="Meta", index=False)
+            for sh in xw.sheets.values():
+                sh.freeze_panes = "A2"
+        outputs.append(out)
+    for o in outputs:
+        print(f"[runblocks] OK -> {o}")
+    print(df.to_string(index=False))
+    return outputs
+
+
 def _verify_range(range_key: str, tolerance: float = 0.01) -> Dict[str, object]:
     """Independently recompute key metrics straight from the CSVs and compare to
     compute_report_metrics(). Returns {checks: [...], passed: bool}.
@@ -6914,7 +7210,29 @@ def _cli_main(argv: List[str]) -> int:
     p_all = sub.add_parser("all", help="reports + exports + readable + metrics + verify")
     add_range(p_all)
 
+    p_rb = sub.add_parser("runblocks", help="per-run averages for arbitrary test windows (incl. CO ppmvd @ 7% O2)")
+    p_rb.add_argument("--file", default=None, help="CSV of windows with start,stop[,run] columns")
+    p_rb.add_argument("--windows", default=None, help="inline 'start,stop[,label]; start,stop; ...'")
+    p_rb.add_argument("--ref-o2", type=float, default=7.0, help="reference O2 %% for correction (EEE = 7)")
+    p_rb.add_argument("--ambient-o2", type=float, default=20.9, help="ambient O2 %% basis (default 20.9)")
+    p_rb.add_argument("--co-already-corrected", action="store_true",
+                      help="set if the CO channel is already corrected to ref O2 at the analyzer")
+    p_rb.add_argument("--format", default="both", choices=["csv", "xlsx", "both"])
+    p_rb.add_argument("--out", default=os.path.join(EXPORT_TMP_DIR, "cli"), help="output directory")
+
     args = parser.parse_args(argv)
+
+    if args.cmd == "runblocks":
+        try:
+            res = cli_run_blocks(
+                args.file, args.windows, args.ref_o2, args.ambient_o2,
+                args.co_already_corrected, args.format, args.out,
+            )
+            return 0 if res else 1
+        except Exception as e:
+            print(f"[runblocks] ERROR {e}")
+            return 1
+
     ranges = CLI_RANGES if getattr(args, "range", "today") == "all" else [args.range]
     out_dir = getattr(args, "out", os.path.join(EXPORT_TMP_DIR, "cli"))
     ensure_dir(out_dir)
@@ -6978,7 +7296,7 @@ def _cli_main(argv: List[str]) -> int:
 #  MAIN ENTRY POINT
 # ============================================================================
 
-_CLI_COMMANDS = {"report", "export", "readable", "metrics", "verify", "all"}
+_CLI_COMMANDS = {"report", "export", "readable", "metrics", "verify", "all", "runblocks"}
 
 if __name__ == "__main__":
     import sys

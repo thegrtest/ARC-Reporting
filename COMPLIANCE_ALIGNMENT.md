@@ -236,3 +236,37 @@ These changes affect only how the collector reconstructs and averages data on
 restart and how the rolling value is computed; the report-generation side
 (CIPMonitor.py) was independently re-verified to still reconcile to full
 precision against the raw CSVs after the changes.
+
+---
+
+## 8. Performance-Test Run Blocks + CO ppmvd @ 7% O2 (2026-07-01)
+
+Added a `runblocks` CLI command to support HWC MACT performance testing (the
+9-run × 21-minute matrix). It averages the continuously-logged data over any set
+of arbitrary run windows and reports the compliance-relevant metrics per run.
+
+**Command:** `python CIPMonitor.py runblocks --file runs.csv` (or `--windows`).
+Windows are half-open `[start, stop)`. Per run it reports: O2 %, CO ppmvd (raw),
+**CO ppmvd @ 7% O2**, NOx ppm, CO/NOx lb/hr (EPA Method 19), stack flow, sample
+count, and data-capture %.
+
+**CO ppmvd @ 7% O2 (Subpart EEE, 40 CFR 63.1219).** Corrected via the standard
+diluent equation `C_7%O2 = C × (20.9 − 7) / (20.9 − O2)`. Reported two ways:
+- `CO_ppmvd_7pctO2` — each 1-minute CO value corrected by that minute's O2, then
+  averaged over the run (the EEE/CEMS-consistent method).
+- `CO_ppmvd_7pctO2_runavg` — run-average CO corrected by run-average O2 (secondary).
+
+The correction is only reported when the run-average O2 is below ambient (real
+combustion); at/above ambient it is suppressed (no net dilution / unstable).
+
+**Assumptions (flag-controlled, confirm with CEMS integrator):**
+- CO and O2 are treated as **dry basis**. If wet, a moisture correction is needed first.
+- CO is treated as **not already O2-corrected**. If the analyzer pre-corrects, run
+  with `--co-already-corrected` (then reported CO @7%O2 = measured CO).
+These map directly to CEMS questions Q1, Q3, and Q8.
+
+**Verification.** The command was run on a real combustion window (9 runs, O2 ≈ 14.5%),
+and every output value (O2, CO raw, CO @7%O2 both methods, NOx, CO/NOx lb/hr, flow,
+capture) was independently recomputed from the raw CSV with separate code and matched
+to rounding (max difference 5e-5). The 7% O2 correction and Method-19 lb/hr were also
+hand-checked.

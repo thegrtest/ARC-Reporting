@@ -78,15 +78,32 @@ WHAT CHANGED
     - Raw lookback distance fixed for all-time / prev_month report generation
       (was using window length instead of distance from today to window start —
       caused 0 processing minutes on historical range reports).
-    - Full CLI: python CIPMonitor.py report|export|readable|metrics|verify|all <range>
-      Ranges: today, week, month, prev_month, all_time
+    - Full CLI: report|export|readable|metrics|verify|all (use --range) and
+      runblocks (use --file/--windows). Ranges: today, week, month, prev_month, all_time.
+    - runblocks: per-run averages for arbitrary test windows, incl. CO ppmvd @ 7% O2
+      (Subpart EEE) and CO/NOx lb/hr. Built for performance-test run matrices.
 
 
-CLI TOOL QUICK REFERENCE
-  python CIPMonitor.py metrics all_time           # print all key metrics
-  python CIPMonitor.py verify all_time            # cross-check report vs. raw data
-  python CIPMonitor.py report compliance month    # generate compliance PDF
-  python CIPMonitor.py report ops prev_month      # generate ops summary PDF
-  python CIPMonitor.py export raw all_time        # raw samples CSV
-  python CIPMonitor.py readable day week          # wide pivot Excel with lb/hr columns
-  python CIPMonitor.py all month                  # generate all reports + exports for month
+CLI TOOL QUICK REFERENCE  (note: range commands take --range)
+  python CIPMonitor.py metrics --range all_time          # print all key metrics
+  python CIPMonitor.py verify  --range all_time          # cross-check report vs. raw data
+  python CIPMonitor.py report  --type compliance --range month
+  python CIPMonitor.py report  --type ops --range prev_month
+  python CIPMonitor.py export  --kind raw --range all_time
+  python CIPMonitor.py readable --granularity hourly --range week --format xlsx
+  python CIPMonitor.py all --range month                 # all reports + exports for month
+
+PERFORMANCE-TEST RUN BLOCKS  (CO ppmvd @ 7% O2 for stack-test runs)
+  # from a windows file (columns: run,start,stop):
+  python CIPMonitor.py runblocks --file runs.csv --out out_dir
+  # or inline:
+  python CIPMonitor.py runblocks --windows "2026-06-30 12:00:00,2026-06-30 12:21:00,R1; ..."
+  # options:
+  #   --ref-o2 7.0            reference O2 % (EEE = 7; default 7.0)
+  #   --ambient-o2 20.9       ambient O2 basis (default 20.9)
+  #   --co-already-corrected  set if the CO channel is already 7%-O2-corrected at the analyzer
+  #   --format csv|xlsx|both  (default both)
+  # Output per run: O2%, CO ppmvd (raw), CO ppmvd @7%O2 (minute-corrected AND run-avg),
+  #   NOx ppm, CO/NOx lb/hr, flow, sample count, data-capture %. Windows are [start, stop).
+  # NOTE: CO @7%O2 assumes CO/O2 are DRY basis and CO is NOT already corrected. Confirm the
+  #   CEMS basis; flip --co-already-corrected if the analyzer pre-corrects.

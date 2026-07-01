@@ -62,6 +62,10 @@ WHAT CHANGED
       so it no longer leaves a hole in the 12-hr window.
     - The 3,000->10,000 ppmv one-minute span substitution (EPA PS-4B / SC#185)
       is now scoped to the CO CEMS only; NOx is carried through uncapped.
+    - New settings checkbox "CO already corrected to 7% O2" (EPA config section).
+      Persists to settings.json (co_already_corrected); controls the runblocks
+      performance-test export only. Defaults unchecked (raw CO ppm). Backward
+      compatible: absent in an existing settings.json reads as unchecked/false.
 
   CIPMonitor.py
     - Reports and raw export now read compressed .csv.gz history (was last 7 days only).
@@ -101,9 +105,16 @@ PERFORMANCE-TEST RUN BLOCKS  (CO ppmvd @ 7% O2 for stack-test runs)
   # options:
   #   --ref-o2 7.0            reference O2 % (EEE = 7; default 7.0)
   #   --ambient-o2 20.9       ambient O2 basis (default 20.9)
-  #   --co-already-corrected  set if the CO channel is already 7%-O2-corrected at the analyzer
+  #   --co-already-corrected / --no-co-already-corrected
+  #                           override the analyzer-pre-correction setting for this run
   #   --format csv|xlsx|both  (default both)
   # Output per run: O2%, CO ppmvd (raw), CO ppmvd @7%O2 (minute-corrected AND run-avg),
   #   NOx ppm, CO/NOx lb/hr, flow, sample count, data-capture %. Windows are [start, stop).
-  # NOTE: CO @7%O2 assumes CO/O2 are DRY basis and CO is NOT already corrected. Confirm the
-  #   CEMS basis; flip --co-already-corrected if the analyzer pre-corrects.
+  #
+  # CO-already-corrected setting: whether the CO channel is already 7%-O2-corrected at the
+  #   analyzer is a persistent setting. Set it once via the CIP.py checkbox
+  #   ("CO already corrected to 7% O2") -- it saves to settings.json (co_already_corrected)
+  #   and runblocks reads it as the default. Unchecked/false (typical: raw CO ppm) => the
+  #   tool applies the 7% O2 correction. Checked/true => reports CO as-is (no correction).
+  #   The --co-already-corrected / --no-co-already-corrected CLI flags override per run.
+  # NOTE: CO @7%O2 also assumes CO/O2 are DRY basis. Confirm the CEMS basis with the integrator.

@@ -1981,6 +1981,18 @@ class MainWindow(QMainWindow):
         self.epa_co_tag_edit.setPlaceholderText("e.g. Program:MainRoutine.CO_PPMV")
         cfg_layout.addRow(QLabel("CO Tag (PPMV):"), self.epa_co_tag_edit)
 
+        self.co_already_corrected_checkbox = QCheckBox(
+            "CO already corrected to 7% O2 (performance-test run blocks)"
+        )
+        self.co_already_corrected_checkbox.setToolTip(
+            "Affects the 'runblocks' performance-test export only (CO ppmvd @ 7% O2).\n"
+            "Leave UNCHECKED when the CO channel reports raw ppm -- the run-block tool\n"
+            "then applies the 7% O2 correction itself. CHECK this only if the CEMS\n"
+            "analyzer already outputs CO corrected to 7% O2, so the tool reports it\n"
+            "as-is instead of double-correcting. Does not change the live lb/hr calc."
+        )
+        cfg_layout.addRow(self.co_already_corrected_checkbox)
+
         production_label = QLabel("Production Tracking")
         production_label.setStyleSheet("font-weight: 600; color: #b0bec5; padding-top: 6px;")
         cfg_layout.addRow(production_label)
@@ -2826,6 +2838,7 @@ class MainWindow(QMainWindow):
 
         self.epa_enabled = bool(data.get("epa_enabled", False))
         self.epa_enabled_checkbox.setChecked(self.epa_enabled)
+        self.co_already_corrected_checkbox.setChecked(bool(data.get("co_already_corrected", False)))
         self.epa_flow_tag = str(data.get("epa_flow_tag", "") or "")
         self.epa_flow_tag_edit.setText(self.epa_flow_tag)
         self.epa_o2_tag = str(data.get("epa_o2_tag", "") or "")
@@ -2944,6 +2957,7 @@ class MainWindow(QMainWindow):
             "epa_o2_units": self.epa_o2_units_combo.currentData(),
             "epa_nox_tag": self.epa_nox_tag_edit.text().strip(),
             "epa_co_tag": self.epa_co_tag_edit.text().strip(),
+            "co_already_corrected": self.co_already_corrected_checkbox.isChecked(),
             "production_tracking": {
                 "product_tag": self.production_product_tag_edit.text().strip(),
                 "weight_tag": self.production_weight_tag_edit.text().strip(),

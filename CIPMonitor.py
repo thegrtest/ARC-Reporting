@@ -3516,6 +3516,7 @@ def load_epa_settings() -> Dict[str, object]:
         "epa_co_tag": resolve_tag_from_alias(
             str(data.get("epa_co_tag", "") or ""), alias_map
         ),
+        "co_already_corrected": bool(data.get("co_already_corrected", False)),
     }
 
 
@@ -7221,8 +7222,12 @@ def _cli_main(argv: List[str]) -> int:
     p_rb.add_argument("--windows", default=None, help="inline 'start,stop[,label]; start,stop; ...'")
     p_rb.add_argument("--ref-o2", type=float, default=7.0, help="reference O2 %% for correction (EEE = 7)")
     p_rb.add_argument("--ambient-o2", type=float, default=20.9, help="ambient O2 %% basis (default 20.9)")
-    p_rb.add_argument("--co-already-corrected", action="store_true",
-                      help="set if the CO channel is already corrected to ref O2 at the analyzer")
+    _rb_cac_default = bool(load_epa_settings().get("co_already_corrected", False))
+    p_rb.add_argument("--co-already-corrected", action=argparse.BooleanOptionalAction,
+                      default=_rb_cac_default,
+                      help=f"CO channel already corrected to ref O2 at the analyzer "
+                           f"(default from settings.json: {_rb_cac_default}). "
+                           f"Use --no-co-already-corrected to force the correction on.")
     p_rb.add_argument("--format", default="both", choices=["csv", "xlsx", "both"])
     p_rb.add_argument("--out", default=os.path.join(EXPORT_TMP_DIR, "cli"), help="output directory")
 
